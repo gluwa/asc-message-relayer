@@ -231,10 +231,16 @@ impl Server {
             .iter()
             .map(|route| {
                 // Ordered most-specific first. An explicit address needs no discovery at all;
-                // a registry read is authoritative and cheap; scanning `OutboxCreated` is the
-                // legacy path and is spoofable, because the factory is permissionless and this
-                // binds the newest log (see `RegistryResolver`'s doc comment). Routes move off it
-                // by setting `outbox_registry_address`.
+                // `outbox_registry_address` pins a *specific* registry, bypassing even the
+                // precompile lookup — useful before the discovery-address getter is deployed
+                // everywhere, or to point at a registry other than the one chain-info reports.
+                // Everything else goes to `FactoryResolver`, which is registry-aware itself now:
+                // it reads the discovery address from the chain-info precompile on every call and
+                // only falls back to scanning the permissionless (and therefore spoofable)
+                // `OutboxCreated` log stream when no registry is registered for the chain key yet
+                // — see `resolve_from_precompile_registry`. So most routes never need
+                // `outbox_registry_address` at all: registry-based resolution becomes automatic
+                // the moment governance sets a discovery address on-chain, no config change here.
                 let resolver: Arc<dyn OutboxResolver> = if route.outbox_address.is_some() {
                     Arc::new(ConfigOverrideResolver)
                 } else if route.outbox_registry_address.is_some() {

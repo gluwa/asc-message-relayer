@@ -1,9 +1,12 @@
 //! Outbox address resolution.
 //!
-//! Production: a factory contract on Creditcoin L1 maps `chainKey` → `Outbox` address (PoC PDF
-//! §4). PoC: the relayer falls back to the `outbox_address` set on each [`ChainRoute`] when no
-//! factory has been deployed yet. The trait is in place so swapping in the real factory is a
-//! one-impl change rather than a refactor across modules.
+//! Three [`OutboxResolver`] implementations, selected per route in `message-relayer::lib`'s
+//! resolver-selection block: [`ConfigOverrideResolver`] for an explicit `outbox_address`;
+//! [`RegistryResolver`] for a route pinned to a specific `outbox_registry_address`; and
+//! [`FactoryResolver`] for everything else, which reads the discovery-registry address off the
+//! chain-info precompile itself (see [`resolve_from_precompile_registry`]) and only falls back to
+//! scanning the factory's permissionless `OutboxCreated` logs when no registry is registered for
+//! the chain key yet.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -99,39 +102,7 @@ impl OutboxResolver for RegistryResolver {
             )
         })?;
 
-        // `chainKey` is `uint32` on the contract side while the pallet and these mirrors carry it
-        // as `u64`. Reject anything unrepresentable rather than truncating: a silently wrapped key
-        // would read the registry for a *different* chain and bind the wrong Outbox.
-        let chain_key_u32 = u32::try_from(chain_key).with_context(|| {
-            format!(
-                "chain_key {chain_key} exceeds the uint32 the Outbox registry is keyed by, so it \
-                 cannot be represented on-chain"
-            )
-        })?;
-
-        let deployer = IOutboxDeployer::new(registry, provider);
-        let address = tokio::time::timeout(
-            PRECOMPILE_CALL_TIMEOUT,
-            deployer.outboxOf(chain_key_u32).call(),
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "chain_key {chain_key}: outboxOf on registry {registry} timed out after \
-                 {PRECOMPILE_CALL_TIMEOUT:?}"
-            )
-        })?
-        .with_context(|| {
-            format!("chain_key {chain_key}: outboxOf call on registry {registry} failed")
-        })?;
-
-        if address.is_zero() {
-            anyhow::bail!(
-                "chain_key {chain_key}: registry {registry} has no Outbox for this chain key \
-                 (outboxOf returned the zero address) — deploy through OutboxDeployer, or point \
-                 `outbox_registry_address` at the registry that holds it"
-            );
-        }
+        let address = outbox_from_registry(chain_key, registry, provider).await?;
 
         // No creation block to report: the registry stores the address only. `current_since_block`
         // is an optimisation for the message watcher's start height, and `None` simply means it
@@ -141,6 +112,97 @@ impl OutboxResolver for RegistryResolver {
             current_since_block: None,
         })
     }
+}
+
+/// Call `outboxOf(chainKey)` on `registry` and turn a zero answer into an error — shared by
+/// [`RegistryResolver`] (an explicitly configured `registry`) and
+/// [`resolve_from_precompile_registry`] (one looked up from the chain-info precompile): once a
+/// caller has a specific registry address to query, "registered but empty" is a hard failure, not
+/// a signal to try something else — that distinction belongs to the caller, before this runs.
+async fn outbox_from_registry(
+    chain_key: u64,
+    registry: Address,
+    provider: &DynProvider,
+) -> Result<Address> {
+    // `chainKey` is `uint32` on the contract side while the pallet and these mirrors carry it
+    // as `u64`. Reject anything unrepresentable rather than truncating: a silently wrapped key
+    // would read the registry for a *different* chain and bind the wrong Outbox.
+    let chain_key_u32 = u32::try_from(chain_key).with_context(|| {
+        format!(
+            "chain_key {chain_key} exceeds the uint32 the Outbox registry is keyed by, so it \
+             cannot be represented on-chain"
+        )
+    })?;
+
+    let deployer = IOutboxDeployer::new(registry, provider);
+    let address = tokio::time::timeout(
+        PRECOMPILE_CALL_TIMEOUT,
+        deployer.outboxOf(chain_key_u32).call(),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "chain_key {chain_key}: outboxOf on registry {registry} timed out after \
+             {PRECOMPILE_CALL_TIMEOUT:?}"
+        )
+    })?
+    .with_context(|| {
+        format!("chain_key {chain_key}: outboxOf call on registry {registry} failed")
+    })?;
+
+    if address.is_zero() {
+        anyhow::bail!(
+            "chain_key {chain_key}: registry {registry} has no Outbox for this chain key \
+             (outboxOf returned the zero address) — deploy through OutboxDeployer, or point \
+             `outbox_registry_address` at the registry that holds it"
+        );
+    }
+
+    Ok(address)
+}
+
+/// Look up the discovery-registry address for `chain_key` from the chain-info precompile and, if
+/// one is registered, resolve the Outbox from it via [`outbox_from_registry`] — the same read
+/// [`RegistryResolver`] performs from an explicit `outbox_registry_address`, just with the
+/// registry address itself also sourced on-chain instead of from route config. This is what makes
+/// registry-based resolution the automatic default for [`FactoryResolver`] rather than something
+/// every route must opt into: no config change is needed once governance registers a discovery
+/// address for a chain key.
+///
+/// Returns `Ok(None)` — not an error — when no discovery address is registered for `chain_key`
+/// yet, so the caller falls through to the factory scan in that case. Any other failure (a
+/// registered-but-reverting registry, or one that answers zero) propagates as an error rather than
+/// silently falling back to the spoofable log scan.
+async fn resolve_from_precompile_registry(
+    chain_key: u64,
+    provider: &DynProvider,
+) -> Result<Option<ResolvedOutbox>> {
+    let chain_info = IChainInfo::new(CHAIN_INFO_PRECOMPILE, provider);
+    let discovery_result = tokio::time::timeout(
+        PRECOMPILE_CALL_TIMEOUT,
+        chain_info.get_outbox_discovery_address(chain_key).call(),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "chain_key {chain_key}: get_outbox_discovery_address precompile call timed out \
+             after {PRECOMPILE_CALL_TIMEOUT:?}"
+        )
+    })?
+    .with_context(|| {
+        format!("chain_key {chain_key}: get_outbox_discovery_address precompile call failed")
+    })?;
+
+    if !discovery_result.exists || discovery_result.discoveryAddr.is_zero() {
+        return Ok(None);
+    }
+
+    let address = outbox_from_registry(chain_key, discovery_result.discoveryAddr, provider).await?;
+
+    Ok(Some(ResolvedOutbox {
+        address,
+        current_since_block: None,
+    }))
 }
 
 sol! {
@@ -159,6 +221,18 @@ sol! {
             external
             view
             returns (address factoryAddr, bool exists);
+
+        /// The Outbox discovery-registry contract governing `chainKey` (`OutboxDeployer`/
+        /// `OutboxDiscovery` in asc-contracts), from `pallet_supported_chains::OutboxDiscoveries`.
+        /// Unlike the factory above, this address is safe to trust directly: it is only ever
+        /// written through an access-controlled deploy path, so `outboxOf`/`defaultOutbox` on it
+        /// can be read straight into a resolved Outbox instead of scanning `OutboxCreated` logs.
+        /// `exists = false` (with `discoveryAddr` the zero address) when nothing is registered for
+        /// `chainKey`.
+        function get_outbox_discovery_address(uint64 chainKey)
+            external
+            view
+            returns (address discoveryAddr, bool exists);
     }
 }
 
@@ -506,6 +580,20 @@ impl FactoryResolver {
 impl OutboxResolver for FactoryResolver {
     async fn resolve(&self, route: &ChainRoute, provider: &DynProvider) -> Result<ResolvedOutbox> {
         let chain_key = route.chain_key;
+
+        // Prefer a registered discovery registry over the factory's log stream — see
+        // `resolve_from_precompile_registry`. Falls through unchanged to the factory scan below
+        // when no registry is registered for this chain key yet, so migration is automatic and
+        // gradual: no config change needed once governance sets the discovery address on-chain,
+        // and a chain key not yet migrated keeps resolving exactly as before.
+        if let Some(resolved) = resolve_from_precompile_registry(chain_key, provider).await? {
+            info!(
+                chain_key,
+                address = %resolved.address,
+                "🧭 resolved Outbox on-chain (discovery registry)"
+            );
+            return Ok(resolved);
+        }
 
         let chain_info = IChainInfo::new(CHAIN_INFO_PRECOMPILE, provider);
         let factory_result = tokio::time::timeout(

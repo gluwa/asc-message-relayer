@@ -300,7 +300,9 @@ Dockerfile               two-stage image build
 - **Generic intent target** — the claim submitter currently targets the bridge PoC's
   `CcBridge.claim`; when the reviewed `IUSCBridgeInbound.bridgeFromIntent` contracts deploy, the
   swap is an ABI + config change confined to `src/claim/` (identical proof arguments).
-- **Factory-based Outbox resolution depends on an unmerged creditcoin3 branch** —
-  `FactoryResolver` calls a chain-info precompile (`get_outbox_factory_address`) that only exists
-  on `writeability-off-usc-dev`, not yet on `main`/`usc-dev`. Until it merges, routes need an
-  explicit `outbox_address` on any network where the precompile isn't deployed.
+- **Outbox resolution depends on unmerged creditcoin3 branches** — `FactoryResolver` calls two
+  chain-info precompile getters, `get_outbox_factory_address` and `get_outbox_discovery_address`,
+  that only exist on `writeability-off-usc-dev` (the latter not yet merged even there), not on
+  `main`/`usc-dev`. Until both merge and deploy, routes need an explicit `outbox_address` on any
+  network where the precompile isn't available — see `resolve_from_precompile_registry` for the
+  registry-first path the discovery getter unlocks once it's live.
