@@ -114,11 +114,12 @@ impl OutboxResolver for RegistryResolver {
     }
 }
 
-/// Call `outboxOf(chainKey)` on `registry` and turn a zero answer into an error — shared by
-/// [`RegistryResolver`] (an explicitly configured `registry`) and
-/// [`resolve_from_precompile_registry`] (one looked up from the chain-info precompile): once a
-/// caller has a specific registry address to query, "registered but empty" is a hard failure, not
-/// a signal to try something else — that distinction belongs to the caller, before this runs.
+/// Call `outboxOf(chainKey)` on `registry` and turn a zero answer into an error. Used only by
+/// [`RegistryResolver`]'s explicitly configured `registry` — kept on `outboxOf`/`OutboxDeployer`
+/// deliberately, matching PR #45's original reasoning: `outboxOf` exists at the pinned
+/// contracts SHA and is drift-gate-checked today, while the better long-term target,
+/// `OutboxDiscovery.defaultOutbox` (see [`default_outbox_from_discovery`]), depends on
+/// asc-contracts#38, still unmerged. Swapping this one too is a follow-up once that pin moves.
 async fn outbox_from_registry(
     chain_key: u64,
     registry: Address,
@@ -161,13 +162,59 @@ async fn outbox_from_registry(
     Ok(address)
 }
 
+/// Call `defaultOutbox(chainKey)` on `discovery` and turn a zero answer into an error. Used only
+/// by [`resolve_from_precompile_registry`], whose registry address comes from the chain-info
+/// precompile rather than route config, so it is free to target the current interface directly
+/// instead of `outboxOf`/`OutboxDeployer` (see [`outbox_from_registry`]'s doc for why that one
+/// stays as-is). `defaultOutbox`, not `outboxOf`, is the confirmed source of truth: "the default
+/// deployed outbox for each chain via: `defaultOutbox(chainKey)` (not from deployer) because
+/// there will be multiple version[s] of outbox" (Kevin Nguyen, Slack, 28 Aug 2026).
+async fn default_outbox_from_discovery(
+    chain_key: u64,
+    discovery: Address,
+    provider: &DynProvider,
+) -> Result<Address> {
+    // `chainKey` is `uint32` on the contract side while the pallet and these mirrors carry it
+    // as `u64`. Reject anything unrepresentable rather than truncating: a silently wrapped key
+    // would read the registry for a *different* chain and bind the wrong Outbox.
+    let chain_key_u32 = u32::try_from(chain_key).with_context(|| {
+        format!(
+            "chain_key {chain_key} exceeds the uint32 the Outbox registry is keyed by, so it \
+             cannot be represented on-chain"
+        )
+    })?;
+
+    let discovery_contract = IOutboxDiscovery::new(discovery, provider);
+    let address = tokio::time::timeout(
+        PRECOMPILE_CALL_TIMEOUT,
+        discovery_contract.defaultOutbox(chain_key_u32).call(),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "chain_key {chain_key}: defaultOutbox on registry {discovery} timed out after \
+             {PRECOMPILE_CALL_TIMEOUT:?}"
+        )
+    })?
+    .with_context(|| {
+        format!("chain_key {chain_key}: defaultOutbox call on registry {discovery} failed")
+    })?;
+
+    if address.is_zero() {
+        anyhow::bail!(
+            "chain_key {chain_key}: registry {discovery} has no default Outbox for this chain \
+             key (defaultOutbox returned the zero address)"
+        );
+    }
+
+    Ok(address)
+}
+
 /// Look up the discovery-registry address for `chain_key` from the chain-info precompile and, if
-/// one is registered, resolve the Outbox from it via [`outbox_from_registry`] — the same read
-/// [`RegistryResolver`] performs from an explicit `outbox_registry_address`, just with the
-/// registry address itself also sourced on-chain instead of from route config. This is what makes
-/// registry-based resolution the automatic default for [`FactoryResolver`] rather than something
-/// every route must opt into: no config change is needed once governance registers a discovery
-/// address for a chain key.
+/// one is registered, resolve the Outbox from it via [`default_outbox_from_discovery`]. This is
+/// what makes registry-based resolution the automatic default for [`FactoryResolver`] rather than
+/// something every route must opt into: no config change is needed once governance registers a
+/// discovery address for a chain key.
 ///
 /// Returns `Ok(None)` — not an error — when no discovery address is registered for `chain_key`
 /// yet, so the caller falls through to the factory scan in that case. Any other failure (a
@@ -197,7 +244,8 @@ async fn resolve_from_precompile_registry(
         return Ok(None);
     }
 
-    let address = outbox_from_registry(chain_key, discovery_result.discoveryAddr, provider).await?;
+    let address =
+        default_outbox_from_discovery(chain_key, discovery_result.discoveryAddr, provider).await?;
 
     Ok(Some(ResolvedOutbox {
         address,
@@ -222,17 +270,28 @@ sol! {
             view
             returns (address factoryAddr, bool exists);
 
-        /// The Outbox discovery-registry contract governing `chainKey` (`OutboxDeployer`/
-        /// `OutboxDiscovery` in asc-contracts), from `pallet_supported_chains::OutboxDiscoveries`.
-        /// Unlike the factory above, this address is safe to trust directly: it is only ever
-        /// written through an access-controlled deploy path, so `outboxOf`/`defaultOutbox` on it
-        /// can be read straight into a resolved Outbox instead of scanning `OutboxCreated` logs.
-        /// `exists = false` (with `discoveryAddr` the zero address) when nothing is registered for
-        /// `chainKey`.
+        /// The Outbox discovery-registry contract governing `chainKey` (`OutboxDiscovery` in
+        /// asc-contracts), from `pallet_supported_chains::OutboxDiscoveries`. Unlike the factory
+        /// above, this address is safe to trust directly: it is only ever written through an
+        /// access-controlled deploy path, so `defaultOutbox` on it can be read straight into a
+        /// resolved Outbox instead of scanning `OutboxCreated` logs. `exists = false` (with
+        /// `discoveryAddr` the zero address) when nothing is registered for `chainKey`.
         function get_outbox_discovery_address(uint64 chainKey)
             external
             view
             returns (address discoveryAddr, bool exists);
+    }
+
+    /// `IOutboxDiscovery` (asc-contracts#38, unmerged as of this binding — not yet checked by the
+    /// `abi_surface` drift gate, same treatment as `IChainInfo` above). Confirmed as the source of
+    /// truth on Slack (Kevin Nguyen, 28 Aug 2026): "the default deployed outbox for each chain
+    /// via: defaultOutbox(chainKey) (not from deployer) because there will be multiple version[s]
+    /// of outbox".
+    #[sol(rpc)]
+    #[derive(Debug)]
+    contract IOutboxDiscovery {
+        /// The default Outbox for `chainKey`, or the zero address if none.
+        function defaultOutbox(uint32 chainKey) external view returns (address);
     }
 }
 
