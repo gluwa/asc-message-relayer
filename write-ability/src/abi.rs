@@ -164,12 +164,16 @@ sol! {
     contract IInbox {
         /// Submit an aggregated set of attestor votes that prove `messageId` was finalized
         /// on Creditcoin. Calldata is byte-identical to what attestors signed.
+        /// Post asc-contracts #45 the Inbox takes the source `outbox` (second argument, must be
+        /// on its allowlist) and is `payable`: `msg.value` must equal the envelope's
+        /// `nativeCoinValue` or the DispatcherRouter reverts `InvalidNativeCoinValue`.
         function deliverMessage(
             bytes32 messageId,
+            address outbox,
             address emitterAddress,
-            bytes calldata payload,
+            bytes calldata messagePayload,
             bytes calldata votes
-        ) external;
+        ) external payable;
 
         /// Retry a message previously left in the `MessagePending` state (e.g. dApp ran out
         /// of gas during `receiveMessage`). Permissionless.
@@ -222,6 +226,9 @@ sol! {
     contract IMessageReceiver {
         /// `messageId` already ran this receiver's callback; delivering it again is a no-op.
         error MessageAlreadyProcessed(bytes32 messageId);
+        /// `outbox` is not on this Inbox's allowlist (asc-contracts #45). Terminal: no retry
+        /// can fix a message published on an Outbox the destination does not trust.
+        error UnsupportedOutbox(address outbox);
     }
 
     #[sol(rpc)]

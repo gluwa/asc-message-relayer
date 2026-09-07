@@ -63,6 +63,9 @@ pub struct IndexedMessage {
     pub chain_key: u64,
     pub message_id: B256,
     pub emitter: Address,
+    /// The Outbox the event was scanned from: part of the signed hash and the second
+    /// `deliverMessage` argument (asc-contracts #45).
+    pub outbox: Address,
     pub destination_chain_key: B256,
     pub creditcoin_chain_id: u64,
     pub payload: Vec<u8>,
@@ -407,6 +410,7 @@ async fn poll_once<P: Provider>(
                 let hash = message_hash(
                     decoded.data.messageId,
                     emitter,
+                    outbox,
                     destination_chain_key,
                     creditcoin_chain_id,
                     &payload,
@@ -415,6 +419,7 @@ async fn poll_once<P: Provider>(
                     chain_key,
                     message_id: decoded.data.messageId,
                     emitter,
+                    outbox,
                     destination_chain_key,
                     creditcoin_chain_id,
                     payload,
