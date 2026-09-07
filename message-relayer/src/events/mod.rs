@@ -6,7 +6,7 @@
 //! §6.2: votes for `messageHash`es we have not indexed are dropped on arrival.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, B256};
 use alloy::providers::{Provider, ProviderBuilder};
@@ -17,12 +17,16 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+pub mod finality;
+
 use crate::abi::IOutbox;
 use crate::checkpoint::CheckpointStore;
 use crate::config::ChainRoute;
 use crate::hash::message_hash;
 use crate::prom::Metrics;
 use write_ability::protocol::chain_key_to_bytes32;
+
+use finality::{pick_to_block, read_finalized_head, FinalityPolicy, FinalityTracker};
 
 pub mod factory;
 
@@ -208,6 +212,20 @@ pub async fn watch_outbox(
         }
     };
 
+    // Creditcoin has deterministic finality, so scan up to the finalized head, exactly where the
+    // attestors sign. `block_confirmation_depth` is only the fallback when the `finalized` tag is
+    // unavailable or finality has stalled (see `events::finality`). With depth 32 at ~6 s blocks
+    // the old `tip - depth` boundary cost ~3 minutes per message on usc-devnet.
+    let policy = FinalityPolicy::Finalized {
+        fallback_depth: route.block_confirmation_depth,
+    };
+    let mut finality = FinalityTracker::new(Instant::now());
+    info!(
+        chain_key,
+        fallback_depth = route.block_confirmation_depth,
+        "📡 Outbox scan boundary: Creditcoin finalized head (depth is the fallback only)"
+    );
+
     let mut tick = tokio::time::interval(Duration::from_secs(DEFAULT_POLL_INTERVAL_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -269,7 +287,8 @@ pub async fn watch_outbox(
                     outbox,
                     destination_chain_key,
                     creditcoin_chain_id,
-                    route.block_confirmation_depth,
+                    &policy,
+                    &mut finality,
                     &provider,
                     &mut last_seen,
                     &indexed_tx,
@@ -309,7 +328,8 @@ async fn poll_once<P: Provider>(
     outbox: Address,
     destination_chain_key: B256,
     creditcoin_chain_id: u64,
-    confirmation_depth: u64,
+    policy: &FinalityPolicy,
+    finality: &mut FinalityTracker,
     provider: &P,
     last_seen: &mut u64,
     indexed_tx: &mpsc::Sender<IndexedMessage>,
@@ -317,7 +337,31 @@ async fn poll_once<P: Provider>(
     cancel: &CancellationToken,
 ) -> Result<()> {
     let tip = provider.get_block_number().await?;
-    let confirmed = tip.saturating_sub(confirmation_depth);
+    // Only ask for the finalized head when the policy can use it; a depth policy never does.
+    let finalized = match policy {
+        FinalityPolicy::Finalized { .. } => read_finalized_head(provider, chain_key).await,
+        FinalityPolicy::Depth(_) => None,
+    };
+    let was_fallback = finality.in_fallback();
+    let confirmed = pick_to_block(finalized, tip, policy, finality, Instant::now());
+    if finality.in_fallback() != was_fallback {
+        if finality.in_fallback() {
+            warn!(
+                chain_key,
+                tip,
+                ?finalized,
+                to_block = confirmed,
+                "Outbox scan switched to the depth fallback (finalized head unavailable or stalled)"
+            );
+        } else {
+            info!(
+                chain_key,
+                tip,
+                ?finalized,
+                "Outbox scan back on the finalized head"
+            );
+        }
+    }
     if confirmed <= *last_seen {
         return Ok(());
     }
