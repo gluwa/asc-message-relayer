@@ -22,8 +22,8 @@ use alloy::primitives::keccak256;
 use alloy::sol_types::{SolCall, SolError, SolEvent};
 use std::path::{Path, PathBuf};
 use write_ability::abi::{
-    IAcknowledgmentValidator, IInbox, IMessageReceiver, IOutbox, IOutboxDeployer, IOutboxFactory,
-    IRelayerContract, IVoteValidator,
+    IAcknowledgmentValidator, IInbox, IMessageReceiver, IOutbox, IOutboxDeployer, IOutboxDiscovery,
+    IOutboxFactory, IRelayerContract, IVoteValidator,
 };
 
 /// Canonical ABI type for one artifact input/output, expanding structs: `tuple` →
@@ -390,8 +390,8 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
     // `outboxOf` is what RegistryResolver reads instead of scanning the factory's logs. Pinning it
     // here matters more than most: the whole point of reading the registry is that it cannot be
     // spoofed, so a silently-renamed getter would send us back to the log scan without anyone
-    // noticing. Post-asc-contracts#38 the equivalent is `OutboxDiscovery.defaultOutbox`, which
-    // gets its own assertion when the pin moves.
+    // noticing. Post-asc-contracts#38 the equivalent is `OutboxDiscovery.defaultOutbox`,
+    // asserted in its own block below.
     let deployer = Artifact::load(
         &contracts,
         "deployer/OutboxDeployer.sol/OutboxDeployer.json",
@@ -400,6 +400,74 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
         "function",
         "outboxOf(uint32)",
         &IOutboxDeployer::outboxOfCall::SELECTOR,
+    );
+
+    // --- OutboxDiscovery (source chain) ---
+    //
+    // Both events and reads. A moved topic0 silently blinds a subscription, and the timelock
+    // events are our only advance notice before a default changes or an Outbox is removed. A
+    // moved selector makes a read revert with empty returndata, which the registry-first resolver
+    // cannot distinguish from "no Outbox for this chain key" — it would resolve to nothing and
+    // idle. Deliberately NOT asserting `activeOutboxCount`: it existed in the reviewed revision
+    // of #38 and was dropped before merge.
+    let discovery = Artifact::load(
+        &contracts,
+        "deployer/OutboxDiscovery.sol/OutboxDiscovery.json",
+    );
+    discovery.assert_mirrored(
+        "event",
+        IOutboxDiscovery::OutboxRegistered::SIGNATURE,
+        &IOutboxDiscovery::OutboxRegistered::SIGNATURE_HASH.0,
+    );
+    discovery.assert_mirrored(
+        "event",
+        IOutboxDiscovery::OutboxRemovalScheduled::SIGNATURE,
+        &IOutboxDiscovery::OutboxRemovalScheduled::SIGNATURE_HASH.0,
+    );
+    discovery.assert_mirrored(
+        "event",
+        IOutboxDiscovery::DefaultOutboxChangeScheduled::SIGNATURE,
+        &IOutboxDiscovery::DefaultOutboxChangeScheduled::SIGNATURE_HASH.0,
+    );
+    discovery.assert_mirrored(
+        "event",
+        IOutboxDiscovery::PendingDefaultCancelled::SIGNATURE,
+        &IOutboxDiscovery::PendingDefaultCancelled::SIGNATURE_HASH.0,
+    );
+    discovery.assert_mirrored(
+        "event",
+        IOutboxDiscovery::PendingRemovalCancelled::SIGNATURE,
+        &IOutboxDiscovery::PendingRemovalCancelled::SIGNATURE_HASH.0,
+    );
+    discovery.assert_mirrored(
+        "function",
+        "defaultOutbox(uint32)",
+        &IOutboxDiscovery::defaultOutboxCall::SELECTOR,
+    );
+    discovery.assert_mirrored(
+        "function",
+        "activeOutboxes(uint32)",
+        &IOutboxDiscovery::activeOutboxesCall::SELECTOR,
+    );
+    discovery.assert_mirrored(
+        "function",
+        "isActiveOutbox(uint32,address)",
+        &IOutboxDiscovery::isActiveOutboxCall::SELECTOR,
+    );
+    discovery.assert_mirrored(
+        "function",
+        "defaultDeployer()",
+        &IOutboxDiscovery::defaultDeployerCall::SELECTOR,
+    );
+    discovery.assert_mirrored(
+        "function",
+        "pendingDefaultOutbox(uint32)",
+        &IOutboxDiscovery::pendingDefaultOutboxCall::SELECTOR,
+    );
+    discovery.assert_mirrored(
+        "function",
+        "pendingRemovalBlock(uint32,address)",
+        &IOutboxDiscovery::pendingRemovalBlockCall::SELECTOR,
     );
 
     // --- OutboxFactory (source chain) ---
