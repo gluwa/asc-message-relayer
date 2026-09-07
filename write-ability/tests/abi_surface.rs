@@ -466,8 +466,8 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
     );
     discovery.assert_mirrored(
         "function",
-        "pendingRemovalTime(uint32,address)",
-        &IOutboxDiscovery::pendingRemovalTimeCall::SELECTOR,
+        "pendingRemovalBlock(uint32,address)",
+        &IOutboxDiscovery::pendingRemovalBlockCall::SELECTOR,
     );
 
     // --- OutboxFactory (source chain) ---
