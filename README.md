@@ -119,21 +119,21 @@ retry silently forever:
   discovery time against whichever Outbox is currently resolved (next bullet), so it is immune to
   a later Outbox rotation retroactively changing which contract an already-queued message is
   checked against.
-- **Outbox resolution follows rotation** — a route with no `outbox_address` configured resolves
-  its Outbox from the chain key alone (on-chain factory lookup + `OutboxCreated` log scan) and
-  re-checks periodically, so a factory-level Outbox rotation is picked up without a restart. New
-  discovery moves to the new address; already-indexed/pending work is unaffected.
+- **Outbox resolution follows rotation** — every route resolves its Outbox from the chain key
+  alone: a chain-info precompile lookup for the `OutboxDiscovery` registry address, then
+  `defaultOutbox(chainKey)` on that registry (asc-contracts#38) — no operator-supplied address, no
+  factory log scan. Re-checked periodically, so a registry-level rotation (`setDefaultOutbox`) is
+  picked up without a restart. New discovery moves to the new address; already-indexed/pending
+  work is unaffected. A chain key with no discovery address registered fails closed.
 - **Checkpoints + startup lookback** — block cursors persist to `--checkpoint-path` so restarts
   never skip events. Because votes and pending acks are memory-only, cursors are rewound by
   `scan_lookback_blocks` (default 600) on startup: in-flight work is re-discovered, and
   already-finished work resolves idempotently (delivered → `Already validated` at simulate,
   acked → skipped by the pre-check). The Outbox watcher's checkpoint additionally records which
   Outbox address it was scanned against, so a restart can tell a valid long-running cursor apart
-  from one left over from a since-rotated-away Outbox. `FactoryResolver`'s own `OutboxCreated`
-  discovery scan (against the factory contract, not the Outbox) persists the same way, under the
-  same checkpoint file: a restart resumes that scan instead of rescanning the factory's full log
-  history from genesis, and a checkpoint recorded against a factory since rotated away from is
-  discarded rather than reused.
+  from one left over from a since-rotated-away Outbox. Outbox resolution itself persists nothing —
+  a registry read is complete and authoritative on every call, so there is no scan cursor to
+  resume.
 - **Bounded everything** — vote cache (TTL + LRU cap), pending-ack queue (cap 10 000, oldest
   evicted), per-tick ack batch (256) and concurrency (8), 5 000-block `eth_getLogs` chunks (an
   over-large resume range would error on every tick forever on range-capped RPCs), 120 s receipt
@@ -167,7 +167,7 @@ message-relayer \
 message-relayer --single-route \
   --chain-key 7 --cc3-chain-id 102035 \
   --creditcoin-eth-rpc-url http://localhost:9944 \
-  --outbox-address 0x… --inbox-address 0x… \
+  --inbox-address 0x… \
   --destination-rpc-url http://localhost:8545 \
   --signer-key 0x… \
   --attestor-set 0xA…,0xB…,0xC…
@@ -178,39 +178,8 @@ Ack flags (`--ack-proof-gen-url`, `--ack-validator-address`, `--ack-signer-key`)
 together or not at all. `--checkpoint-path ""` disables persistence (watchers start at head).
 `--verbose` switches `info` → `debug` logging. A few poll cadences are env-only (no CLI flag,
 sensible defaults): `RELAYER_ACK_POLL_SECS`, `RELAYER_CLAIM_POLL_SECS`,
-`RELAYER_OUTBOX_RESOLVE_POLL_SECS` (how often a factory-resolved route re-checks for an Outbox
-rotation, default 60 s). `RELAYER_FACTORY_ROTATION_RESUME_FROM_CHECKPOINT` (bool, default `true`)
-controls how a factory-resolved route reacts to a rotation: by default it resumes the newly-current
-factory's `OutboxCreated` scan from the block height the previous factory's scan had already
-reached, instead of rescanning that factory's full history from genesis — cheap because nothing
-before that height could have driven a delivery through the not-yet-current Outbox. Set to `false`
-to force the always-genesis behavior, e.g. if a factory can have a permissionless `deployOutbox`
-predating the rotation itself.
-
-That resume is an assumption — that the rotated-to factory was itself deployed at rotation time —
-and it is now self-correcting when wrong. A scan that reaches the confirmed tip having matched
-nothing, and that started above the configured genesis block, **rewinds once and rescans from that
-floor** before reporting "no Outbox" (logged as `🪃 no OutboxCreated found above the resumed
-checkpoint`). Without it, re-pointing a chain key at a *pre-existing* factory strands it
-permanently: the cursor is persisted at the tip against that factory, so it reads back as a valid
-checkpoint and a restart entrenches the failure instead of clearing it. The rewind fires at most
-once per factory, so a factory that genuinely has no Outbox costs one extra scan and then settles.
-
-Expect that one-time rewind on the first resolve after upgrading to a build with this fallback,
-too, for any chain key whose checkpoint predates it and still has no Outbox: a bare pre-upgrade
-record carries no floor of its own, so it loads with one assumed at its cursor — the same reading
-that heals a rotation stranded on an older build. There is no way to tell that healthy "no Outbox
-yet" cursor apart from a stranded one after the fact, so both get the one rescan; a single `🪃` per
-still-Outbox-less chain key on upgrade day is expected, not an incident.
-
-`RELAYER_FACTORY_SCAN_GENESIS_BLOCK` (u64, default `0`) is the block every *from-scratch*
-`OutboxCreated` scan starts at — a first boot with no checkpoint, a rotation with the flag above
-disabled, and the rewind. Raising it to a height known to precede the chain key's factory
-deployment is what makes those scans cheap on a long-lived chain. It is a floor for scans with **no**
-position, never a rewind of one that has it: a persisted checkpoint, or a rotation resuming from
-one, is kept even when it sits below this value. Set it *above* a factory's `OutboxCreated` and that
-Outbox becomes undiscoverable, the rewind included — so use a height that precedes every factory the
-chain key will be pointed at.
+`RELAYER_OUTBOX_RESOLVE_POLL_SECS` (how often a route re-checks the discovery registry for an
+Outbox rotation, default 60 s).
 
 ## HTTP API
 
@@ -276,8 +245,8 @@ message-relayer/         the relayer crate
   bin/relayer.rs         CLI entrypoint (clap; --config or --single-route)
   src/lib.rs             Server: worker wiring, channels, supervisor JoinSet
   src/config.rs          YAML schema + validation (see config.example.yaml)
-  src/events/            Outbox watcher + outbox resolver (static outbox_address, or on-chain
-                         factory-based resolution when it's omitted; see events/factory.rs)
+  src/events/            Outbox watcher + outbox resolver (discovery-registry resolution only;
+                         see events/factory.rs)
   src/pool/              vote aggregation state machine (allowlist, threshold, retries,
                          reobservation triggers, /votes queries, hot set-reload)
   src/p2p/               libp2p swarm: gossipsub topics, envelope codecs, peer metrics
@@ -300,9 +269,12 @@ Dockerfile               two-stage image build
 - **Generic intent target** — the claim submitter currently targets the bridge PoC's
   `CcBridge.claim`; when the reviewed `IUSCBridgeInbound.bridgeFromIntent` contracts deploy, the
   swap is an ABI + config change confined to `src/claim/` (identical proof arguments).
-- **Outbox resolution depends on unmerged creditcoin3 branches** — `FactoryResolver` calls two
-  chain-info precompile getters, `get_outbox_factory_address` and `get_outbox_discovery_address`,
-  that only exist on `writeability-off-usc-dev` (the latter not yet merged even there), not on
-  `main`/`usc-dev`. Until both merge and deploy, routes need an explicit `outbox_address` on any
-  network where the precompile isn't available — see `resolve_from_precompile_registry` for the
-  registry-first path the discovery getter unlocks once it's live.
+- **Outbox resolution depends on an unmerged creditcoin3 branch, with no fallback** — the
+  `get_outbox_discovery_address` chain-info precompile getter `DiscoveryResolver` calls only exists
+  on `writeability-off-usc-dev`, not yet on `main`/`usc-dev`. There is no config override anymore
+  (`ConfigOverrideResolver`/`outbox_address` was removed along with the rest of the deprecated
+  resolution paths per the asc-contracts team's guidance — see `events/factory.rs`'s module docs),
+  so **a route on a network without the precompile, or whose chain key has no discovery address
+  registered via `set_outbox_discovery_addr`, cannot resolve an Outbox at all** and fails closed.
+  Confirm both are in place — precompile deployed, discovery address registered and pointing at
+  the `OutboxDiscovery` proxy from asc-contracts#38 — before pointing this relayer at a network.

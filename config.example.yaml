@@ -57,10 +57,9 @@ routes:
     chain_key: 7
     # EVM chain id of the Creditcoin chain (bound into messageHash).
     creditcoin_chain_id: 102035
-    # Outbox on Creditcoin publishing this route's messages. Optional: omit it to resolve the
-    # Outbox automatically from chain_key via the on-chain factory instead — see README's "Known
-    # gaps" for which networks that currently works on.
-    outbox_address: "0x9D77bb69Bff057Db66d523F1D1a37e6a976a3af9"
+    # Outbox on Creditcoin publishing this route's messages is resolved automatically from
+    # chain_key via the on-chain OutboxDiscovery registry — see README's "Known gaps" for which
+    # networks that currently works on. Not configurable here.
     # Destination-chain RPC. https:// is preferred over wss:// — discovery is polling-based, and
     # idle websockets get killed by RPC load balancers (hourly reconnect noise).
     destination_rpc_url: "https://ethereum-sepolia-rpc.publicnode.com"

@@ -74,16 +74,6 @@ struct Cli {
     #[arg(long, env = "RELAYER_CC3_CHAIN_ID", required = false)]
     cc3_chain_id: Option<u64>,
 
-    /// Optional Outbox address override (else resolved from chain factory; PoC stub).
-    #[arg(long, env = "RELAYER_OUTBOX_ADDRESS", required = false)]
-    outbox_address: Option<String>,
-
-    /// `OutboxDeployer` / `OutboxDiscovery` address. Set this to resolve the Outbox by an
-    /// authoritative registry read instead of scanning the permissionless factory's logs, which
-    /// an attacker can spoof. Ignored when `--outbox-address` is given.
-    #[arg(long, env = "RELAYER_OUTBOX_REGISTRY_ADDRESS", required = false)]
-    outbox_registry_address: Option<String>,
-
     /// Destination chain RPC URL (HTTP or WS) for `Inbox.deliverMessage`.
     #[arg(long, env = "RELAYER_DESTINATION_RPC_URL", required = false)]
     destination_rpc_url: Option<String>,
@@ -252,21 +242,6 @@ fn single_route_config(cli: Cli) -> Result<Config> {
 
     let inbox_address = Address::from_str(inbox_raw.trim())
         .with_context(|| format!("invalid --inbox-address: {inbox_raw}"))?;
-    let outbox_address = cli
-        .outbox_address
-        .as_deref()
-        .map(|s| {
-            Address::from_str(s.trim()).with_context(|| format!("invalid --outbox-address: {s}"))
-        })
-        .transpose()?;
-    let outbox_registry_address = cli
-        .outbox_registry_address
-        .as_deref()
-        .map(|s| {
-            Address::from_str(s.trim())
-                .with_context(|| format!("invalid --outbox-registry-address: {s}"))
-        })
-        .transpose()?;
 
     let attestor_addresses: Vec<Address> = attestor_csv
         .split(',')
@@ -357,8 +332,6 @@ fn single_route_config(cli: Cli) -> Result<Config> {
     let route = ChainRoute {
         chain_key,
         creditcoin_chain_id: cc3_chain_id,
-        outbox_address,
-        outbox_registry_address,
         destination_rpc_url,
         inbox_address,
         signer_key: cli.signer_key,

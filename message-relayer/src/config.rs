@@ -72,12 +72,6 @@ pub struct Config {
 pub struct ChainRoute {
     pub chain_key: u64,
     pub creditcoin_chain_id: u64,
-    pub outbox_address: Option<Address>,
-    /// `OutboxDeployer` (or, post-asc-contracts#38, `OutboxDiscovery`) on the source chain. When
-    /// set, the Outbox is resolved by reading that registry instead of scanning the factory's
-    /// `OutboxCreated` logs — see [`crate::events::RegistryResolver`] for why that matters.
-    /// Ignored when `outbox_address` is set, since an explicit address needs no discovery.
-    pub outbox_registry_address: Option<Address>,
     pub destination_rpc_url: String,
     pub inbox_address: Address,
     pub signer_key: Option<String>,
@@ -351,12 +345,6 @@ impl Default for DeliveryConfigFile {
 pub struct ChainRouteFile {
     pub chain_key: u64,
     pub creditcoin_chain_id: u64,
-    #[serde(default)]
-    pub outbox_address: Option<String>,
-    /// Set this to move the route off log-scanning discovery and onto an authoritative registry
-    /// read. See [`ChainRoute::outbox_registry_address`].
-    #[serde(default)]
-    pub outbox_registry_address: Option<String>,
     pub destination_rpc_url: String,
     pub inbox_address: String,
     #[serde(default)]
@@ -483,23 +471,6 @@ impl ChainRouteFile {
     fn into_route(self) -> Result<ChainRoute> {
         let inbox_address = parse_address(&self.inbox_address)
             .with_context(|| format!("invalid inbox_address for chain_key {}", self.chain_key))?;
-        let outbox_address = self
-            .outbox_address
-            .as_deref()
-            .map(parse_address)
-            .transpose()
-            .with_context(|| format!("invalid outbox_address for chain_key {}", self.chain_key))?;
-        let outbox_registry_address = self
-            .outbox_registry_address
-            .as_deref()
-            .map(parse_address)
-            .transpose()
-            .with_context(|| {
-                format!(
-                    "invalid outbox_registry_address for chain_key {}",
-                    self.chain_key
-                )
-            })?;
         let relayer_contract_address = self
             .relayer_contract_address
             .as_deref()
@@ -596,8 +567,6 @@ impl ChainRouteFile {
         Ok(ChainRoute {
             chain_key: self.chain_key,
             creditcoin_chain_id: self.creditcoin_chain_id,
-            outbox_address,
-            outbox_registry_address,
             destination_rpc_url: self.destination_rpc_url,
             inbox_address,
             signer_key: self.signer_key,
@@ -641,7 +610,6 @@ delivery:
 routes:
   - chain_key: 2
     creditcoin_chain_id: 102031
-    outbox_address: "0x0000000000000000000000000000000000000001"
     destination_rpc_url: "http://localhost:8545"
     inbox_address: "0x0000000000000000000000000000000000000002"
     block_confirmation_depth: 12
@@ -833,98 +801,5 @@ mod poll_override_tests {
             "garbage rejected"
         );
         assert_eq!(super::poll_secs_override("TEST_POLL_UNSET", 6), 6);
-    }
-}
-
-/// Environment override for a boolean feature flag. Accepts `1`/`0`, `true`/`false`, `yes`/`no`,
-/// `on`/`off` (case-insensitive). Returns `default` when unset, empty, or unparseable — never
-/// fails startup on a typo, matching [`poll_secs_override`]'s fail-safe shape.
-pub fn bool_env_override(var: &str, default: bool) -> bool {
-    match std::env::var(var) {
-        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => true,
-            "0" | "false" | "no" | "off" => false,
-            _ => {
-                tracing::warn!(
-                    var,
-                    raw,
-                    default,
-                    "invalid boolean override — using default"
-                );
-                default
-            }
-        },
-        Err(_) => default,
-    }
-}
-
-/// Environment override for a `u64` block height. Returns `default` when unset, empty, or
-/// unparseable — never fails startup on a typo, matching [`poll_secs_override`]'s and
-/// [`bool_env_override`]'s fail-safe shape. Unlike the poll override there is no clamp: any block
-/// height is a legitimate value, and the only way to get it wrong is to aim it above the event you
-/// are looking for, which no bound this function could impose would catch.
-pub fn block_env_override(var: &str, default: u64) -> u64 {
-    match std::env::var(var) {
-        Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(block) => {
-                if block != default {
-                    tracing::info!(var, block, default, "⛏️ scan genesis block overridden");
-                }
-                block
-            }
-            Err(_) => {
-                tracing::warn!(var, raw, default, "invalid block override — using default");
-                default
-            }
-        },
-        Err(_) => default,
-    }
-}
-
-#[cfg(test)]
-mod block_override_tests {
-    #[test]
-    fn parses_overrides_and_falls_back_safely() {
-        std::env::set_var("TEST_BLOCK_A", "705530");
-        assert_eq!(super::block_env_override("TEST_BLOCK_A", 0), 705_530);
-        std::env::set_var("TEST_BLOCK_B", "  42  ");
-        assert_eq!(
-            super::block_env_override("TEST_BLOCK_B", 0),
-            42,
-            "surrounding whitespace is trimmed, as in the sibling overrides"
-        );
-        std::env::set_var("TEST_BLOCK_C", "0");
-        assert_eq!(
-            super::block_env_override("TEST_BLOCK_C", 900),
-            0,
-            "zero is a meaningful value here (genesis), not a rejected one"
-        );
-        std::env::set_var("TEST_BLOCK_D", "not-a-block");
-        assert_eq!(
-            super::block_env_override("TEST_BLOCK_D", 700),
-            700,
-            "garbage falls back to default"
-        );
-        assert_eq!(super::block_env_override("TEST_BLOCK_UNSET", 12), 12);
-    }
-}
-
-#[cfg(test)]
-mod bool_override_tests {
-    #[test]
-    fn parses_overrides_and_falls_back_safely() {
-        std::env::set_var("TEST_BOOL_A", "false");
-        assert!(!super::bool_env_override("TEST_BOOL_A", true));
-        std::env::set_var("TEST_BOOL_B", "1");
-        assert!(super::bool_env_override("TEST_BOOL_B", false));
-        std::env::set_var("TEST_BOOL_C", "On");
-        assert!(super::bool_env_override("TEST_BOOL_C", false));
-        std::env::set_var("TEST_BOOL_D", "nonsense");
-        assert!(
-            super::bool_env_override("TEST_BOOL_D", true),
-            "garbage falls back to default"
-        );
-        assert!(super::bool_env_override("TEST_BOOL_UNSET", true));
-        assert!(!super::bool_env_override("TEST_BOOL_UNSET_2", false));
     }
 }
