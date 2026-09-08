@@ -2,10 +2,14 @@
 //!
 //! One [`OutboxResolver`] implementation — [`DiscoveryResolver`] — used by every route. It reads
 //! the discovery-registry address off the chain-info precompile (see
-//! [`resolve_from_precompile_registry`]) and calls `defaultOutbox` on it. There is no fallback:
-//! scanning the factory's permissionless `OutboxCreated` logs, and the config-driven
-//! `outbox_address`/`outbox_registry_address` overrides that used to exist alongside it, are gone
-//! — `OutboxDiscovery` (asc-contracts#38) is the only source of truth resolution trusts.
+//! [`resolve_from_precompile_registry`]) and calls `defaultOutbox` on it. There is no scan
+//! fallback: the factory's permissionless `OutboxCreated` logs and the config-driven
+//! `outbox_registry_address` override are gone — `OutboxDiscovery` (asc-contracts#38) is the only
+//! source of truth the production path trusts.
+//!
+//! The one exception is `outbox_address` (route config / `--outbox-address`), an operator-pinned
+//! override checked before the registry lookup — see [`DiscoveryResolver::override_address`] for
+//! when to use it.
 
 use alloy::primitives::{address, Address};
 use alloy::providers::DynProvider;
@@ -160,21 +164,41 @@ const CHAIN_INFO_PRECOMPILE: Address = address!("0000000000000000000000000000000
 /// resolver (`events::watch_outbox` and `ack::run` share one resolver per route).
 const PRECOMPILE_CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Production resolver: finds the Outbox for `route.chain_key` entirely from on-chain state, no
-/// operator-supplied address or override — mirroring creditcoin3's own attestor-fleet resolver,
-/// which avoids a configured address on the same grounds ("an address supplied separately from the
-/// chain key may not correspond to it").
+/// Production resolver: finds the Outbox for `route.chain_key` from on-chain state — mirroring
+/// creditcoin3's own attestor-fleet resolver, which avoids a configured address on the same
+/// grounds ("an address supplied separately from the chain key may not correspond to it").
 ///
 /// A registry read is complete and authoritative on every call: no scan, no cursor, no persisted
 /// checkpoint, no genesis fallback. A chain key with nothing registered in `OutboxDiscovery` fails
-/// closed with a clear error rather than falling back to any spoofable or manually-pinned source.
+/// closed with a clear error rather than falling back to any spoofable source.
+///
+/// `override_address` is the one exception (Dylan, PR review, 8 Sep): an operator-pinned Outbox,
+/// honored before the registry lookup, for a network where the chain-info precompile getter is
+/// missing or misconfigured, or to pin an Outbox during an incident. `None` (the default) is the
+/// production path described above. Logged loudly on every resolve while set, not just once at
+/// startup — this bypasses the fail-closed default, so it should stay visible for as long as it's
+/// in effect, not just when someone happens to be watching the startup log.
 #[derive(Debug, Default)]
-pub struct DiscoveryResolver;
+pub struct DiscoveryResolver {
+    pub override_address: Option<Address>,
+}
 
 #[async_trait]
 impl OutboxResolver for DiscoveryResolver {
     async fn resolve(&self, route: &ChainRoute, provider: &DynProvider) -> Result<ResolvedOutbox> {
         let chain_key = route.chain_key;
+        if let Some(address) = self.override_address {
+            tracing::warn!(
+                chain_key,
+                %address,
+                "⚠️ Outbox resolution overridden by outbox_address — bypassing the OutboxDiscovery \
+                 registry for this route"
+            );
+            return Ok(ResolvedOutbox {
+                address,
+                current_since_block: None,
+            });
+        }
         resolve_from_precompile_registry(chain_key, provider)
             .await?
             .with_context(|| {
@@ -200,6 +224,7 @@ mod tests {
             destination_rpc_url: "http://x".into(),
             inbox_address: address!("0000000000000000000000000000000000000002"),
             signer_key: None,
+            outbox_address: None,
             relayer_contract_address: None,
             block_confirmation_depth: 0,
             start_block: None,
@@ -276,10 +301,27 @@ mod tests {
         // error-shaping contract on `DiscoveryResolver::resolve` when the precompile call itself
         // can't be reached, which must still surface a chain_key-scoped error, not panic.
         let route = route_with(2);
-        let err = DiscoveryResolver
+        let err = DiscoveryResolver::default()
             .resolve(&route, &unused_provider())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("2"), "{err}");
+    }
+
+    /// The override, when set, short-circuits the registry lookup entirely — it must not touch
+    /// the provider at all, so this can assert against `unused_provider()` unconditionally.
+    #[tokio::test]
+    async fn override_address_bypasses_the_registry() {
+        let route = route_with(2);
+        let overridden = address!("00000000000000000000000000000000000000aa");
+        let resolver = DiscoveryResolver {
+            override_address: Some(overridden),
+        };
+        let resolved = resolver
+            .resolve(&route, &unused_provider())
+            .await
+            .expect("override must resolve without touching the provider");
+        assert_eq!(resolved.address, overridden);
+        assert_eq!(resolved.current_since_block, None);
     }
 }

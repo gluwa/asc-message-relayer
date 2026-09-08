@@ -59,7 +59,12 @@ routes:
     creditcoin_chain_id: 102035
     # Outbox on Creditcoin publishing this route's messages is resolved automatically from
     # chain_key via the on-chain OutboxDiscovery registry — see README's "Known gaps" for which
-    # networks that currently works on. Not configurable here.
+    # networks that currently works on.
+    # outbox_address: "0x3333333333333333333333333333333333333333"
+    # Operator-pinned override, checked before the registry lookup above. Leave unset — the
+    # registry is the source of truth. Set only for a network where the chain-info precompile
+    # getter is missing/misconfigured, or to pin an Outbox during an incident; logged loudly
+    # (WARN) at startup and on every resolve while set.
     # Destination-chain RPC. https:// is preferred over wss:// — discovery is polling-based, and
     # idle websockets get killed by RPC load balancers (hourly reconnect noise).
     destination_rpc_url: "https://ethereum-sepolia-rpc.publicnode.com"

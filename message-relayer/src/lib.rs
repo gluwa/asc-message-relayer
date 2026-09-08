@@ -221,15 +221,27 @@ impl Server {
         // One resolver per route, shared between its Outbox watcher and ack submitter below — both
         // need to agree on the same live Outbox address. Every route uses the same
         // `DiscoveryResolver`: it reads the discovery-registry address off the chain-info
-        // precompile and calls `defaultOutbox` on it, with no override and no fallback — a chain
-        // key with nothing registered in `OutboxDiscovery` fails closed instead of resolving from
-        // any spoofable or manually-pinned source.
+        // precompile and calls `defaultOutbox` on it, no fallback — a chain key with nothing
+        // registered in `OutboxDiscovery` fails closed instead of resolving from any spoofable
+        // source. `route.outbox_address` is the one operator-pinned exception (see
+        // `DiscoveryResolver::override_address`); flagged here at startup as well as on every
+        // resolve (`DiscoveryResolver::resolve`) since it bypasses that fail-closed default.
         let resolvers: HashMap<u64, Arc<dyn OutboxResolver>> = self
             .config
             .routes
             .iter()
             .map(|route| {
-                let resolver: Arc<dyn OutboxResolver> = Arc::new(DiscoveryResolver);
+                if let Some(address) = route.outbox_address {
+                    tracing::warn!(
+                        chain_key = route.chain_key,
+                        %address,
+                        "⚠️ outbox_address is set for this route — Outbox resolution will bypass \
+                         the OutboxDiscovery registry entirely"
+                    );
+                }
+                let resolver: Arc<dyn OutboxResolver> = Arc::new(DiscoveryResolver {
+                    override_address: route.outbox_address,
+                });
                 (route.chain_key, resolver)
             })
             .collect();

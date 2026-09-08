@@ -86,6 +86,13 @@ struct Cli {
     #[arg(long, env = "RELAYER_SIGNER_KEY", required = false)]
     signer_key: Option<String>,
 
+    /// Operator-pinned Outbox address, honored before the on-chain OutboxDiscovery registry
+    /// lookup. The registry is the default and source of truth; set this only for a network
+    /// where the chain-info precompile getter is missing/misconfigured, or to pin an Outbox
+    /// during an incident. Logged loudly (WARN) at startup and on every resolve while set.
+    #[arg(long, env = "RELAYER_OUTBOX_ADDRESS", required = false)]
+    outbox_address: Option<String>,
+
     /// Comma-separated EVM addresses of trusted attestors (static allowlist).
     #[arg(long, env = "RELAYER_ATTESTOR_SET", required = false)]
     attestor_set: Option<String>,
@@ -242,6 +249,14 @@ fn single_route_config(cli: Cli) -> Result<Config> {
 
     let inbox_address = Address::from_str(inbox_raw.trim())
         .with_context(|| format!("invalid --inbox-address: {inbox_raw}"))?;
+    let outbox_address = cli
+        .outbox_address
+        .as_deref()
+        .map(|raw| {
+            Address::from_str(raw.trim())
+                .with_context(|| format!("invalid --outbox-address: {raw}"))
+        })
+        .transpose()?;
 
     let attestor_addresses: Vec<Address> = attestor_csv
         .split(',')
@@ -335,6 +350,7 @@ fn single_route_config(cli: Cli) -> Result<Config> {
         destination_rpc_url,
         inbox_address,
         signer_key: cli.signer_key,
+        outbox_address,
         relayer_contract_address,
         block_confirmation_depth: DEFAULT_BLOCK_CONFIRMATION_DEPTH,
         start_block: None,

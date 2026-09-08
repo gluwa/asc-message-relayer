@@ -269,12 +269,14 @@ Dockerfile               two-stage image build
 - **Generic intent target** — the claim submitter currently targets the bridge PoC's
   `CcBridge.claim`; when the reviewed `IUSCBridgeInbound.bridgeFromIntent` contracts deploy, the
   swap is an ABI + config change confined to `src/claim/` (identical proof arguments).
-- **Outbox resolution depends on an unmerged creditcoin3 branch, with no fallback** — the
+- **Outbox resolution depends on an unmerged creditcoin3 branch** — the
   `get_outbox_discovery_address` chain-info precompile getter `DiscoveryResolver` calls only exists
-  on `writeability-off-usc-dev`, not yet on `main`/`usc-dev`. There is no config override anymore
-  (`ConfigOverrideResolver`/`outbox_address` was removed along with the rest of the deprecated
-  resolution paths per the asc-contracts team's guidance — see `events/factory.rs`'s module docs),
-  so **a route on a network without the precompile, or whose chain key has no discovery address
-  registered via `set_outbox_discovery_addr`, cannot resolve an Outbox at all** and fails closed.
+  on `writeability-off-usc-dev`, not yet on `main`/`usc-dev`. **A route on a network without the
+  precompile, or whose chain key has no discovery address registered via
+  `set_outbox_discovery_addr`, cannot resolve an Outbox at all** and fails closed by default.
   Confirm both are in place — precompile deployed, discovery address registered and pointing at
   the `OutboxDiscovery` proxy from asc-contracts#38 — before pointing this relayer at a network.
+  `outbox_address` (route config / `--outbox-address`) is an operator-pinned escape hatch for
+  exactly that gap or an incident — see `events/factory.rs`'s module docs — but it bypasses the
+  registry entirely, so treat it as temporary and logged (WARN) loudly while set, not a substitute
+  for registering the chain key properly.

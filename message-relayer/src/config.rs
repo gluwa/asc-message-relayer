@@ -75,6 +75,12 @@ pub struct ChainRoute {
     pub destination_rpc_url: String,
     pub inbox_address: Address,
     pub signer_key: Option<String>,
+    /// Operator-pinned Outbox address, honored before the on-chain `OutboxDiscovery` registry
+    /// lookup (`DiscoveryResolver::override_address`). The registry is the default and the only
+    /// source of truth resolution otherwise trusts; set this only for a network where the
+    /// chain-info precompile getter is missing or misconfigured, or to pin an Outbox during an
+    /// incident. Logged loudly (`WARN`) at startup and on every resolve while set.
+    pub outbox_address: Option<Address>,
     /// `RelayerContract(Lite)` on the *source* (Creditcoin) chain — the contract holding the
     /// per-message fee ledger (`getMessageInfo`) and `claimDelivery` since usc-contracts #23 moved
     /// both off the RelayerFeeVault (the vault holds tokens only now). When set, the delivery
@@ -349,6 +355,9 @@ pub struct ChainRouteFile {
     pub inbox_address: String,
     #[serde(default)]
     pub signer_key: Option<String>,
+    /// See [`ChainRoute::outbox_address`].
+    #[serde(default)]
+    pub outbox_address: Option<String>,
     /// Accepts the pre-#23 key `relayer_fee_vault_address` as an alias so existing configs keep
     /// working; the ledger the relayer talks to is the RelayerContract now.
     #[serde(default, alias = "relayer_fee_vault_address")]
@@ -471,6 +480,12 @@ impl ChainRouteFile {
     fn into_route(self) -> Result<ChainRoute> {
         let inbox_address = parse_address(&self.inbox_address)
             .with_context(|| format!("invalid inbox_address for chain_key {}", self.chain_key))?;
+        let outbox_address = self
+            .outbox_address
+            .as_deref()
+            .map(parse_address)
+            .transpose()
+            .with_context(|| format!("invalid outbox_address for chain_key {}", self.chain_key))?;
         let relayer_contract_address = self
             .relayer_contract_address
             .as_deref()
@@ -570,6 +585,7 @@ impl ChainRouteFile {
             destination_rpc_url: self.destination_rpc_url,
             inbox_address,
             signer_key: self.signer_key,
+            outbox_address,
             relayer_contract_address,
             block_confirmation_depth: self.block_confirmation_depth,
             start_block: self.start_block,
