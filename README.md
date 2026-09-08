@@ -280,3 +280,15 @@ Dockerfile               two-stage image build
   exactly that gap or an incident — see `events/factory.rs`'s module docs — but it bypasses the
   registry entirely, so treat it as temporary and logged (WARN) loudly while set, not a substitute
   for registering the chain key properly.
+- **A restart during a live Outbox rotation can permanently skip early messages on the new
+  Outbox** — `OutboxDiscovery.defaultOutbox` is a bare address with no history, so
+  `DiscoveryResolver` cannot report when it actually started serving. On a normal (running)
+  rotation this is mostly harmless (the scan cursor carries over unchanged); the sharp edge is a
+  restart that lands after governance rotated to a new Outbox but before a fresh checkpoint for
+  it exists — resolution then falls back to `start_block` or the chain head, and any
+  `MessagePublished` already emitted on the new Outbox below that point is dropped with no
+  recovery path (reobservation recovers missing votes, not messages never discovered at all).
+  Deliberately not patched as a standalone fix — the planned per-Outbox multi-watch work
+  (`activeOutboxes` + `OutboxRegistered`, tracked as the next piece after this PR) determines each
+  listener's start block from that same event as part of its own design. See `events/factory.rs`'s
+  module docs.
