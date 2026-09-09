@@ -137,6 +137,7 @@ async fn pool_drops_votes_from_unknown_signers() {
         chain_key: 2,
         message_id: alloy::primitives::B256::from([7u8; 32]),
         emitter: address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        outbox: address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
         destination_chain_key: alloy::primitives::B256::ZERO,
         creditcoin_chain_id: 1,
         payload: vec![],

@@ -23,10 +23,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::network::EthereumWallet;
-use alloy::primitives::{Address, Bytes, B256};
+use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
-use alloy::sol_types::{SolError, SolEvent};
+use alloy::sol_types::{SolError, SolEvent, SolValue};
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -42,6 +42,23 @@ pub mod encode;
 /// Initial retry backoff. Subsequent attempts double the wait, capped by [`MAX_BACKOFF`].
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Most native value (destination wei) the relayer will front on one delivery. The relayer is only
+/// made whole on `claimDelivery`, so this is working capital at risk per message. Zero until the
+/// cap policy (per route, priced by the quoter) is decided with the contracts team; a nonzero
+/// `nativeCoinValue` is therefore refused as terminal today rather than silently delivered with
+/// the wrong `msg.value`.
+const MAX_NATIVE_COIN_VALUE_WEI: U256 = U256::ZERO;
+
+/// The `nativeCoinValue` an EVM `messagePayload` asks the dispatcher to forward, or zero when the
+/// payload is not the four-field envelope `abi.encode(destination, nativeCoinValue, gasLimit,
+/// payloadData)` (asc-contracts #36). Only the second word matters here; the router decodes the
+/// rest on-chain.
+fn envelope_native_value(payload: &[u8]) -> U256 {
+    <(Address, U256, U256, Bytes)>::abi_decode_params(payload)
+        .map(|(_, native_value, _, _)| native_value)
+        .unwrap_or(U256::ZERO)
+}
 
 /// Upper bound on waiting for a delivery receipt. Without it, one stuck (e.g. underpriced) tx
 /// blocks the route's serial worker — and every message queued behind it — indefinitely. On
@@ -101,6 +118,8 @@ pub struct DeliveryJob {
     pub chain_key: u64,
     pub message_id: B256,
     pub emitter: Address,
+    /// Source Outbox the message was scanned from; second `deliverMessage` argument (#45).
+    pub outbox: Address,
     pub message_hash: B256,
     pub payload: Vec<u8>,
     pub votes_calldata: Vec<u8>,
@@ -396,6 +415,22 @@ async fn handle_job<P: Provider + Clone + 'static>(
 ) -> Result<DeliveryResultKind> {
     let inbox = IInbox::new(route.inbox_address, provider);
 
+    // Since asc-contracts #36/#45 `deliverMessage` is `payable`: the relayer fronts the envelope's
+    // `nativeCoinValue` as `msg.value` and recovers it through the fee claim. The router reverts
+    // `InvalidNativeCoinValue` if the two differ, so read it from the payload rather than guess.
+    // A payload that is not a four-field envelope (legacy dApps, raw bytes) carries no value.
+    let native_value = envelope_native_value(&job.payload);
+    if native_value > MAX_NATIVE_COIN_VALUE_WEI {
+        warn!(
+            chain_key = route.chain_key,
+            message_id = %job.message_id,
+            %native_value,
+            cap = %MAX_NATIVE_COIN_VALUE_WEI,
+            "envelope asks the relayer to front more native value than the cap; refusing (terminal)"
+        );
+        return Ok(DeliveryResultKind::Terminal);
+    }
+
     if delivery_config.simulate_before_send {
         // Validity check only — do NOT pin `.gas()` here. The simulate exists to catch
         // `validateVotes` logic reverts; constraining it to the funded gas would conflate an
@@ -404,10 +439,12 @@ async fn handle_job<P: Provider + Clone + 'static>(
         if let Err(err) = inbox
             .deliverMessage(
                 job.message_id,
+                job.outbox,
                 job.emitter,
                 Bytes::from(job.payload.clone()),
                 Bytes::from(job.votes_calldata.clone()),
             )
+            .value(native_value)
             .call()
             .await
         {
@@ -455,10 +492,12 @@ async fn handle_job<P: Provider + Clone + 'static>(
             inbox
                 .deliverMessage(
                     job.message_id,
+                    job.outbox,
                     job.emitter,
                     Bytes::from(job.payload.clone()),
                     Bytes::from(job.votes_calldata.clone()),
                 )
+                .value(native_value)
                 .estimate_gas(),
         )
         .await;
@@ -544,12 +583,15 @@ async fn handle_job<P: Provider + Clone + 'static>(
     let mut attempts = 0u32;
     let outcome = loop {
         attempts += 1;
-        let mut tx = inbox.deliverMessage(
-            job.message_id,
-            job.emitter,
-            Bytes::from(job.payload.clone()),
-            Bytes::from(job.votes_calldata.clone()),
-        );
+        let mut tx = inbox
+            .deliverMessage(
+                job.message_id,
+                job.outbox,
+                job.emitter,
+                Bytes::from(job.payload.clone()),
+                Bytes::from(job.votes_calldata.clone()),
+            )
+            .value(native_value);
         if let Some(gas) = funding.gas {
             tx = tx.gas(gas);
         }
@@ -846,6 +888,43 @@ fn spawn_pending_retry<P: Provider + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A four-field envelope `abi.encode(destination, nativeCoinValue, gasLimit, payloadData)` yields
+    /// its second word; anything else (legacy raw payloads, truncated bytes) yields zero so the
+    /// delivery goes out with `msg.value == 0`, which is what every pre-envelope Inbox expects.
+    #[test]
+    fn envelope_native_value_reads_the_second_word_or_zero() {
+        let envelope = (
+            Address::repeat_byte(0x11),
+            U256::from(1_500u64),
+            U256::from(300_000u64),
+            Bytes::from(vec![0xde, 0xad]),
+        )
+            .abi_encode_params();
+        assert_eq!(envelope_native_value(&envelope), U256::from(1_500u64));
+
+        let zero_value = (
+            Address::repeat_byte(0x11),
+            U256::ZERO,
+            U256::from(300_000u64),
+            Bytes::from(vec![0xde, 0xad]),
+        )
+            .abi_encode_params();
+        assert_eq!(envelope_native_value(&zero_value), U256::ZERO);
+
+        assert_eq!(envelope_native_value(b"not an envelope"), U256::ZERO);
+        assert_eq!(envelope_native_value(&[]), U256::ZERO);
+        // Cut inside the head (only two of the four words present): the decoder cannot locate the
+        // dynamic tail, so this is not an envelope. Trimming tail *padding* is tolerated by the
+        // decoder and still yields the value, which is fine because the head words are intact.
+        assert_eq!(envelope_native_value(&envelope[..64]), U256::ZERO);
+    }
+
+    /// Until the cap policy is decided the relayer fronts nothing: the constant is the whole policy.
+    #[test]
+    fn native_value_cap_is_zero_until_policy_lands() {
+        assert_eq!(MAX_NATIVE_COIN_VALUE_WEI, U256::ZERO);
+    }
 
     // -------------------------------------------------------------------------------------
     // Top-up foreclosure. An under-funded delivery is retried on the assumption that a
