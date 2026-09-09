@@ -12,7 +12,8 @@ use alloy::primitives::Address;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use message_relayer::config::{
-    AckConfig, AttestorSet, ChainRoute, ClaimConfig, Config, P2pConfig,
+    validate_ack_not_ready_poll_secs, AckConfig, AttestorSet, ChainRoute, ClaimConfig, Config,
+    P2pConfig, DEFAULT_ACK_NOT_READY_POLL_SECS, DEFAULT_ACK_NOT_READY_POLL_WINDOW_SECS,
     DEFAULT_BLOCK_CONFIRMATION_DEPTH, DEFAULT_P2P_PORT,
 };
 use message_relayer::Server;
@@ -136,6 +137,25 @@ struct Cli {
     /// reorg guard). 0 for instant-finality destinations.
     #[arg(long, default_value_t = 0, env = "RELAYER_ACK_CONFIRMATION_DEPTH")]
     ack_confirmation_depth: u64,
+
+    /// Flat cadence (seconds, > 0) at which the ack submitter re-asks proof-gen for a delivery
+    /// proof it answered "not ready" for (422 BlockNotReady, or 404 while proof-gen's chain view
+    /// lags the tx). Not a failure, so it does not grow like the transient backoff.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_ACK_NOT_READY_POLL_SECS,
+        env = "RELAYER_ACK_NOT_READY_POLL_SECS"
+    )]
+    ack_not_ready_poll_secs: u64,
+
+    /// How long (seconds, from first sighting of a delivery) to keep that flat cadence before
+    /// sliding into the 30 s → 10 min slow backoff for a proof that never appears.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_ACK_NOT_READY_POLL_WINDOW_SECS,
+        env = "RELAYER_ACK_NOT_READY_POLL_WINDOW_SECS"
+    )]
+    ack_not_ready_poll_window_secs: u64,
 
     // ---------- claim submitter (opt-in; all four required to enable) --------------------------
     /// Proof-gen API base URL for claim proofs. Enables the claim submitter ("relayer on both
@@ -287,12 +307,18 @@ fn single_route_config(cli: Cli) -> Result<Config> {
         (Some(proof_gen_url), Some(validator_raw), Some(signer_key)) => {
             let validator_address = Address::from_str(validator_raw.trim())
                 .with_context(|| format!("invalid --ack-validator-address: {validator_raw}"))?;
+            validate_ack_not_ready_poll_secs(
+                cli.ack_not_ready_poll_secs,
+                "--ack-not-ready-poll-secs",
+            )?;
             Some(AckConfig {
                 proof_gen_url,
                 validator_address,
                 signer_key,
                 confirmation_depth: cli.ack_confirmation_depth,
                 start_block: None,
+                not_ready_poll_secs: cli.ack_not_ready_poll_secs,
+                not_ready_poll_window_secs: cli.ack_not_ready_poll_window_secs,
             })
         }
         (None, None, None) => None,

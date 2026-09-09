@@ -3,8 +3,24 @@
 //!
 //! `GET {base}/api/v1/proof-by-tx/{chain_key}/{tx_hash}` returns the prover `txBytes` (encoded
 //! tx + receipt) plus the merkle-inclusion and continuity proofs for the block containing the
-//! transaction. HTTP 422 means the block is not yet attested (`BlockNotReady`) — the normal early
-//! state of every request, mapped to [`ProofFetch::NotReady`] so callers defer instead of erroring.
+//! transaction.
+//!
+//! Two response classes mean "not yet" rather than "failed", and are mapped to
+//! [`ProofFetch::NotReady`] so callers poll instead of backing off as if the service were broken:
+//!
+//! - HTTP 422 `BlockNotReady` — the block exists but is not yet attested on Creditcoin. The normal
+//!   early state of every request (destination finality + attestation take minutes).
+//! - HTTP 404 (`TxHashNotFound`, `BlockNotOnSourceChain`, `AttestationsMissing`) — proof-gen's own
+//!   view of the destination chain has not caught up with the tx yet: its source RPC has not
+//!   indexed the tx, the block is still inside proof-gen's reorg-protection window, or the chain
+//!   has no attestations at all yet. On usc-devnet (2026-09-08) a delivery was answered 404 four
+//!   times over six minutes and then served normally; treating each 404 as a transient *error*
+//!   put the ack on the 30 s-doubling backoff and landed it 17 minutes after delivery, about four
+//!   of them pure backoff after the proof had become available. A tx hash that genuinely never
+//!   existed also answers 404 — the caller's bounded fast-poll window, slow backoff and age
+//!   give-up cover that case, so it is not worth classifying differently here.
+//!
+//! Everything else (5xx, connection errors, an unparseable proof) is an `Err`.
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -25,8 +41,67 @@ pub struct ProofGenClient {
 
 pub enum ProofFetch {
     Ready(SingleContinuityResponse),
-    /// HTTP 422 — the block containing the tx is not yet attested.
-    NotReady,
+    /// Proof-gen cannot serve this proof *yet* (HTTP 422 / 404 — see the module docs). Not an
+    /// error: callers poll on a steady cadence instead of backing off.
+    NotReady(ProofNotReady),
+}
+
+/// Why proof-gen could not serve a proof yet — carried on [`ProofFetch::NotReady`] so the
+/// caller's deferral log names the state instead of a bare "not ready".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProofNotReady {
+    /// HTTP status proof-gen answered with (422 or 404).
+    pub status: u16,
+    /// proof-gen's `code` from its JSON error body (`BlockNotReady`, `TxHashNotFound`, …), or the
+    /// status' canonical reason phrase when the body carried no parseable code.
+    pub code: String,
+}
+
+impl std::fmt::Display for ProofNotReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP {} {}", self.status, self.code)
+    }
+}
+
+/// The subset of proof-gen's `ErrorResponse` body we read back (`code` names its `ServiceError`
+/// variant). Everything else in the body is ignored.
+#[derive(Debug, Deserialize)]
+struct ProofGenErrorBody {
+    code: Option<String>,
+}
+
+/// Classify one proof-gen response into ready / not-ready / error. Pure, so the mapping is
+/// unit-tested without a server: `status` and `body` are the raw HTTP response, `url` only feeds
+/// error messages.
+pub fn classify_proof_response(
+    status: reqwest::StatusCode,
+    body: &str,
+    url: &str,
+) -> Result<ProofFetch> {
+    if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        || status == reqwest::StatusCode::NOT_FOUND
+    {
+        let code = serde_json::from_str::<ProofGenErrorBody>(body)
+            .ok()
+            .and_then(|b| b.code)
+            .filter(|c| !c.trim().is_empty())
+            .unwrap_or_else(|| {
+                status
+                    .canonical_reason()
+                    .unwrap_or("not ready")
+                    .replace(' ', "")
+            });
+        return Ok(ProofFetch::NotReady(ProofNotReady {
+            status: status.as_u16(),
+            code,
+        }));
+    }
+    if !status.is_success() {
+        anyhow::bail!("proof-gen returned {status} for {url}: {body}");
+    }
+    let parsed: SingleContinuityResponse = serde_json::from_str(body)
+        .with_context(|| format!("decoding proof-gen response from {url}"))?;
+    Ok(ProofFetch::Ready(parsed))
 }
 
 impl ProofGenClient {
@@ -53,21 +128,12 @@ impl ProofGenClient {
             .await
             .with_context(|| format!("GET {url} failed"))?;
 
-        // 422 (BlockNotReady) is expected while the destination block is still being attested.
-        if resp.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
-            return Ok(ProofFetch::NotReady);
-        }
         let status = resp.status();
         let body = resp
             .text()
             .await
             .with_context(|| format!("reading body of {url}"))?;
-        if !status.is_success() {
-            anyhow::bail!("proof-gen returned {status} for {url}: {body}");
-        }
-        let parsed: SingleContinuityResponse = serde_json::from_str(&body)
-            .with_context(|| format!("decoding proof-gen response from {url}"))?;
-        Ok(ProofFetch::Ready(parsed))
+        classify_proof_response(status, &body, &url)
     }
 }
 
@@ -207,6 +273,72 @@ mod tests {
         assert_eq!(merkle.siblings.len(), 1);
         assert!(merkle.siblings[0].isLeft);
         assert_eq!(continuity.roots.len(), 1);
+    }
+
+    fn not_ready(status: u16, body: &str) -> ProofNotReady {
+        let status = reqwest::StatusCode::from_u16(status).unwrap();
+        match classify_proof_response(status, body, "http://pg/api/v1/proof-by-tx/8/0x1").unwrap() {
+            ProofFetch::NotReady(r) => r,
+            ProofFetch::Ready(_) => panic!("{status} must not classify as Ready"),
+        }
+    }
+
+    /// The 2026-09-08 usc-devnet shape: proof-gen answered 404 while its view of the destination
+    /// chain lagged the delivery, and every 404 was treated as a transient error (30 s-doubling
+    /// backoff). 404 and 422 are both "not yet"; the body's `code` rides along for the log.
+    #[test]
+    fn classifies_404_and_422_as_not_ready_with_proof_gen_code() {
+        let r = not_ready(
+            422,
+            r#"{"code":"BlockNotReady","message":"...","retriable":true,"block_number":5,"last_attested_block":4}"#,
+        );
+        assert_eq!(r.status, 422);
+        assert_eq!(r.code, "BlockNotReady");
+        assert_eq!(r.to_string(), "HTTP 422 BlockNotReady");
+
+        for code in [
+            "TxHashNotFound",
+            "BlockNotOnSourceChain",
+            "AttestationsMissing",
+        ] {
+            let r = not_ready(
+                404,
+                &format!(r#"{{"code":"{code}","message":"x","retriable":false}}"#),
+            );
+            assert_eq!(r.status, 404);
+            assert_eq!(r.code, code);
+        }
+    }
+
+    /// A 404/422 without a parseable JSON body (a proxy's HTML page, an empty body) is still
+    /// not-ready — the status alone decides; the code falls back to the reason phrase.
+    #[test]
+    fn not_ready_without_a_json_body_falls_back_to_the_status_reason() {
+        assert_eq!(not_ready(404, "").code, "NotFound");
+        assert_eq!(not_ready(404, "<html>nope</html>").code, "NotFound");
+        assert_eq!(not_ready(422, r#"{"code":""}"#).code, "UnprocessableEntity");
+    }
+
+    /// Real failures keep erroring so they take the transient backoff, not the fast poll: 5xx,
+    /// 4xx other than 404/422, and a 200 whose body is not a proof.
+    #[test]
+    fn real_errors_stay_errors() {
+        let url = "http://pg/api/v1/proof-by-tx/8/0x1";
+        for status in [400u16, 401, 429, 500, 502, 503] {
+            let status = reqwest::StatusCode::from_u16(status).unwrap();
+            let err = classify_proof_response(status, r#"{"code":"Internal"}"#, url)
+                .err()
+                .unwrap_or_else(|| panic!("{status} must be an error"));
+            assert!(err.to_string().contains(&status.as_u16().to_string()));
+        }
+        assert!(
+            classify_proof_response(reqwest::StatusCode::OK, "not json", url).is_err(),
+            "a 200 with an undecodable body is an error, not a proof"
+        );
+        assert!(matches!(
+            classify_proof_response(reqwest::StatusCode::OK, SAMPLE, url).unwrap(),
+            ProofFetch::Ready(p) if p.header_number == 42
+        ));
     }
 
     #[test]

@@ -16,6 +16,47 @@ use alloy::primitives::B256;
 pub const TRANSIENT_BACKOFF_BASE: Duration = Duration::from_secs(30);
 pub const TRANSIENT_BACKOFF_MAX: Duration = Duration::from_secs(10 * 60);
 
+/// Retry schedule for a proof that proof-gen cannot serve *yet* (`ProofFetch::NotReady`: the
+/// destination block is not attested, or proof-gen's view of the destination chain has not caught
+/// up with the tx). This is the normal early state of every ack, not a failure, so it must not
+/// take the transient backoff: on usc-devnet (2026-09-08) four 404s on one delivery, each backed
+/// off as an error (30 s doubling), landed the ack 17 minutes after delivery — four of them pure
+/// backoff after the proof had already become available.
+///
+/// The schedule is a pure function of how long the tx has been waiting since it was first seen:
+/// a fixed short `poll_interval` for the first `poll_window`, then the same 30 s → 10 min
+/// exponential shape as the transient backoff (derived from the time past the window, so no
+/// attempt counter is needed) so a proof that never appears — a tx hash that does not exist, a
+/// block that is never attested — does not hot-loop until the caller's age give-up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotReadyPolicy {
+    /// Re-poll cadence while the tx has been waiting less than `poll_window`. Must be non-zero
+    /// (the config layer rejects 0).
+    pub poll_interval: Duration,
+    /// How long, since the tx was first seen, to keep the fixed cadence before sliding into the
+    /// slow backoff.
+    pub poll_window: Duration,
+}
+
+impl NotReadyPolicy {
+    /// Delay until the next attempt for a tx that has been waiting `waited` (since first seen)
+    /// and was just answered "not ready".
+    pub fn next_delay(&self, waited: Duration) -> Duration {
+        if waited < self.poll_window {
+            return self.poll_interval;
+        }
+        // Past the window: 30 s, 60 s, 120 s, … capped at 10 min, chosen from how far past the
+        // window we are. Consecutive polls at these delays reproduce the doubling sequence
+        // exactly (cumulative excess 0, 30, 90, 210, 450, 930 s), without a per-tx counter.
+        let excess = waited.saturating_sub(self.poll_window);
+        let steps = excess.as_secs() / TRANSIENT_BACKOFF_BASE.as_secs().max(1) + 1;
+        let exp = steps.ilog2().min(31);
+        TRANSIENT_BACKOFF_BASE
+            .saturating_mul(2u32.saturating_pow(exp))
+            .min(TRANSIENT_BACKOFF_MAX)
+    }
+}
+
 /// One tracked tx awaiting proof + submission.
 struct PendingTx {
     /// When the tx was first observed — drives cap eviction and the caller's max-age cutoff.
@@ -297,6 +338,76 @@ mod tests {
             Some(Duration::from_secs(5))
         );
         assert_eq!(p.age(&tx(2), t0), None);
+    }
+
+    /// Inside the window the cadence is flat — no growth, no attempt counting — so a proof that
+    /// becomes available is picked up within one `poll_interval`, not after a doubled backoff.
+    #[test]
+    fn not_ready_policy_polls_flat_inside_the_window() {
+        let policy = NotReadyPolicy {
+            poll_interval: Duration::from_secs(20),
+            poll_window: Duration::from_secs(30 * 60),
+        };
+        for waited_secs in [0u64, 20, 400, 6 * 60 + 38, 29 * 60 + 59] {
+            assert_eq!(
+                policy.next_delay(Duration::from_secs(waited_secs)),
+                Duration::from_secs(20),
+                "waited {waited_secs}s must still be on the flat cadence"
+            );
+        }
+        // The observed devnet case: four "not ready" answers over ~6 min, then the proof exists.
+        // Flat polling bounds the extra latency after availability to one interval.
+        let mut waited = Duration::ZERO;
+        let mut polls = 0;
+        while waited < Duration::from_secs(13 * 60) {
+            waited += policy.next_delay(waited);
+            polls += 1;
+        }
+        assert_eq!(polls, 39, "13 min of not-ready at 20 s is 39 polls");
+    }
+
+    /// Past the window the delays reproduce the transient backoff shape, 30 s doubling to a 10 min
+    /// cap, so a proof that never appears cannot hot-loop until the caller's age give-up.
+    #[test]
+    fn not_ready_policy_backs_off_past_the_window() {
+        let window = Duration::from_secs(30 * 60);
+        let policy = NotReadyPolicy {
+            poll_interval: Duration::from_secs(20),
+            poll_window: window,
+        };
+        let mut waited = window;
+        let mut delays = Vec::new();
+        for _ in 0..8 {
+            let d = policy.next_delay(waited);
+            delays.push(d.as_secs());
+            waited += d;
+        }
+        assert_eq!(delays, vec![30, 60, 120, 240, 480, 600, 600, 600]);
+        // Monotone non-decreasing everywhere past the window, and never below the base.
+        let mut last = Duration::ZERO;
+        for excess_secs in (0..3600).step_by(7) {
+            let d = policy.next_delay(window + Duration::from_secs(excess_secs));
+            assert!(d >= TRANSIENT_BACKOFF_BASE && d <= TRANSIENT_BACKOFF_MAX);
+            assert!(d >= last, "delay must not shrink as waiting grows");
+            last = d;
+        }
+    }
+
+    /// A zero window disables the fast poll entirely (straight to the slow backoff); a very long
+    /// window keeps the flat cadence for as long as the caller's age give-up allows.
+    #[test]
+    fn not_ready_policy_window_edges() {
+        let interval = Duration::from_secs(25);
+        let none = NotReadyPolicy {
+            poll_interval: interval,
+            poll_window: Duration::ZERO,
+        };
+        assert_eq!(none.next_delay(Duration::ZERO), TRANSIENT_BACKOFF_BASE);
+        let forever = NotReadyPolicy {
+            poll_interval: interval,
+            poll_window: Duration::MAX,
+        };
+        assert_eq!(forever.next_delay(Duration::from_secs(48 * 3600)), interval);
     }
 
     #[test]
