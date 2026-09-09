@@ -110,9 +110,15 @@ retry silently forever:
   so classification extracts the raw 4-byte custom-error selector and compares against the shared
   ABI's `SolError::SELECTOR` constants, with phrase and error-name fallbacks. String-matching
   decoded names alone *will* misclassify deterministic reverts as transient and loop forever.
-- **Ack lifecycle** — `BlockNotReady` (proof not attested yet) defers on a steady 15 s cadence
-  without penalty, bounded by a 24 h give-up; transient submit failures back off 30 s → 10 min and
-  give up loudly after 20 attempts (the unfunded-signer failure mode); reverts bubbling from the
+- **Ack lifecycle** — a proof that is *not ready yet* (proof-gen 422 `BlockNotReady`: destination
+  block not attested; or 404: proof-gen's own chain view has not caught up with the tx) is
+  re-polled on a flat cadence without penalty — `ack.not_ready_poll_secs` (default 20 s) for
+  `ack.not_ready_poll_window_secs` (default 30 min) from first sighting, then the 30 s → 10 min
+  slow backoff, bounded by a 24 h give-up. `relayer_ack_proof_fetches{outcome=Ready|NotReady|Error}`
+  separates that wait from real proof-gen failures (a 404 used to take the error backoff, which
+  turned a six-minute attestation lag into a 17-minute ack on usc-devnet). Transient submit
+  failures back off 30 s → 10 min and escalate loudly after 20 attempts (the unfunded-signer
+  failure mode); reverts bubbling from the
   Outbox (`MessageCannotBeAcknowledged`, `MessageAlreadyAcknowledged`, …) are terminal. A
   **canAck pre-check** reads the Outbox state first, so bridge-style `canAck=false` traffic costs
   a view call instead of a proof fetch + guaranteed-revert estimate — tagged per-message at

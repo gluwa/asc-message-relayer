@@ -41,6 +41,13 @@ pub trait MetricsTrait: Send + Sync + Debug {
     /// path (proof-gen down, signer unfunded) is visible even while messages keep delivering
     /// normally — see the `relayer_claim_*`/`relayer_ack_*` gap write-up this closes.
     fn inc_ack_submission(&self, chain_key: u64, outcome: SettlementOutcome);
+    /// One proof-gen `proof-by-tx` fetch by the ack submitter, by outcome. Splits the two reasons
+    /// an ack can be waiting: `NotReady` (proof-gen says "not yet" — 422 `BlockNotReady`, or 404
+    /// while its chain view lags; polled flat, expected to clear on its own) versus `Error` (5xx,
+    /// connection failure, undecodable proof; backed off exponentially, operator-relevant). Before
+    /// this split both showed up only as `relayer_ack_submissions{outcome="Failed"}` and a
+    /// four-minute pure-backoff stall after a 404 was indistinguishable from an outage.
+    fn inc_ack_proof_fetch(&self, chain_key: u64, outcome: ProofFetchOutcome);
     /// One `claimDelivery` relay-fee-claim attempt resolved, on the source-chain `RelayerContract`
     /// (see `crate::ack`'s `AckAndClaim` mode). Independent of `inc_ack_submission` since
     /// usc-contracts #23 decoupled the two settlements.
@@ -84,6 +91,7 @@ impl MetricsTrait for NoopMetrics {
     fn set_attestor_set_size(&self, _chain_key: u64, _size: i64) {}
     fn inc_attestor_set_reload(&self, _chain_key: u64) {}
     fn inc_ack_submission(&self, _chain_key: u64, _outcome: SettlementOutcome) {}
+    fn inc_ack_proof_fetch(&self, _chain_key: u64, _outcome: ProofFetchOutcome) {}
     fn inc_claim_submission(&self, _chain_key: u64, _outcome: SettlementOutcome) {}
     fn set_settlement_queue_depth(&self, _chain_key: u64, _depth: i64) {}
     fn set_signer_balance(
@@ -111,6 +119,7 @@ pub struct RelayerMetrics {
     attestor_set_size: Family<LabelChain, Gauge<i64, AtomicI64>>,
     attestor_set_reloads: Family<LabelChain, Counter<u64, AtomicU64>>,
     ack_submissions: Family<LabelSettlement, Counter<u64, AtomicU64>>,
+    ack_proof_fetches: Family<LabelProofFetch, Counter<u64, AtomicU64>>,
     claim_submissions: Family<LabelSettlement, Counter<u64, AtomicU64>>,
     settlement_queue_depth: Family<LabelChain, Gauge<i64, AtomicI64>>,
     signer_balance: Family<LabelSigner, Gauge<f64, AtomicU64>>,
@@ -201,6 +210,16 @@ impl RelayerMetrics {
             "relayer_ack_submissions",
             "submitAcknowledgment settlement attempts on the AcknowledgmentValidator, by outcome",
             ack_submissions.clone(),
+        );
+
+        let ack_proof_fetches = Family::default();
+        registry.register(
+            "relayer_ack_proof_fetches",
+            "proof-gen proof-by-tx fetches by the ack submitter, by outcome: Ready, NotReady \
+             (proof-gen 422/404 — destination block not attested yet or proof-gen's chain view \
+             lagging; polled flat and expected to clear on its own) or Error (5xx, connection, \
+             undecodable proof; exponential backoff, operator-relevant)",
+            ack_proof_fetches.clone(),
         );
 
         let claim_submissions = Family::default();
@@ -296,6 +315,7 @@ impl RelayerMetrics {
             attestor_set_size,
             attestor_set_reloads,
             ack_submissions,
+            ack_proof_fetches,
             claim_submissions,
             settlement_queue_depth,
             signer_balance,
@@ -451,6 +471,12 @@ impl MetricsTrait for RelayerMetrics {
     fn inc_ack_submission(&self, chain_key: u64, outcome: SettlementOutcome) {
         self.ack_submissions
             .get_or_create(&LabelSettlement { chain_key, outcome })
+            .inc();
+    }
+
+    fn inc_ack_proof_fetch(&self, chain_key: u64, outcome: ProofFetchOutcome) {
+        self.ack_proof_fetches
+            .get_or_create(&LabelProofFetch { chain_key, outcome })
             .inc();
     }
 
@@ -652,6 +678,27 @@ pub struct LabelSettlement {
     pub outcome: SettlementOutcome,
 }
 
+/// Outcome of one proof-gen `proof-by-tx` fetch by the ack submitter — the label on
+/// [`MetricsTrait::inc_ack_proof_fetch`]. Mirrors `crate::proofgen::ProofFetch` plus the error arm.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum ProofFetchOutcome {
+    /// A proof came back and was handed to the submit path.
+    Ready,
+    /// Proof-gen answered "not yet" (HTTP 422 `BlockNotReady`, or 404 while its view of the
+    /// destination chain lags the tx). Re-polled on the flat not-ready cadence; a steady stream
+    /// here with matching `Ready` growth is attestation latency, not a fault.
+    NotReady,
+    /// A real failure (5xx, connection error, undecodable body). Backed off exponentially; a
+    /// sustained rise with no `Ready` growth is the proof-gen-outage shape.
+    Error,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct LabelProofFetch {
+    pub chain_key: u64,
+    pub outcome: ProofFetchOutcome,
+}
+
 mod items {
     use prometheus_client::encoding::EncodeLabelSet;
 
@@ -745,11 +792,25 @@ mod tests {
         m.inc_ack_submission(7, SettlementOutcome::Confirmed);
         m.inc_claim_submission(7, SettlementOutcome::Failed);
         m.set_settlement_queue_depth(7, 3);
+        m.inc_ack_proof_fetch(7, ProofFetchOutcome::NotReady);
+        m.inc_ack_proof_fetch(7, ProofFetchOutcome::NotReady);
+        m.inc_ack_proof_fetch(7, ProofFetchOutcome::Error);
         let body = m.encode();
         assert!(body.contains("relayer_messages_indexed"));
         assert!(body.contains("relayer_votes_received"));
         assert!(body.contains("relayer_deliver_tx"));
         assert!(body.contains("relayer_ack_submissions"));
+        // The not-ready / error split must be visible as distinct label values on one family.
+        assert!(
+            body.contains(
+                "relayer_ack_proof_fetches_total{chain_key=\"7\",outcome=\"NotReady\"} 2"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("relayer_ack_proof_fetches_total{chain_key=\"7\",outcome=\"Error\"} 1"),
+            "{body}"
+        );
         assert!(body.contains("relayer_claim_submissions"));
         assert!(body.contains("relayer_settlement_queue_depth"));
         assert!(body.contains("chain_keys=\"2,7\""));
@@ -767,6 +828,7 @@ mod tests {
         m.set_p2p_peer_count(1, 4);
         m.set_pool_messages_pending(3);
         m.inc_ack_submission(1, SettlementOutcome::Terminal);
+        m.inc_ack_proof_fetch(1, ProofFetchOutcome::Ready);
         m.inc_claim_submission(1, SettlementOutcome::Confirmed);
     }
 }

@@ -561,7 +561,7 @@ async fn claim_tx<P: Provider>(
 
     let proof = match client.proof_by_tx(chain_key, tx_hash).await? {
         ProofFetch::Ready(p) => p,
-        ProofFetch::NotReady => return Ok(ClaimOutcome::NotReady),
+        ProofFetch::NotReady(_) => return Ok(ClaimOutcome::NotReady),
     };
 
     let encoded_tx = proof.encoded_transaction()?;

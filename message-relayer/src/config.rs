@@ -33,6 +33,17 @@ pub const DEFAULT_BLOCK_CONFIRMATION_DEPTH: u64 = 0;
 /// a recent window is idempotent: already-delivered messages resolve as "Already validated" at
 /// simulate, already-acknowledged ones are skipped by the canAck pre-check.
 pub const DEFAULT_SCAN_LOOKBACK_BLOCKS: u64 = 600;
+/// Default cadence (seconds) at which the ack submitter re-asks proof-gen for a delivery proof it
+/// answered "not ready" for (HTTP 422 `BlockNotReady`, or 404 while proof-gen's view of the
+/// destination chain lags the tx). Flat, not growing: the proof appears on its own once the block
+/// is attested, and the ack should land within one interval of that. See
+/// [`crate::pending::NotReadyPolicy`].
+pub const DEFAULT_ACK_NOT_READY_POLL_SECS: u64 = 20;
+/// Default length (seconds) of the flat not-ready polling window per delivery, measured from when
+/// the delivery was first seen. Past it the ack slides into the 30 s → 10 min slow backoff, so a
+/// proof that never appears does not hot-loop until the 24 h give-up. Healthy destination
+/// finality + attestation is minutes; 30 min is far outside it.
+pub const DEFAULT_ACK_NOT_READY_POLL_WINDOW_SECS: u64 = 30 * 60;
 
 // ---------------------------------------------------------------------------
 // Validated runtime config
@@ -129,6 +140,31 @@ pub struct AckConfig {
     pub confirmation_depth: u64,
     /// First destination block to scan on first run when no persisted ack checkpoint exists.
     pub start_block: Option<u64>,
+    /// Flat re-poll cadence while proof-gen answers "not ready" for a delivery proof. Non-zero.
+    /// Default [`DEFAULT_ACK_NOT_READY_POLL_SECS`].
+    pub not_ready_poll_secs: u64,
+    /// How long (from first sighting of the delivery) to keep that flat cadence before sliding
+    /// into the slow backoff. Default [`DEFAULT_ACK_NOT_READY_POLL_WINDOW_SECS`].
+    pub not_ready_poll_window_secs: u64,
+}
+
+impl AckConfig {
+    /// The not-ready retry schedule these settings describe.
+    pub fn not_ready_policy(&self) -> crate::pending::NotReadyPolicy {
+        crate::pending::NotReadyPolicy {
+            poll_interval: std::time::Duration::from_secs(self.not_ready_poll_secs),
+            poll_window: std::time::Duration::from_secs(self.not_ready_poll_window_secs),
+        }
+    }
+}
+
+/// Reject a zero not-ready poll cadence: it would re-ask proof-gen on every 6 s ack tick for
+/// every pending delivery, for the whole window. Shared by the YAML and CLI paths.
+pub fn validate_ack_not_ready_poll_secs(secs: u64, origin: &str) -> Result<()> {
+    if secs == 0 {
+        bail!("{origin}: ack not_ready_poll_secs must be > 0 (a zero cadence would hot-loop proof-gen)");
+    }
+    Ok(())
 }
 
 /// Claim submitter config ("relayer on both sides"). See [`ChainRoute::claim`].
@@ -387,6 +423,10 @@ pub struct AckConfigFile {
     pub confirmation_depth: u64,
     #[serde(default)]
     pub start_block: Option<u64>,
+    #[serde(default = "default_ack_not_ready_poll_secs")]
+    pub not_ready_poll_secs: u64,
+    #[serde(default = "default_ack_not_ready_poll_window_secs")]
+    pub not_ready_poll_window_secs: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -429,6 +469,12 @@ fn default_gas_multiplier() -> f64 {
 }
 fn default_scan_lookback_blocks() -> u64 {
     DEFAULT_SCAN_LOOKBACK_BLOCKS
+}
+fn default_ack_not_ready_poll_secs() -> u64 {
+    DEFAULT_ACK_NOT_READY_POLL_SECS
+}
+fn default_ack_not_ready_poll_window_secs() -> u64 {
+    DEFAULT_ACK_NOT_READY_POLL_WINDOW_SECS
 }
 
 impl ConfigFile {
@@ -556,12 +602,18 @@ impl ChainRouteFile {
                         self.chain_key
                     )
                 })?;
+                validate_ack_not_ready_poll_secs(
+                    a.not_ready_poll_secs,
+                    &format!("chain_key {}", self.chain_key),
+                )?;
                 anyhow::Ok(AckConfig {
                     proof_gen_url: a.proof_gen_url,
                     validator_address,
                     signer_key: a.signer_key,
                     confirmation_depth: a.confirmation_depth,
                     start_block: a.start_block,
+                    not_ready_poll_secs: a.not_ready_poll_secs,
+                    not_ready_poll_window_secs: a.not_ready_poll_window_secs,
                 })
             })
             .transpose()?;
@@ -650,6 +702,10 @@ routes:
       addresses:
         - "0x000000000000000000000000000000000000000a"
         - "0x000000000000000000000000000000000000000b"
+    ack:
+      proof_gen_url: "http://localhost:3100"
+      validator_address: "0x0000000000000000000000000000000000000005"
+      signer_key: "0x0000000000000000000000000000000000000000000000000000000000000001"
     claim:
       proof_gen_url: "http://localhost:3100"
       source_bridge_address: "0x0000000000000000000000000000000000000003"
@@ -677,6 +733,44 @@ routes:
                 .parse::<Address>()
                 .unwrap()
         );
+        // The not-ready polling knobs are optional and default to the flat 20 s / 30 min schedule.
+        let ack = cfg.routes[0].ack.as_ref().expect("ack block parsed");
+        assert_eq!(ack.not_ready_poll_secs, DEFAULT_ACK_NOT_READY_POLL_SECS);
+        assert_eq!(
+            ack.not_ready_poll_window_secs,
+            DEFAULT_ACK_NOT_READY_POLL_WINDOW_SECS
+        );
+        let policy = ack.not_ready_policy();
+        assert_eq!(policy.poll_interval, std::time::Duration::from_secs(20));
+        assert_eq!(policy.poll_window, std::time::Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn ack_not_ready_polling_is_configurable_and_rejects_zero_cadence() {
+        let tuned = sample_yaml().replace(
+            "validator_address: \"0x0000000000000000000000000000000000000005\"\n",
+            "validator_address: \"0x0000000000000000000000000000000000000005\"\n      \
+             not_ready_poll_secs: 30\n      not_ready_poll_window_secs: 600\n",
+        );
+        let file: ConfigFile = serde_yaml::from_str(&tuned).unwrap();
+        let cfg = file
+            .into_config("ws://cc3:9944".into(), "http://cc3-eth:9933".into(), None)
+            .unwrap();
+        let ack = cfg.routes[0].ack.as_ref().unwrap();
+        assert_eq!(ack.not_ready_poll_secs, 30);
+        assert_eq!(ack.not_ready_poll_window_secs, 600);
+
+        // A zero cadence would re-ask proof-gen every ack tick for the whole window.
+        let zero = sample_yaml().replace(
+            "validator_address: \"0x0000000000000000000000000000000000000005\"\n",
+            "validator_address: \"0x0000000000000000000000000000000000000005\"\n      \
+             not_ready_poll_secs: 0\n",
+        );
+        let file: ConfigFile = serde_yaml::from_str(&zero).unwrap();
+        let err = file
+            .into_config("ws://cc3:9944".into(), "http://cc3-eth:9933".into(), None)
+            .expect_err("zero cadence must be rejected");
+        assert!(err.to_string().contains("not_ready_poll_secs"), "{err}");
     }
 
     #[test]

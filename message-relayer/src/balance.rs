@@ -205,6 +205,8 @@ mod tests {
             signer_key: KEY.into(),
             confirmation_depth: 0,
             start_block: None,
+            not_ready_poll_secs: crate::config::DEFAULT_ACK_NOT_READY_POLL_SECS,
+            not_ready_poll_window_secs: crate::config::DEFAULT_ACK_NOT_READY_POLL_WINDOW_SECS,
         });
 
         let targets = targets_from_routes(&[r], "http://source:2");

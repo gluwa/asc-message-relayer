@@ -113,6 +113,15 @@ routes:
       # Destination blocks to lag the MessageDelivered scan (reorg safety on the unsafe head).
       confirmation_depth: 32
       # start_block: 0
+      # While proof-gen answers "not ready" for a delivery proof (422 BlockNotReady: destination
+      # block not attested yet; or 404: proof-gen's own chain view has not caught up with the tx)
+      # the ack is re-polled on this flat cadence — it is the normal early state of every ack,
+      # not a failure, so it does not take the 30 s → 10 min transient backoff. Must be > 0.
+      # not_ready_poll_secs: 20
+      # How long (from first sighting of the delivery) to keep that flat cadence before sliding
+      # into the slow backoff, so a proof that never appears does not hot-loop until the 24 h
+      # give-up. Healthy finality + attestation is minutes; 30 min is far outside it.
+      # not_ready_poll_window_secs: 1800
 
     # Optional claim submitter ("relayer on both sides", proof-based, permissionless): watches the
     # destination chain for bridge Locked events, fetches a native USC proof, and submits

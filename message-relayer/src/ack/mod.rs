@@ -39,8 +39,11 @@
 //!
 //! Submission is keyed (and deduped) by destination **transaction hash**: one transaction may
 //! contain several `MessageDelivered` logs and the validator acknowledges all of them in a single
-//! call. A transaction whose block is not yet attested returns HTTP 422 (`BlockNotReady`) from the
-//! proof-gen API and is retried on the next tick.
+//! call. A transaction whose proof is not available *yet* — HTTP 422 (`BlockNotReady`: block not
+//! attested) or 404 (proof-gen's own view of the destination chain has not caught up with the tx)
+//! from the proof-gen API — is re-polled on a flat, short cadence for a bounded window and only
+//! then slides into the slow backoff; see [`crate::pending::NotReadyPolicy`] and
+//! [`crate::proofgen`] for why a 404 is "not yet" rather than an error.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -62,8 +65,8 @@ use crate::checkpoint::CheckpointStore;
 use crate::config::{AckConfig, ChainRoute};
 use crate::events::{OutboxResolver, DEFAULT_RESOLVE_POLL_INTERVAL_SECS};
 use crate::pending::{BoundedSeen, PendingTxs};
-use crate::prom::{Metrics, SettlementOutcome};
-use crate::proofgen::{ProofFetch, ProofGenClient};
+use crate::prom::{Metrics, ProofFetchOutcome, SettlementOutcome};
+use crate::proofgen::{ProofFetch, ProofGenClient, ProofNotReady};
 
 /// Poll cadence for the destination `MessageDelivered` watcher and the pending-proof retry queue.
 pub const ACK_POLL_INTERVAL_SECS: u64 = 6;
@@ -111,13 +114,13 @@ const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
 /// attempt can hold the signer's broadcast slot.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Retry cadence while the proof block is simply not attested yet (`BlockNotReady`). This is the
-/// normal early state of every ack — destination finality plus attestation takes minutes — so it
-/// does not count against the transient-failure budget.
-const NOT_READY_RETRY: Duration = Duration::from_secs(15);
-
-/// Give up on a tx whose proof never becomes ready (e.g. its block is never attested). Generous:
-/// far beyond any healthy finality + attestation latency.
+/// Give up on a tx whose proof never becomes ready (e.g. its block is never attested, or the tx
+/// hash proof-gen keeps answering 404 for does not exist). Generous: far beyond any healthy
+/// finality + attestation latency. The re-poll cadence *before* this point is the route's
+/// [`crate::pending::NotReadyPolicy`] (`ack.not_ready_poll_secs` /
+/// `ack.not_ready_poll_window_secs`): flat and short while the proof is expected to appear on its
+/// own, slow backoff once it is overdue. Not ready never counts against the transient-failure
+/// budget.
 const MAX_ACK_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Give up loudly after this many *transient* submit failures (RPC down, timeout, nonce) — a
@@ -526,8 +529,9 @@ fn decode_delivery_log(
 
 /// Try to fetch a proof and submit an acknowledgment for every pending destination tx that is due
 /// for an attempt. Successful (or terminally-reverting) submissions move to `done`; not-yet-ready
-/// proofs are deferred by [`NOT_READY_RETRY`]; transient failures back off exponentially and give
-/// up after [`MAX_ACK_TRANSIENT_ATTEMPTS`].
+/// proofs are re-polled per the route's [`crate::pending::NotReadyPolicy`] (flat cadence inside
+/// the window, slow backoff past it, `MAX_ACK_AGE` give-up); transient failures back off
+/// exponentially and escalate the log after [`MAX_ACK_TRANSIENT_ATTEMPTS`].
 #[allow(clippy::too_many_arguments)]
 async fn process_pending<P: Provider>(
     chain_key: u64,
@@ -553,7 +557,7 @@ async fn process_pending<P: Provider>(
     // Fetch proofs + submit with bounded concurrency rather than strictly serially: each attempt
     // is independent and dominated by network latency. Mutations to `pending`/`done` are applied
     // afterwards, on this task, so no shared-state synchronization is needed.
-    let results: Vec<(B256, Result<AckOutcome>)> = futures::stream::iter(batch)
+    let results: Vec<(B256, Vec<B256>, Result<AckOutcome>)> = futures::stream::iter(batch)
         .map(|(tx_hash, message_ids)| {
             // Tagged at discovery time, not whatever the resolver reports now — see `pending_outbox`.
             let outbox = pending_outbox.get(&tx_hash).copied();
@@ -572,15 +576,16 @@ async fn process_pending<P: Provider>(
                     tx_hash,
                 )
                 .await;
-                (tx_hash, outcome)
+                (tx_hash, message_ids, outcome)
             }
         })
         .buffer_unordered(MAX_ACK_CONCURRENCY)
         .collect()
         .await;
 
+    let not_ready_policy = ack.not_ready_policy();
     let now = Instant::now();
-    for (tx_hash, outcome) in results {
+    for (tx_hash, message_ids, outcome) in results {
         match outcome {
             Ok(AckOutcome::Acknowledged) => {
                 info!(chain_key, %tx_hash, "✅ delivery settled on source chain");
@@ -594,22 +599,37 @@ async fn process_pending<P: Provider>(
                 pending_outbox.remove(&tx_hash);
                 done.insert(tx_hash);
             }
-            Ok(AckOutcome::NotReady) => {
-                // Normal early state (destination finality + attestation take minutes) — defer
+            Ok(AckOutcome::NotReady(reason)) => {
+                // Normal early state (destination finality + attestation take minutes) — re-poll
                 // without burning the transient budget, but don't wait forever on a block that
-                // never attests.
-                if pending.age(&tx_hash, now) > Some(MAX_ACK_AGE) {
+                // never attests. INFO, not WARN: nothing is wrong yet, and the operator reading
+                // the latency of an ack needs to see how long it has been waiting and on what.
+                let waited = pending.age(&tx_hash, now).unwrap_or_default();
+                if waited > MAX_ACK_AGE {
                     warn!(
                         chain_key,
                         %tx_hash,
+                        %reason,
                         "proof never became ready within {MAX_ACK_AGE:?}; giving up on this ack"
                     );
                     pending.remove(&tx_hash);
                     pending_outbox.remove(&tx_hash);
                     done.insert(tx_hash);
                 } else {
-                    debug!(chain_key, %tx_hash, "proof not ready yet; deferred");
-                    pending.defer(&tx_hash, now + NOT_READY_RETRY);
+                    let retry_in = not_ready_policy.next_delay(waited);
+                    let past_window = waited >= not_ready_policy.poll_window;
+                    info!(
+                        chain_key,
+                        %tx_hash,
+                        message_ids = ?message_ids,
+                        %reason,
+                        waited_secs = waited.as_secs(),
+                        retry_in_secs = retry_in.as_secs(),
+                        past_poll_window = past_window,
+                        "⏳ proof not ready yet (destination block not attested / proof-gen catching \
+                         up); polling"
+                    );
+                    pending.defer(&tx_hash, now + retry_in);
                 }
             }
             Err(err) => {
@@ -670,8 +690,9 @@ enum AckOutcome {
     /// Proof verified and the settlement call (`submitAcknowledgment` / `claimDelivery`) succeeded
     /// or was already terminal for every message — either way the tx is resolved.
     Acknowledged,
-    /// The proof block is not yet attested (`BlockNotReady`); retry later.
-    NotReady,
+    /// Proof-gen cannot serve the proof yet (block not attested / its chain view lagging — see
+    /// [`crate::proofgen`]); re-poll per the route's [`crate::pending::NotReadyPolicy`].
+    NotReady(ProofNotReady),
     /// A permanent condition (e.g. on-chain revert: already acknowledged / does not require ack).
     Terminal(String),
 }
@@ -819,9 +840,18 @@ async fn acknowledge_tx<P: Provider>(
     }
 
     let proof = match client.proof_by_tx(chain_key, tx_hash).await {
-        Ok(ProofFetch::Ready(p)) => p,
-        Ok(ProofFetch::NotReady) => return Ok(AckOutcome::NotReady),
+        Ok(ProofFetch::Ready(p)) => {
+            metrics.inc_ack_proof_fetch(chain_key, ProofFetchOutcome::Ready);
+            p
+        }
+        Ok(ProofFetch::NotReady(reason)) => {
+            // Counted apart from `Error`: a stream of these with matching `Ready` growth is
+            // attestation latency, not a fault, and must not look like the outage shape below.
+            metrics.inc_ack_proof_fetch(chain_key, ProofFetchOutcome::NotReady);
+            return Ok(AckOutcome::NotReady(reason));
+        }
         Err(err) => {
+            metrics.inc_ack_proof_fetch(chain_key, ProofFetchOutcome::Error);
             // Whichever settlement(s) this poll needed failed to even get a proof — this is
             // exactly the shape that hid a two-day settlement outage behind a WARN nobody read
             // (proof-gen's archiver silently unable to build continuity proofs): delivery kept
