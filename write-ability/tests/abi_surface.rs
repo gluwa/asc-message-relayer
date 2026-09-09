@@ -22,8 +22,8 @@ use alloy::primitives::keccak256;
 use alloy::sol_types::{SolCall, SolError, SolEvent};
 use std::path::{Path, PathBuf};
 use write_ability::abi::{
-    IAcknowledgmentValidator, IInbox, IMessageReceiver, IOutbox, IOutboxDeployer, IOutboxDiscovery,
-    IOutboxFactory, IRelayerContract, IVoteValidator,
+    IAcknowledgmentValidator, IInbox, IMessageReceiver, IOutbox, IOutboxDiscovery,
+    IRelayerContract, IVoteValidator,
 };
 
 /// Canonical ABI type for one artifact input/output, expanding structs: `tuple` →
@@ -385,23 +385,6 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
         );
     }
 
-    // --- OutboxDeployer (source chain) ---
-    //
-    // `outboxOf` is what RegistryResolver reads instead of scanning the factory's logs. Pinning it
-    // here matters more than most: the whole point of reading the registry is that it cannot be
-    // spoofed, so a silently-renamed getter would send us back to the log scan without anyone
-    // noticing. Post-asc-contracts#38 the equivalent is `OutboxDiscovery.defaultOutbox`,
-    // asserted in its own block below.
-    let deployer = Artifact::load(
-        &contracts,
-        "deployer/OutboxDeployer.sol/OutboxDeployer.json",
-    );
-    deployer.assert_mirrored(
-        "function",
-        "outboxOf(uint32)",
-        &IOutboxDeployer::outboxOfCall::SELECTOR,
-    );
-
     // --- OutboxDiscovery (source chain) ---
     //
     // Both events and reads. A moved topic0 silently blinds a subscription, and the timelock
@@ -468,13 +451,5 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
         "function",
         "pendingRemovalBlock(uint32,address)",
         &IOutboxDiscovery::pendingRemovalBlockCall::SELECTOR,
-    );
-
-    // --- OutboxFactory (source chain) ---
-    let factory = Artifact::load(&contracts, "deployer/OutboxFactory.sol/OutboxFactory.json");
-    factory.assert_mirrored(
-        "event",
-        IOutboxFactory::OutboxCreated::SIGNATURE,
-        &IOutboxFactory::OutboxCreated::SIGNATURE_HASH.0,
     );
 }

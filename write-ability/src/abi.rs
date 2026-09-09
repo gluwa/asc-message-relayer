@@ -70,28 +70,6 @@ sol! {
         error MessageAlreadyAcknowledged(bytes32 messageId);
     }
 
-    #[sol(rpc)]
-    #[derive(Debug)]
-    contract IOutboxDeployer {
-        /// The Outbox this deployer registered for `chainKey`, or the zero address if none.
-        ///
-        /// This is the *authoritative* answer, and the reason it exists here: the factory's
-        /// `deployOutbox` is intentionally permissionless, so anyone can deploy an Outbox for any
-        /// chain key and emit an `OutboxCreated` indistinguishable from a legitimate one. A
-        /// consumer that binds the newest log therefore follows whatever an attacker deployed
-        /// last. `OutboxDeployer` only records deployments it performed itself, so reading this
-        /// mapping cannot be spoofed by an outside caller — see the design note on
-        /// `OutboxFactory.deployOutbox`, which justifies being permissionless precisely on the
-        /// grounds that an unauthorised deployment is one "the protocol never registers".
-        ///
-        /// Post-asc-contracts#38 the equivalent is `OutboxDiscovery.defaultOutbox(chainKey)`,
-        /// which additionally supports rotation via `setDefaultOutbox`. This mapping has no
-        /// setter, so a chain key it already holds cannot be re-pointed — `deployOutbox` reverts
-        /// `ChainKeyAlreadyUsed`. `RegistryResolver` reads whichever of the two a route is
-        /// configured with, so swapping is a config change plus one call site.
-        function outboxOf(uint32 chainKey) external view returns (address);
-    }
-
     /// OutboxDiscovery (asc-contracts #38): the cross-generation registry that replaces both the
     /// per-deployer `outboxOf` mapping and factory-log scanning as the source of truth for which
     /// Outbox serves a chain key. `defaultOutbox` is the confirmed read ("not from deployer,
@@ -140,23 +118,6 @@ sol! {
         /// Cold-start reads for a relayer booting after a schedule event already fired.
         function pendingDefaultOutbox(uint32 chainKey) external view returns (address outbox, uint64 effectiveBlock);
         function pendingRemovalBlock(uint32 chainKey, address outbox) external view returns (uint64 effectiveBlock);
-    }
-
-    #[sol(rpc)]
-    #[derive(Debug)]
-    contract IOutboxFactory {
-        /// Emitted when a new Outbox is deployed for `chainKey` on this factory.
-        /// `deployOutbox` is intentionally permissionless (see `OutboxFactory.sol`), so more than
-        /// one `OutboxCreated` can exist for the same `chainKey` over time — `FactoryResolver`
-        /// (`message-relayer::events::factory`) takes the latest by block order as the current
-        /// Outbox, never the first.
-        event OutboxCreated(
-            address indexed outbox,
-            uint32 indexed chainKey,
-            address indexed owner,
-            address validator,
-            string version
-        );
     }
 
     #[sol(rpc)]

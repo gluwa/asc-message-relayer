@@ -75,16 +75,6 @@ struct Cli {
     #[arg(long, env = "RELAYER_CC3_CHAIN_ID", required = false)]
     cc3_chain_id: Option<u64>,
 
-    /// Optional Outbox address override (else resolved from chain factory; PoC stub).
-    #[arg(long, env = "RELAYER_OUTBOX_ADDRESS", required = false)]
-    outbox_address: Option<String>,
-
-    /// `OutboxDeployer` / `OutboxDiscovery` address. Set this to resolve the Outbox by an
-    /// authoritative registry read instead of scanning the permissionless factory's logs, which
-    /// an attacker can spoof. Ignored when `--outbox-address` is given.
-    #[arg(long, env = "RELAYER_OUTBOX_REGISTRY_ADDRESS", required = false)]
-    outbox_registry_address: Option<String>,
-
     /// Destination chain RPC URL (HTTP or WS) for `Inbox.deliverMessage`.
     #[arg(long, env = "RELAYER_DESTINATION_RPC_URL", required = false)]
     destination_rpc_url: Option<String>,
@@ -96,6 +86,13 @@ struct Cli {
     /// Hex private key (with or without `0x`) for the destination signer wallet.
     #[arg(long, env = "RELAYER_SIGNER_KEY", required = false)]
     signer_key: Option<String>,
+
+    /// Operator-pinned Outbox address, honored before the on-chain OutboxDiscovery registry
+    /// lookup. The registry is the default and source of truth; set this only for a network
+    /// where the chain-info precompile getter is missing/misconfigured, or to pin an Outbox
+    /// during an incident. Logged loudly (WARN) at startup and on every resolve while set.
+    #[arg(long, env = "RELAYER_OUTBOX_ADDRESS", required = false)]
+    outbox_address: Option<String>,
 
     /// Comma-separated EVM addresses of trusted attestors (static allowlist).
     #[arg(long, env = "RELAYER_ATTESTOR_SET", required = false)]
@@ -275,16 +272,9 @@ fn single_route_config(cli: Cli) -> Result<Config> {
     let outbox_address = cli
         .outbox_address
         .as_deref()
-        .map(|s| {
-            Address::from_str(s.trim()).with_context(|| format!("invalid --outbox-address: {s}"))
-        })
-        .transpose()?;
-    let outbox_registry_address = cli
-        .outbox_registry_address
-        .as_deref()
-        .map(|s| {
-            Address::from_str(s.trim())
-                .with_context(|| format!("invalid --outbox-registry-address: {s}"))
+        .map(|raw| {
+            Address::from_str(raw.trim())
+                .with_context(|| format!("invalid --outbox-address: {raw}"))
         })
         .transpose()?;
 
@@ -383,11 +373,10 @@ fn single_route_config(cli: Cli) -> Result<Config> {
     let route = ChainRoute {
         chain_key,
         creditcoin_chain_id: cc3_chain_id,
-        outbox_address,
-        outbox_registry_address,
         destination_rpc_url,
         inbox_address,
         signer_key: cli.signer_key,
+        outbox_address,
         relayer_contract_address,
         block_confirmation_depth: DEFAULT_BLOCK_CONFIRMATION_DEPTH,
         start_block: None,

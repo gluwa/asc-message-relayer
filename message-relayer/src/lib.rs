@@ -57,9 +57,7 @@ pub use config::{
     AttestorSet, AttestorSource, ChainRoute, Config, DeliveryConfig, P2pConfig, VoteCacheConfig,
 };
 pub use delivery::DeliveryJob;
-pub use events::{
-    ConfigOverrideResolver, FactoryResolver, IndexedMessage, OutboxResolver, RegistryResolver,
-};
+pub use events::{DiscoveryResolver, IndexedMessage, OutboxResolver};
 pub use p2p::MessageVote;
 pub use pool::{calculate_threshold, RouteAttestors};
 pub use prom::{Metrics, MetricsTrait, NoopMetrics, RelayerMetrics};
@@ -100,7 +98,6 @@ impl Server {
                 chain_key = route.chain_key,
                 creditcoin_chain_id = route.creditcoin_chain_id,
                 inbox = %route.inbox_address,
-                outbox = ?route.outbox_address,
                 destination_rpc = %redact_url_query(&route.destination_rpc_url),
                 attestor_set = ?attestor_set_summary(&route.attestor_set),
                 threshold_override = ?route.threshold_override,
@@ -222,26 +219,29 @@ impl Server {
         );
 
         // One resolver per route, shared between its Outbox watcher and ack submitter below — both
-        // need to agree on the same live Outbox address, and sharing keeps the on-chain scan
-        // progress in one place. An explicit `outbox_address` keeps that static override; a route
-        // without one resolves automatically via `FactoryResolver`.
+        // need to agree on the same live Outbox address. Every route uses the same
+        // `DiscoveryResolver`: it reads the discovery-registry address off the chain-info
+        // precompile and calls `defaultOutbox` on it, no fallback — a chain key with nothing
+        // registered in `OutboxDiscovery` fails closed instead of resolving from any spoofable
+        // source. `route.outbox_address` is the one operator-pinned exception (see
+        // `DiscoveryResolver::override_address`); flagged here at startup as well as on every
+        // resolve (`DiscoveryResolver::resolve`) since it bypasses that fail-closed default.
         let resolvers: HashMap<u64, Arc<dyn OutboxResolver>> = self
             .config
             .routes
             .iter()
             .map(|route| {
-                // Ordered most-specific first. An explicit address needs no discovery at all;
-                // a registry read is authoritative and cheap; scanning `OutboxCreated` is the
-                // legacy path and is spoofable, because the factory is permissionless and this
-                // binds the newest log (see `RegistryResolver`'s doc comment). Routes move off it
-                // by setting `outbox_registry_address`.
-                let resolver: Arc<dyn OutboxResolver> = if route.outbox_address.is_some() {
-                    Arc::new(ConfigOverrideResolver)
-                } else if route.outbox_registry_address.is_some() {
-                    Arc::new(RegistryResolver)
-                } else {
-                    Arc::new(FactoryResolver::new(checkpoint.clone()))
-                };
+                if let Some(address) = route.outbox_address {
+                    tracing::warn!(
+                        chain_key = route.chain_key,
+                        %address,
+                        "⚠️ outbox_address is set for this route — Outbox resolution will bypass \
+                         the OutboxDiscovery registry entirely"
+                    );
+                }
+                let resolver: Arc<dyn OutboxResolver> = Arc::new(DiscoveryResolver {
+                    override_address: route.outbox_address,
+                });
                 (route.chain_key, resolver)
             })
             .collect();

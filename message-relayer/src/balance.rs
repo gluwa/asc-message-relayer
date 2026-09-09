@@ -175,11 +175,10 @@ mod tests {
         ChainRoute {
             chain_key,
             creditcoin_chain_id: 1,
-            outbox_address: None,
-            outbox_registry_address: None,
             destination_rpc_url: "http://dest:1".into(),
             inbox_address: address!("0000000000000000000000000000000000000002"),
             signer_key: None,
+            outbox_address: None,
             relayer_contract_address: None,
             block_confirmation_depth: 0,
             start_block: None,

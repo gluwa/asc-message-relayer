@@ -30,19 +30,17 @@ use finality::{pick_to_block, read_finalized_head, FinalityPolicy, FinalityTrack
 
 pub mod factory;
 
-pub use factory::{
-    ConfigOverrideResolver, FactoryResolver, OutboxResolver, RegistryResolver, ResolvedOutbox,
-};
+pub use factory::{DiscoveryResolver, OutboxResolver, ResolvedOutbox};
 
 /// Default poll cadence for re-checking whether [`OutboxResolver::resolve`] now returns a
 /// different address (an Outbox rotation). Independent of, and much slower than,
-/// [`DEFAULT_POLL_INTERVAL_SECS`]'s `MessagePublished` scan — a rotation is rare, and
-/// `FactoryResolver::resolve` costs a precompile call plus at least one `eth_getLogs` round trip.
+/// [`DEFAULT_POLL_INTERVAL_SECS`]'s `MessagePublished` scan — a rotation is rare, and a registry
+/// read costs at most two precompile/contract calls.
 pub const DEFAULT_RESOLVE_POLL_INTERVAL_SECS: u64 = 60;
 
 /// Retry cadence for the startup resolution bootstrap while [`OutboxResolver::resolve`] has not
-/// yet produced an address (e.g. `FactoryResolver` still catching up on a long backlog — see
-/// `MAX_SCAN_CHUNKS_PER_CALL`). Short: this only blocks the very first scan, not the running loop.
+/// yet produced an address (e.g. no discovery registry registered for the chain key yet). Short:
+/// this only blocks the very first scan, not the running loop.
 const RESOLVE_BOOTSTRAP_RETRY: Duration = Duration::from_secs(5);
 
 /// Default poll cadence for `eth_getLogs`. WS subscription would be lower-latency but adds an
@@ -113,19 +111,15 @@ pub async fn watch_outbox(
     // `provider` itself free for the rest of this function's direct, generic-typed calls.
     let dyn_provider = provider.clone().erased();
 
-    // Startup bootstrap: retry until `resolve()` produces an address. `ConfigOverrideResolver`
-    // resolves on the first try or not at all (nothing to wait for); `FactoryResolver` may need
-    // several tries on a cold start against a long block-range backlog (see
-    // `MAX_SCAN_CHUNKS_PER_CALL`) — each retry resumes its cursor rather than rescanning.
+    // Startup bootstrap: retry until `resolve()` produces an address — resolves on the first try
+    // or not at all (a registry read is a single atomic lookup, nothing to catch up on).
     let resolved = loop {
         match resolver.resolve(&route, &dyn_provider).await {
             Ok(resolved) => break resolved,
             Err(err) => {
                 warn!(chain_key, %err, "outbox resolution not ready yet; retrying");
-                // A returned Err (unlike a hung RPC call, which never gets here) means the
-                // resolver is actively working — e.g. FactoryResolver churning through a long
-                // OutboxCreated backlog. Heartbeat so a slow-but-converging resolution does not
-                // trip /health's PROGRESS_DEADLINE and get killed mid-scan.
+                // Heartbeat so waiting on a chain key with no discovery address registered yet
+                // does not trip /health's PROGRESS_DEADLINE and get killed.
                 health.heartbeat(&health_key);
                 tokio::select! {
                     () = tokio::time::sleep(RESOLVE_BOOTSTRAP_RETRY) => {}
@@ -461,9 +455,8 @@ async fn poll_once<P: Provider>(
 }
 
 /// Whether a checkpoint's recorded Outbox address (if any) positively contradicts the currently
-/// resolved one. `None` — no address was ever recorded, whether a pre-migration checkpoint file
-/// or a resolver (e.g. `ConfigOverrideResolver`) that never needed to — is deliberately NOT a
-/// contradiction: only a recorded address that actually differs counts.
+/// resolved one. `None` — no address was ever recorded, e.g. a pre-migration checkpoint file — is
+/// deliberately NOT a contradiction: only a recorded address that actually differs counts.
 fn checkpoint_contradicts_resolved_outbox(recorded: Option<&str>, resolved: Address) -> bool {
     recorded.is_some_and(|recorded| recorded != resolved.to_string())
 }
