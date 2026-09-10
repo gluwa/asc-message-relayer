@@ -250,6 +250,9 @@ mod tests {
             threshold_override: None,
             ack: None,
             claim: None,
+            max_native_coin_value_wei: crate::config::DEFAULT_MAX_NATIVE_COIN_VALUE_WEI,
+            max_gas_limit: crate::config::DEFAULT_MAX_GAS_LIMIT,
+            auto_request_top_up: false,
         }
     }
 

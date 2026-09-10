@@ -166,6 +166,18 @@ sol! {
             address indexed destinationContract,
             address indexed relayer
         );
+        /// asc-contracts #36: emitted **together with** `MessageDelivered` (same successful tx)
+        /// when the dispatcher reported a terminal destination failure (`DISPATCH_MESSAGE_FAILED`
+        /// — the destination call ran with the attested gas and reverted, or the destination has
+        /// no code). The message is consumed (`processedAt` set); `retryPendingMessage` is NOT
+        /// possible and the delivery still counts for `claimDelivery`. Receipt-log classification
+        /// reads it to label the outcome `DestinationFailed` instead of a plain success.
+        /// `dispatcher` is the `IMessageDispatcher` (DispatcherRouter) that ran the message.
+        event MessageExecutionFailed(
+            bytes32 indexed messageId,
+            address indexed dispatcher,
+            address indexed relayer
+        );
 
         /// Revert used to classify duplicate deliveries for metrics + retry logic. NOTE: older
         /// inboxes rejected duplicates with `require(..., "Already validated")` (a string revert) —
@@ -174,6 +186,37 @@ sol! {
         /// vote errors are mirrored here.) Post-#23 the error carries the messageId — the old
         /// zero-arg selector matched nothing (caught by the abi_surface drift test).
         error MessageAlreadyValidated(bytes32 messageId);
+        /// asc-contracts #36: `retryPendingMessage` reverts this when the dispatcher answered
+        /// deferred/queued again. Pending state is restored, so the retry is not lost — but
+        /// re-sending before `retryAfter` is a guaranteed revert. `retryAfter` is a unix timestamp
+        /// from the dispatcher's optional `IMessageRetrySchedule` hint, or 0 when it exposes none
+        /// (fall back to the fixed backoff). Decoded from the revert data by the pending-retry task.
+        error RetryDeferred(bytes32 messageId, uint64 retryAfter);
+        /// asc-contracts #36: `deliverMessage` reverts this (instead of emitting `ValidationFailed`
+        /// and returning false) when the votes fail validation AND `msg.value != 0`, so the
+        /// fronted native value is refunded rather than stranded in the Inbox. Terminal for these
+        /// votes: the same bundle re-validates identically.
+        error ValidationFailedWithNativeValue(bytes32 messageId, uint256 value);
+        /// asc-contracts #36: the configured dispatcher has no code while native value is attached
+        /// (a value-bearing failure cannot be parked as pending). Also raised by the owner-only
+        /// setters. Terminal for the job — only an Inbox reconfiguration clears it.
+        error InvalidMessageDispatcher(address dispatcher);
+    }
+
+    /// Dispatcher-side surface (asc-contracts #36: `DispatcherRouter` + the `DefaultDispatcher` /
+    /// `RateLimitDispatcher` implementations it delegates to, via `DestinationCall`). Only the one
+    /// revert the relayer must react to is mirrored; the Inbox bubbles it verbatim from
+    /// `deliverMessage`.
+    #[sol(rpc)]
+    #[derive(Debug)]
+    contract IMessageDispatcher {
+        /// The destination call FAILED and, after EIP-150's 63/64 reduction, the caller had less
+        /// than `gasLimit / 63` left — i.e. the relayer's tx gas was too low to prove the attested
+        /// `gasLimit` was actually forwarded, so the failure may be the relayer's under-gassing
+        /// rather than the destination's fault. The dispatcher reverts (rolling back replay/queue
+        /// state) instead of recording a terminal `DISPATCH_MESSAGE_FAILED`, so the same message
+        /// can be retried with more gas. Retryable: bump the tx gas and resend.
+        error InsufficientGasForDestination();
     }
 
     /// Destination-side receiver base (`MessageReceiverBase.sol`). Mirrored for one reason: its
@@ -301,6 +344,14 @@ sol! {
             InclusionProof inclusionProof,
             ContinuityProof continuityProof
         ) external;
+
+        /// Relayer-side signal that the funded `gasLimit` is short by `additionalGasNeeded`. Pure
+        /// signal: no state change, just `TopUpRequested(messageId, msg.sender,
+        /// additionalGasNeeded)` for the payer/quoter to act on with `topUpGasLimit`. Reverts
+        /// `UnknownOperation` (unfunded), `RelayAlreadySettled`, or `DeliveryDeadlineReached`
+        /// when a top-up could no longer help. Permissionless; whether a relayer calls it is
+        /// service policy (`ChainRoute::auto_request_top_up`, default off).
+        function requestTopUp(bytes32 messageId, uint256 additionalGasNeeded) external;
 
         /// `messageId` was not funded through the relayer contract (e.g. bridge traffic, or a
         /// message published without a relay fee). Permanent for a given messageId.

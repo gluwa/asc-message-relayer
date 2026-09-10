@@ -43,11 +43,19 @@ the message up), but cannot forge.
    allowlist → dedup) and counts distinct signers. At threshold — `⌊2N/3⌋+1` — it encodes the
    votes and dispatches a `DeliveryJob`.
 5. **Deliver** — the per-route *delivery worker* (optionally) simulates
-   `Inbox.deliverMessage(messageId, emitter, payload, votes)`, then sends it. The Inbox's
-   `EOAValidator` re-verifies every signature on-chain and the Inbox invokes the destination
-   dApp's `receiveMessage`. If that callback reverts, the tx still succeeds but the Inbox emits
-   `MessagePending` instead of `MessageDelivered` and stores the message for permissionless
-   `retryPendingMessage` retries.
+   `Inbox.deliverMessage(messageId, outbox, emitter, payload, votes)`, then sends it. Since
+   asc-contracts #36 the payload is an envelope `abi.encode(destination, nativeCoinValue,
+   gasLimit, payloadData)` and `deliverMessage` is `payable`: the relayer fronts `nativeCoinValue`
+   as `msg.value` (capped per route by `max_native_coin_value_wei`, default 0) and refuses
+   envelopes whose attested `gasLimit` exceeds `max_gas_limit` (default 5M — the router only
+   rejects zero, and an oversized one can never fit a block). The Inbox's `EOAValidator`
+   re-verifies every signature on-chain and hands the message to the `DispatcherRouter`, which
+   calls the destination with exactly the attested `gasLimit`. Three successful-tx shapes come
+   back in the receipt logs: `MessageDelivered` alone (executed); `MessagePending` (the dispatcher
+   deferred/queued it — stored for permissionless `retryPendingMessage`, which may itself revert
+   `RetryDeferred(retryAfter)`, honoured as the next attempt time); or `MessageExecutionFailed`
+   *with* `MessageDelivered` (the destination call failed and the message is consumed — no retry,
+   but the delivery still counts and is still paid).
 6. **Acknowledge & settle** (optional) — the *ack submitter* watches the destination for
    `MessageDelivered`/`MessagePending`, fetches a **native USC proof** of that transaction from
    the proof-gen API, and submits it to `AcknowledgmentValidator` on Creditcoin (verified against
@@ -105,6 +113,22 @@ retry silently forever:
   (`delivery.max_retries`), then a bounded pool-level redispatch (5 attempts, 30 s → 5 min
   backoff). Deterministic reverts are terminal immediately; `"Already validated"` (lost the race
   to another relayer) is idempotent success.
+- **#36 outcome classification** — `relayer_deliver_tx{status=…}` gains `DestinationFailed`
+  (delivered + consumed, destination call failed; WARN, no retry), `RefusedNativeValue` /
+  `RefusedGasLimit` (envelope over the route caps; terminal before any tx), and
+  `ValidationFailedWithNativeValue` / `InvalidDispatcher` (the #36 hard reverts; ERROR, terminal).
+  A mined-but-reverted delivery is replayed at its block to learn why: `InsufficientGasForDestination`
+  (the destination failed and our tx gas was too low to prove the attested `gasLimit` was
+  forwarded) is resent with 25 % more gas per attempt up to `max_gas_limit`, within
+  `delivery.max_retries`. `retryPendingMessage` honours a `RetryDeferred(retryAfter)` hint
+  (plus a 5 s margin, capped at 6 h) instead of the fixed 15 s / 60 s / 240 s schedule, still
+  within the same three-attempt budget.
+- **Under-funded deliveries** — when the estimate exceeds the funded `gasLimit` the job waits
+  for a `topUpGasLimit` (bounded by the delivery deadline / settlement). With
+  `auto_request_top_up: true` the route additionally emits
+  `RelayerContract.requestTopUp(messageId, additionalGasNeeded)` on Creditcoin once per message
+  from the ack (else claim) signer, so the payer/quoter learns the shortfall on-chain. Off by
+  default: the call is permissionless and sending it is relayer policy.
 - **Revert classification is node-agnostic** (`src/revert.rs`) — nodes word reverts differently
   (geth: `execution reverted`; Creditcoin's EVM RPC: `VM Exception … revert, data: "0x<selector>"`),
   so classification extracts the raw 4-byte custom-error selector and compares against the shared
@@ -182,6 +206,12 @@ message-relayer --single-route \
 Every flag has a `RELAYER_*` env twin (`--help` lists them); `.env` is loaded via dotenvy.
 Ack flags (`--ack-proof-gen-url`, `--ack-validator-address`, `--ack-signer-key`) must be set
 together or not at all. `--checkpoint-path ""` disables persistence (watchers start at head).
+Per-route envelope policy (asc-contracts #36), YAML key = flag = env:
+`max_native_coin_value_wei` / `--max-native-coin-value-wei` / `RELAYER_MAX_NATIVE_COIN_VALUE_WEI`
+(decimal or 0x-hex string, default `0`: front no native value), `max_gas_limit` /
+`--max-gas-limit` / `RELAYER_MAX_GAS_LIMIT` (default `5000000`, must be > 0), and
+`auto_request_top_up` / `--auto-request-top-up` / `RELAYER_AUTO_REQUEST_TOP_UP` (default `false`;
+needs `relayer_contract_address` and an ack or claim signer). The caps are logged at startup.
 `--verbose` switches `info` → `debug` logging. A few poll cadences are env-only (no CLI flag,
 sensible defaults): `RELAYER_ACK_POLL_SECS`, `RELAYER_CLAIM_POLL_SECS`,
 `RELAYER_OUTBOX_RESOLVE_POLL_SECS` (how often a route re-checks the discovery registry for an

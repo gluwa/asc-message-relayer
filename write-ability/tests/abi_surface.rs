@@ -22,8 +22,8 @@ use alloy::primitives::keccak256;
 use alloy::sol_types::{SolCall, SolError, SolEvent};
 use std::path::{Path, PathBuf};
 use write_ability::abi::{
-    IAcknowledgmentValidator, IInbox, IMessageReceiver, IOutbox, IOutboxDiscovery,
-    IRelayerContract, IVoteValidator,
+    IAcknowledgmentValidator, IInbox, IMessageDispatcher, IMessageReceiver, IOutbox,
+    IOutboxDiscovery, IRelayerContract, IVoteValidator,
 };
 
 /// Canonical ABI type for one artifact input/output, expanding structs: `tuple` →
@@ -214,7 +214,7 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
     let inbox = Artifact::load(&contracts, "Inbox.sol/Inbox.json");
     inbox.assert_mirrored(
         "function",
-        "deliverMessage(bytes32,address,bytes,bytes)",
+        "deliverMessage(bytes32,address,address,bytes,bytes)",
         &IInbox::deliverMessageCall::SELECTOR,
     );
     inbox.assert_mirrored(
@@ -237,11 +237,54 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
         IInbox::MessagePending::SIGNATURE,
         &IInbox::MessagePending::SIGNATURE_HASH.0,
     );
+    // #36: emitted alongside MessageDelivered for a consumed-but-failed destination call. A moved
+    // topic0 would silently relabel every destination failure as a plain success.
+    inbox.assert_mirrored(
+        "event",
+        IInbox::MessageExecutionFailed::SIGNATURE,
+        &IInbox::MessageExecutionFailed::SIGNATURE_HASH.0,
+    );
     inbox.assert_mirrored(
         "error",
-        "MessageAlreadyValidated()",
+        "MessageAlreadyValidated(bytes32)",
         &IInbox::MessageAlreadyValidated::SELECTOR,
     );
+    // #36 reverts the delivery/pending-retry classifiers key on. The selectors are matched from raw
+    // revert data (Creditcoin-style nodes decode no names), so a drifted one is dead code that
+    // falls through to the generic "revert ⇒ terminal" arm: RetryDeferred would lose its
+    // retryAfter scheduling, InsufficientGasForDestination would stop being retried with more gas.
+    inbox.assert_mirrored(
+        "error",
+        "RetryDeferred(bytes32,uint64)",
+        &IInbox::RetryDeferred::SELECTOR,
+    );
+    inbox.assert_mirrored(
+        "error",
+        "ValidationFailedWithNativeValue(bytes32,uint256)",
+        &IInbox::ValidationFailedWithNativeValue::SELECTOR,
+    );
+    inbox.assert_mirrored(
+        "error",
+        "InvalidMessageDispatcher(address)",
+        &IInbox::InvalidMessageDispatcher::SELECTOR,
+    );
+
+    // --- Dispatcher implementations (destination chain, #36) ---
+    // `InsufficientGasForDestination` is raised inside the `DestinationCall` library, so it lands
+    // in the ABI of every dispatcher implementation that links it (not the router, which only
+    // delegatecalls them, nor the Inbox, which bubbles the raw revert). Pin it against both shipped
+    // implementations: a route's Inbox may be wired to either.
+    for artifact in [
+        "DefaultDispatcher.sol/DefaultDispatcher.json",
+        "RateLimitDispatcher.sol/RateLimitDispatcher.json",
+    ] {
+        let dispatcher = Artifact::load(&contracts, artifact);
+        dispatcher.assert_mirrored(
+            "error",
+            "InsufficientGasForDestination()",
+            &IMessageDispatcher::InsufficientGasForDestination::SELECTOR,
+        );
+    }
 
     // --- MessageReceiverBase (destination chain) ---
     // Only the duplicate guard is mirrored; delivery treats its selector as idempotent success.
@@ -251,7 +294,7 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
     );
     receiver.assert_mirrored(
         "error",
-        "MessageAlreadyProcessed()",
+        "MessageAlreadyProcessed(bytes32)",
         &IMessageReceiver::MessageAlreadyProcessed::SELECTOR,
     );
 
@@ -367,6 +410,13 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
             "function",
             "claimDelivery(bytes32,bytes32,uint64,(uint8,bytes32,bytes),(bytes32,bytes32[]))",
             &IRelayerContract::claimDeliveryCall::SELECTOR,
+        );
+        // Opt-in relayer-side top-up signal (`ChainRoute::auto_request_top_up`). Only ever sent
+        // when the operator turned it on, but a drifted selector would then revert every request.
+        relayer.assert_mirrored(
+            "function",
+            "requestTopUp(bytes32,uint256)",
+            &IRelayerContract::requestTopUpCall::SELECTOR,
         );
         relayer.assert_mirrored(
             "error",

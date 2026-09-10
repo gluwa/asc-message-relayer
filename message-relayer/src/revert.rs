@@ -12,6 +12,25 @@
 //! depending on any one node's error format. Compare selectors against the `SolError::SELECTOR`
 //! constants from [`write_ability::abi`] rather than hand-computed hex.
 
+/// Extract the full ABI-encoded revert payload (selector + arguments) from a revert error string
+/// of the form `… revert, data: "0x2f28bb55…"`. Anchored on the `data` field so an address or hash
+/// appearing earlier in the message cannot be mistaken for the payload. `None` when there is no
+/// `data` field or it is shorter than a selector; the caller decodes it with the matching
+/// `SolError::abi_decode` (which validates the argument length).
+#[must_use]
+pub fn revert_data(s: &str) -> Option<Vec<u8>> {
+    let data_at = s.find("data")?;
+    let hex_at = s[data_at..].find("0x")? + data_at + 2;
+    let hex: String = s[hex_at..]
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect();
+    if hex.len() < 8 || !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    hex::decode(hex.to_ascii_lowercase()).ok()
+}
+
 /// Extract the 4-byte custom-error selector from a revert error string of the form
 /// `… revert, data: "0x2f28bb55…"`. Anchored on the `data` field so an address or hash appearing
 /// earlier in the message cannot be mistaken for a selector.
@@ -57,6 +76,21 @@ mod tests {
     const CC_STYLE: &str = "server returned an error response: error code -32603: VM Exception \
          while processing transaction: revert, data: \
          \"0x2f28bb55c8e0b2db4217508f44fb2d148bd9fab3c94e876a56a3fdbcf71f17570ecbe54c\"";
+
+    #[test]
+    fn revert_data_extraction() {
+        // Selector + one 32-byte word, as the node prints it.
+        let data = revert_data(CC_STYLE).expect("payload present");
+        assert_eq!(data.len(), 36);
+        assert_eq!(&data[..4], &[0x2f, 0x28, 0xbb, 0x55]);
+        assert_eq!(
+            revert_data("call reverted, data: \"0x12345678\""),
+            Some(vec![0x12, 0x34, 0x56, 0x78])
+        );
+        assert_eq!(revert_data("connection refused"), None);
+        assert_eq!(revert_data("revert, data: \"0xabc\""), None); // shorter than a selector
+        assert_eq!(revert_data("revert, data: \"0x123456789\""), None); // odd nibble count
+    }
 
     #[test]
     fn selector_extraction() {

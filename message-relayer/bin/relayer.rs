@@ -12,9 +12,9 @@ use alloy::primitives::Address;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use message_relayer::config::{
-    validate_ack_not_ready_poll_secs, AckConfig, AttestorSet, ChainRoute, ClaimConfig, Config,
-    P2pConfig, DEFAULT_ACK_NOT_READY_POLL_SECS, DEFAULT_ACK_NOT_READY_POLL_WINDOW_SECS,
-    DEFAULT_BLOCK_CONFIRMATION_DEPTH, DEFAULT_P2P_PORT,
+    parse_wei, validate_ack_not_ready_poll_secs, AckConfig, AttestorSet, ChainRoute, ClaimConfig,
+    Config, P2pConfig, DEFAULT_ACK_NOT_READY_POLL_SECS, DEFAULT_ACK_NOT_READY_POLL_WINDOW_SECS,
+    DEFAULT_BLOCK_CONFIRMATION_DEPTH, DEFAULT_MAX_GAS_LIMIT, DEFAULT_P2P_PORT,
 };
 use message_relayer::Server;
 use tracing::{debug, info};
@@ -115,6 +115,26 @@ struct Cli {
         required = false
     )]
     relayer_contract_address: Option<String>,
+
+    /// Most native value (destination wei; decimal or 0x-hex) this route fronts as `msg.value` on
+    /// one `deliverMessage` (asc-contracts #36 envelope `nativeCoinValue`). Envelopes above it are
+    /// refused as terminal. Default 0: front nothing. Keep it small — the relayer is only repaid on
+    /// `claimDelivery` (product guidance: about 0.1 CTC equivalent per chain).
+    #[arg(long, default_value = "0", env = "RELAYER_MAX_NATIVE_COIN_VALUE_WEI")]
+    max_native_coin_value_wei: String,
+
+    /// Largest attested envelope `gasLimit` this route will deliver; above it the message can never
+    /// fit a destination block, so it is refused as terminal. Also caps the gas bump on an
+    /// `InsufficientGasForDestination` retry. Must be > 0.
+    #[arg(long, default_value_t = DEFAULT_MAX_GAS_LIMIT, env = "RELAYER_MAX_GAS_LIMIT")]
+    max_gas_limit: u64,
+
+    /// Call `RelayerContract.requestTopUp(messageId, additionalGasNeeded)` on Creditcoin (once per
+    /// message, from the ack/claim signer) when a delivery is refused because its funded gasLimit
+    /// is below the estimate. Off by default; requires `--relayer-contract-address` and the ack
+    /// (or claim) signer key.
+    #[arg(long, default_value_t = false, env = "RELAYER_AUTO_REQUEST_TOP_UP")]
+    auto_request_top_up: bool,
 
     // ---------- acknowledgment submitter (opt-in; all three required to enable) ---------------
     /// Proof-gen API base URL (e.g. `http://127.0.0.1:8080`). Enables the ack submitter when set
@@ -370,6 +390,14 @@ fn single_route_config(cli: Cli) -> Result<Config> {
         })
         .transpose()?;
 
+    let max_native_coin_value_wei =
+        parse_wei(&cli.max_native_coin_value_wei).with_context(|| {
+            format!(
+                "invalid --max-native-coin-value-wei: {}",
+                cli.max_native_coin_value_wei
+            )
+        })?;
+
     let route = ChainRoute {
         chain_key,
         creditcoin_chain_id: cc3_chain_id,
@@ -384,7 +412,13 @@ fn single_route_config(cli: Cli) -> Result<Config> {
         threshold_override: cli.threshold_override,
         ack,
         claim,
+        max_native_coin_value_wei,
+        max_gas_limit: cli.max_gas_limit,
+        auto_request_top_up: cli.auto_request_top_up,
     };
+    // Same cross-field rules as the YAML path (non-zero gas cap; the top-up opt-in needs the
+    // relayer contract and a Creditcoin signer).
+    route.validate()?;
 
     let checkpoint = checkpoint_path_opt(&cli.checkpoint_path);
     Ok(Config::single_route(
