@@ -85,6 +85,29 @@ routes:
     # alias for existing configs.
     # relayer_contract_address: "0x2222222222222222222222222222222222222222"
 
+    # --- asc-contracts #36 envelope policy (all optional) ---------------------------------------
+    # Every EVM message payload is now an envelope abi.encode(destination, nativeCoinValue,
+    # gasLimit, payloadData); deliverMessage is payable and msg.value must equal nativeCoinValue.
+    #
+    # Most native value (destination wei) this route fronts on one delivery. The relayer is only
+    # repaid on claimDelivery, so this is working capital at risk per message — keep it small
+    # (product guidance: about 0.1 CTC equivalent per chain, also enforced by the quoter). An
+    # envelope above the cap is refused as terminal (relayer_deliver_tx{status="RefusedNativeValue"}).
+    # Default 0 = front nothing. Use a string: wei amounts overflow a YAML integer; 0x-hex accepted.
+    # max_native_coin_value_wei: "100000000000000000"   # 0.1 ether-units
+    # Largest attested envelope gasLimit this route will deliver. The DispatcherRouter only rejects
+    # gasLimit == 0, so a gasLimit bigger than a destination block can never be delivered by anyone;
+    # refusing it up front (terminal, relayer_deliver_tx{status="RefusedGasLimit"}) beats retrying
+    # an unincludable tx forever. Also the ceiling for the +25%/attempt gas bump on an
+    # InsufficientGasForDestination revert. Must be > 0. Default 5_000_000.
+    # max_gas_limit: 5000000
+    # When a delivery is refused because its funded gasLimit is below the estimate (the "awaiting a
+    # topUpGasLimit" path), also call RelayerContract.requestTopUp(messageId, additionalGasNeeded)
+    # on Creditcoin — once per message, from the ack (else claim) signer below. It is a pure
+    # on-chain signal (TopUpRequested) for the payer/quoter; permissionless, so sending it is
+    # relayer policy. Requires relayer_contract_address and an ack or claim signer_key. Default false.
+    # auto_request_top_up: false
+
     # Attestor allowlist + quorum. Threshold is ⌊2N/3⌋+1 unless threshold_override is set.
     attestor_set:
       # On-chain source (recommended): read attestors()/threshold() from the EOAValidator on the

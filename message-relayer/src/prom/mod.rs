@@ -610,13 +610,33 @@ pub enum VoteOutcome {
     Buffered,
 }
 
+/// Outcome label on `relayer_deliver_tx`. One increment per classified attempt/outcome; a job that
+/// is refused before any tx is sent still counts (the `Refused*` arms), so a route that silently
+/// drops every message is visible.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
 pub enum DeliveryStatus {
     Submitted,
     Succeeded,
     Reverted,
     AlreadyValidated,
+    /// Votes validated, dApp callback deferred/reverted — stored for `retryPendingMessage`.
     Pending,
+    /// asc-contracts #36: delivered AND consumed, but the destination call failed
+    /// (`MessageExecutionFailed` alongside `MessageDelivered`). Not retryable; the relayer is still
+    /// paid on claim. A rising count here is a destination-dApp problem, not a relayer one.
+    DestinationFailed,
+    /// The envelope asked the relayer to front more native value than the route's
+    /// `max_native_coin_value_wei`. Terminal (quoter/publisher-side fix).
+    RefusedNativeValue,
+    /// The attested envelope `gasLimit` exceeds the route's `max_gas_limit`, so no relayer can ever
+    /// fit it in a destination block. Terminal (publisher-side fix).
+    RefusedGasLimit,
+    /// `deliverMessage` reverted `ValidationFailedWithNativeValue`: the votes failed validation
+    /// while value was attached. Terminal for these votes.
+    ValidationFailedWithNativeValue,
+    /// `deliverMessage` reverted `InvalidMessageDispatcher`: the Inbox's dispatcher has no code
+    /// and value was attached. Terminal until the Inbox is reconfigured.
+    InvalidDispatcher,
 }
 
 /// Outcome of one settlement attempt (`submitAcknowledgment` or `claimDelivery`) — shared shape
@@ -814,6 +834,30 @@ mod tests {
         assert!(body.contains("relayer_claim_submissions"));
         assert!(body.contains("relayer_settlement_queue_depth"));
         assert!(body.contains("chain_keys=\"2,7\""));
+    }
+
+    /// The #36 outcomes must be distinct label values on the existing `relayer_deliver_tx` family
+    /// (dashboards select on `status`), not folded into `Succeeded`/`Reverted`.
+    #[test]
+    fn post_36_delivery_outcomes_are_distinct_labels() {
+        let m = RelayerMetrics::new(&[8]);
+        m.inc_deliver_tx(8, DeliveryStatus::DestinationFailed);
+        m.inc_deliver_tx(8, DeliveryStatus::RefusedNativeValue);
+        m.inc_deliver_tx(8, DeliveryStatus::RefusedGasLimit);
+        m.inc_deliver_tx(8, DeliveryStatus::ValidationFailedWithNativeValue);
+        m.inc_deliver_tx(8, DeliveryStatus::InvalidDispatcher);
+        let body = m.encode();
+        for status in [
+            "DestinationFailed",
+            "RefusedNativeValue",
+            "RefusedGasLimit",
+            "ValidationFailedWithNativeValue",
+            "InvalidDispatcher",
+        ] {
+            let needle =
+                format!("relayer_deliver_tx_total{{chain_key=\"8\",status=\"{status}\"}} 1");
+            assert!(body.contains(&needle), "missing {needle} in:\n{body}");
+        }
     }
 
     #[test]

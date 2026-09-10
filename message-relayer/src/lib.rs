@@ -101,6 +101,9 @@ impl Server {
                 destination_rpc = %redact_url_query(&route.destination_rpc_url),
                 attestor_set = ?attestor_set_summary(&route.attestor_set),
                 threshold_override = ?route.threshold_override,
+                max_native_coin_value_wei = %route.max_native_coin_value_wei,
+                max_gas_limit = route.max_gas_limit,
+                auto_request_top_up = route.auto_request_top_up,
                 "📨 Route configured"
             );
         }

@@ -3,28 +3,39 @@
 //! Consumes [`DeliveryJob`]s from the vote pool and submits `Inbox.deliverMessage(...)` on the
 //! destination chain. Implements the PoC §7 + §9 behaviour:
 //!
-//!  1. (Optional) `eth_call` simulate to catch `validateVotes` reverts before paying gas.
+//!  1. Refuse what can never be delivered: an envelope whose `nativeCoinValue` exceeds the route's
+//!     `max_native_coin_value_wei`, or whose attested `gasLimit` exceeds `max_gas_limit`
+//!     (asc-contracts #36 — the router only rejects `gasLimit == 0`, so an oversized one would be
+//!     retried forever). Both are terminal with their own metric label.
+//!  2. (Optional) `eth_call` simulate to catch `validateVotes` reverts before paying gas.
 //!     Simulation distinguishes reverts (terminal / already-validated) from transport failures
 //!     (returned to the pool's bounded retry) — a mere RPC blip must not drop a message.
-//!  2. Send the transaction, watching for receipt (bounded by [`RECEIPT_TIMEOUT`] so a stuck
+//!  3. Send the transaction, watching for receipt (bounded by [`RECEIPT_TIMEOUT`] so a stuck
 //!     underpriced tx cannot wedge the route's serial worker).
-//!  3. Classify the outcome. Note `MessagePending` is an **event on a successful tx** (the inbox
-//!     validated the votes but the dApp's `receiveMessage` reverted) — it is detected from the
-//!     receipt logs, not from a revert.
-//!  4. On `MessagePending`, schedule bounded `retryPendingMessage` attempts (permissionless).
-//!  5. On RPC-level failure, retry up to `delivery.max_retries` with backoff.
+//!  4. Classify the outcome from the receipt logs. `MessagePending` and (#36)
+//!     `MessageExecutionFailed` are **events on a successful tx**: the former means the dispatcher
+//!     deferred/queued the message (retryable via `retryPendingMessage`), the latter that the
+//!     destination call failed and the message is consumed for good (no retry; delivery still
+//!     counts and is still paid). A mined-but-reverted tx is replayed to learn why: an
+//!     `InsufficientGasForDestination` revert is retried with 25% more gas up to `max_gas_limit`.
+//!  5. On `MessagePending`, schedule bounded `retryPendingMessage` attempts (permissionless),
+//!     honouring a `RetryDeferred(retryAfter)` hint over the fixed backoff.
+//!  6. On RPC-level failure, retry up to `delivery.max_retries` with backoff.
 //!
 //! The worker processes one job at a time per route — serial nonce management is the simplest
 //! approach for PoC scope and matches PoC §7.2 ("optional multiple wallets for throughput, out
 //! of PoC scope"). Each route runs in its own [`tokio::spawn`] so a slow destination chain
 //! does not block the others.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use alloy::eips::BlockId;
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, Bytes, B256, U256};
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::{DynProvider, Provider, ProviderBuilder};
+use alloy::rpc::types::Log;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::{SolError, SolEvent, SolValue};
 use anyhow::{Context, Result};
@@ -32,10 +43,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::abi::{IInbox, IMessageReceiver, IRelayerContract};
+use crate::abi::{IInbox, IMessageDispatcher, IMessageReceiver, IRelayerContract};
 use crate::config::{ChainRoute, DeliveryConfig};
 use crate::prom::{DeliveryStatus, Metrics};
-use crate::revert::{has_selector, is_revert};
+use crate::revert::{is_revert, revert_data, revert_selector};
 
 pub mod encode;
 
@@ -43,21 +54,30 @@ pub mod encode;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
-/// Most native value (destination wei) the relayer will front on one delivery. The relayer is only
-/// made whole on `claimDelivery`, so this is working capital at risk per message. Zero until the
-/// cap policy (per route, priced by the quoter) is decided with the contracts team; a nonzero
-/// `nativeCoinValue` is therefore refused as terminal today rather than silently delivered with
-/// the wrong `msg.value`.
-const MAX_NATIVE_COIN_VALUE_WEI: U256 = U256::ZERO;
+/// The four-field EVM envelope `abi.encode(destination, nativeCoinValue, gasLimit, payloadData)`
+/// (asc-contracts #36) — or rather the two words of it the relayer acts on. A payload that is not
+/// an envelope (legacy dApps, raw bytes) carries no value and no attested gas.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct EnvelopeTerms {
+    native_value: U256,
+    /// Attested destination `gasLimit`; `None` when the payload is not an envelope.
+    gas_limit: Option<U256>,
+}
+
+fn envelope_terms(payload: &[u8]) -> EnvelopeTerms {
+    <(Address, U256, U256, Bytes)>::abi_decode_params(payload)
+        .map(|(_, native_value, gas_limit, _)| EnvelopeTerms {
+            native_value,
+            gas_limit: Some(gas_limit),
+        })
+        .unwrap_or_default()
+}
 
 /// The `nativeCoinValue` an EVM `messagePayload` asks the dispatcher to forward, or zero when the
-/// payload is not the four-field envelope `abi.encode(destination, nativeCoinValue, gasLimit,
-/// payloadData)` (asc-contracts #36). Only the second word matters here; the router decodes the
-/// rest on-chain.
+/// payload is not the four-field envelope. Test-side shorthand for [`envelope_terms`].
+#[cfg(test)]
 fn envelope_native_value(payload: &[u8]) -> U256 {
-    <(Address, U256, U256, Bytes)>::abi_decode_params(payload)
-        .map(|(_, native_value, _, _)| native_value)
-        .unwrap_or(U256::ZERO)
+    envelope_terms(payload).native_value
 }
 
 /// Upper bound on waiting for a delivery receipt. Without it, one stuck (e.g. underpriced) tx
@@ -72,9 +92,9 @@ const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
 const HEALTH_TICK: Duration = Duration::from_secs(15);
 
 /// Upper bound on the per-job funded-gas RPC reads (`RelayerContract.getMessageInfo` on the
-/// source, and the under-funding `estimate_gas` on the destination). Both sit in the serial
-/// worker's critical path, so a stalled RPC must not park the route — on timeout the job degrades
-/// gracefully (estimation fallback / bounded retry) instead of wedging.
+/// source, the under-funding `estimate_gas` on the destination, and the mined-revert replay). All
+/// sit in the serial worker's critical path, so a stalled RPC must not park the route — on timeout
+/// the job degrades gracefully (estimation fallback / bounded retry) instead of wedging.
 const FUNDED_GAS_READ_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Upper bound on a single `send()` — the gas/fee/nonce reads plus `eth_sendRawTransaction`. Alloy's
@@ -104,13 +124,27 @@ const MAX_FUNDED_GAS: u64 = 100_000_000;
 const TOP_UP_DEADLINE_GRACE: Duration = Duration::from_secs(900);
 
 /// Bounded, permissionless `retryPendingMessage` schedule after a delivery lands in the
-/// `MessagePending` state (dApp callback reverted). Backoff gives the destination dApp time to
-/// recover (e.g. gas market spike); anyone else may also retry, so this is best-effort.
+/// `MessagePending` state (dispatcher deferred/queued the message). Backoff gives the destination
+/// time to recover (e.g. a rate-limit window); anyone else may also retry, so this is best-effort.
+/// When the previous attempt reverted `RetryDeferred(retryAfter)` with a usable timestamp, that
+/// timestamp (plus [`RETRY_DEFERRED_MARGIN`]) replaces the fixed delay — see
+/// [`pending_retry_delay`].
 const PENDING_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(15),
     Duration::from_secs(60),
     Duration::from_secs(240),
 ];
+
+/// Slack added on top of a `RetryDeferred.retryAfter` hint: the dispatcher's window opens at that
+/// second on the *destination chain's* clock, and the retry tx also has to be mined after it, so
+/// aiming exactly at the boundary would revert again on any skew.
+const RETRY_DEFERRED_MARGIN: Duration = Duration::from_secs(5);
+
+/// Longest the pending-retry task will honour a `retryAfter` hint for. A dispatcher hint is
+/// advisory and unauthenticated by us; a bogus far-future value must not park a detached task for
+/// days. Past this the attempt falls back to the fixed schedule (and, most likely, defers again
+/// and exhausts its bounded budget — the message stays retryable on-chain by anyone).
+const MAX_RETRY_DEFERRED_WAIT: Duration = Duration::from_secs(6 * 3600);
 
 /// Job dispatched by the pool when a `messageHash` clears the threshold.
 #[derive(Clone, Debug)]
@@ -211,11 +245,29 @@ pub async fn run(
         None => None,
     };
 
+    // Opt-in `requestTopUp` sender (source chain, signed by the ack/claim key). Built here, once,
+    // so a bad key fails the route at startup instead of on the first under-funded message.
+    let mut top_up = match (route.auto_request_top_up, route.relayer_contract_address) {
+        (true, Some(relayer_contract)) => Some(
+            TopUpRequester::connect(
+                &route,
+                relayer_contract,
+                &creditcoin_eth_rpc_url,
+                broadcast_locks.clone(),
+            )
+            .await?,
+        ),
+        _ => None,
+    };
+
     info!(
         chain_key,
         signer = %signer_address,
         inbox = %route.inbox_address,
         relayer_contract = ?route.relayer_contract_address,
+        max_native_coin_value_wei = %route.max_native_coin_value_wei,
+        max_gas_limit = route.max_gas_limit,
+        auto_request_top_up = route.auto_request_top_up,
         "🚚 delivery worker online"
     );
 
@@ -276,6 +328,7 @@ pub async fn run(
                     &job,
                     funding,
                     metrics.as_ref(),
+                    top_up.as_mut(),
                 ).await {
                     Ok(outcome) => outcome,
                     Err(err) => {
@@ -392,6 +445,492 @@ fn now_unix() -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
+// ---------------------------------------------------------------------------------------------
+// requestTopUp (opt-in)
+// ---------------------------------------------------------------------------------------------
+
+/// Most `requestTopUp` sends attempted per message before giving up on the signal. Each attempt
+/// only happens when the delivery is refused as under-funded again, so this is bounded by the
+/// pool's own retry cadence, not a hot loop.
+const MAX_TOP_UP_ATTEMPTS: u8 = 3;
+
+/// Per-message state of the `requestTopUp` signal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TopUpMark {
+    /// A send is in progress (detached task running); do not double-send.
+    InFlight { attempts: u8 },
+    /// The signal landed (mined), or the contract rejected it deterministically (a top-up could
+    /// not help anyway). Nothing more to send for this message.
+    Settled,
+    /// The last send did not complete (stalled broadcast, receipt error/timeout). Eligible for
+    /// another attempt on the next under-funded refusal, up to [`MAX_TOP_UP_ATTEMPTS`].
+    Failed { attempts: u8 },
+}
+
+/// Idempotency + retry bookkeeping for `requestTopUp`, one entry per message id. Only a mined or
+/// deterministically rejected request settles a message; a transport failure leaves it eligible
+/// for a bounded retry — recording the id before the send completed meant one timeout suppressed
+/// the signal for the life of the process (Bugbot, PR #63). Restarts forget the ledger, so a
+/// message still under-funded across a restart is requested again: one duplicate event, harmless.
+#[derive(Debug, Default)]
+struct TopUpLedger {
+    marks: HashMap<B256, TopUpMark>,
+}
+
+impl TopUpLedger {
+    /// Whether a request for `id` should go out now; if so, marks it in flight and returns the
+    /// attempt number (1-based). `Err` names why not.
+    fn begin(&mut self, id: B256) -> Result<u8, &'static str> {
+        let attempts = match self.marks.get(&id) {
+            Some(TopUpMark::InFlight { .. }) => return Err("a request is already in flight"),
+            Some(TopUpMark::Settled) => return Err("already requested"),
+            Some(TopUpMark::Failed { attempts }) if *attempts >= MAX_TOP_UP_ATTEMPTS => {
+                return Err("attempts exhausted")
+            }
+            Some(TopUpMark::Failed { attempts }) => attempts + 1,
+            None => 1,
+        };
+        self.marks.insert(id, TopUpMark::InFlight { attempts });
+        Ok(attempts)
+    }
+
+    /// The in-flight request for `id` landed or was deterministically rejected.
+    fn settle(&mut self, id: B256) {
+        self.marks.insert(id, TopUpMark::Settled);
+    }
+
+    /// The in-flight request for `id` did not complete; keep the attempt count for the cap.
+    fn fail(&mut self, id: B256) {
+        let attempts = match self.marks.get(&id) {
+            Some(TopUpMark::InFlight { attempts }) | Some(TopUpMark::Failed { attempts }) => {
+                *attempts
+            }
+            Some(TopUpMark::Settled) => return,
+            None => 1,
+        };
+        self.marks.insert(id, TopUpMark::Failed { attempts });
+    }
+}
+
+/// Sends `RelayerContract(Lite).requestTopUp(messageId, additionalGasNeeded)` on Creditcoin when a
+/// delivery is refused for being under-funded, once per message (retried a bounded number of
+/// times only if the send itself failed — see [`TopUpLedger`]). Signed by the route's ack (else
+/// claim) key — the same key that already talks to the RelayerContract for `claimDelivery` — and
+/// serialized through the shared [`crate::broadcast::BroadcastLocks`] so it cannot race the ack
+/// worker for that key's nonce.
+///
+/// The call is a pure on-chain signal (`TopUpRequested` event; no state change) for the payer /
+/// quoter to act on with `topUpGasLimit`. It is permissionless, so whether to send it at all is
+/// relayer policy: `ChainRoute::auto_request_top_up`, default off.
+struct TopUpRequester {
+    provider: DynProvider,
+    relayer_contract: Address,
+    signer_address: Address,
+    broadcast_locks: Arc<crate::broadcast::BroadcastLocks>,
+    /// Shared with the detached send tasks, which report their outcome back into it.
+    ledger: Arc<Mutex<TopUpLedger>>,
+}
+
+impl TopUpRequester {
+    async fn connect(
+        route: &ChainRoute,
+        relayer_contract: Address,
+        creditcoin_eth_rpc_url: &str,
+        broadcast_locks: Arc<crate::broadcast::BroadcastLocks>,
+    ) -> Result<Self> {
+        let chain_key = route.chain_key;
+        let key = route.top_up_signer_key().with_context(|| {
+            format!(
+                "chain_key {chain_key}: auto_request_top_up needs an ack or claim signer_key \
+                 (validated by config; this is a wiring bug)"
+            )
+        })?;
+        let signer: PrivateKeySigner = key.trim().parse().with_context(|| {
+            format!("chain_key {chain_key}: invalid ack/claim signer_key for auto_request_top_up")
+        })?;
+        let signer_address = signer.address();
+        let provider = crate::broadcast::chain_nonce_builder()
+            .wallet(EthereumWallet::from(signer))
+            .connect(creditcoin_eth_rpc_url)
+            .await
+            .with_context(|| {
+                format!(
+                    "chain_key {chain_key}: failed to connect to source EVM RPC at \
+                     {creditcoin_eth_rpc_url} (needed for requestTopUp)"
+                )
+            })?
+            .erased();
+        info!(
+            chain_key,
+            signer = %signer_address,
+            %relayer_contract,
+            "🪙 auto_request_top_up enabled — under-funded deliveries will emit requestTopUp"
+        );
+        Ok(Self {
+            provider,
+            relayer_contract,
+            signer_address,
+            broadcast_locks,
+            ledger: Arc::new(Mutex::new(TopUpLedger::default())),
+        })
+    }
+
+    /// Request a top-up of `additional_gas` for `message_id`, unless one already landed, is in
+    /// flight, or the bounded attempt budget is spent. Detached: the send + receipt wait must not
+    /// sit in the serial delivery worker's critical path (it is a side signal, not part of
+    /// delivering anything). The in-flight mark is taken *before* spawning so a second refusal of
+    /// the same message while the first request is still pending does not double-send; the task
+    /// reports back so a send that never completed can be retried on the next refusal.
+    fn request(&mut self, chain_key: u64, message_id: B256, additional_gas: u64) {
+        let attempt = match self
+            .ledger
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .begin(message_id)
+        {
+            Ok(n) => n,
+            Err(why) => {
+                debug!(chain_key, %message_id, why, "requestTopUp not (re)sent");
+                return;
+            }
+        };
+        let locks = self.broadcast_locks.clone();
+        let provider = self.provider.clone();
+        let relayer_contract = self.relayer_contract;
+        let signer_address = self.signer_address;
+        let ledger = self.ledger.clone();
+        tokio::spawn(async move {
+            let landed = send_top_up_request(
+                &provider,
+                &locks,
+                relayer_contract,
+                signer_address,
+                chain_key,
+                message_id,
+                additional_gas,
+                attempt,
+            )
+            .await;
+            let mut ledger = ledger.lock().unwrap_or_else(|p| p.into_inner());
+            if landed {
+                ledger.settle(message_id);
+            } else {
+                ledger.fail(message_id);
+            }
+        });
+    }
+}
+
+/// One `requestTopUp` send + receipt wait. `true` when the message is settled from the relayer's
+/// point of view (mined, or deterministically rejected so a top-up could not help anyway); `false`
+/// when the send did not complete and may be retried.
+#[allow(clippy::too_many_arguments)]
+async fn send_top_up_request(
+    provider: &DynProvider,
+    locks: &crate::broadcast::BroadcastLocks,
+    relayer_contract: Address,
+    signer_address: Address,
+    chain_key: u64,
+    message_id: B256,
+    additional_gas: u64,
+    attempt: u8,
+) -> bool {
+    let ledger = IRelayerContract::new(relayer_contract, provider);
+    let call = ledger.requestTopUp(message_id, U256::from(additional_gas));
+    let sent = match locks
+        .broadcast(signer_address, SEND_TIMEOUT, call.send())
+        .await
+    {
+        Ok(res) => res,
+        Err(stalled) => {
+            warn!(chain_key, %message_id, attempt, %stalled,
+                "requestTopUp send did not complete; will retry on the next under-funded refusal");
+            return false;
+        }
+    };
+    match sent {
+        Ok(builder) => {
+            match tokio::time::timeout(RECEIPT_TIMEOUT, crate::receipt::await_receipt(&builder))
+                .await
+            {
+                Ok(Ok(receipt)) if receipt.status() => {
+                    info!(chain_key, %message_id, additional_gas, attempt, tx = %receipt.transaction_hash,
+                        "🪙 requestTopUp emitted (TopUpRequested) — awaiting the payer's topUpGasLimit");
+                    true
+                }
+                Ok(Ok(receipt)) => {
+                    // Mined and reverted: the same state-dependent rejection as the send-time
+                    // revert below; resending would revert identically.
+                    warn!(chain_key, %message_id, attempt, tx = %receipt.transaction_hash,
+                        "requestTopUp tx mined but reverted; not retrying");
+                    true
+                }
+                Ok(Err(err)) => {
+                    warn!(chain_key, %message_id, attempt, %err,
+                        "requestTopUp receipt failed; will retry on the next under-funded refusal");
+                    false
+                }
+                Err(_) => {
+                    // The tx may still land later (one duplicate TopUpRequested event, harmless).
+                    warn!(chain_key, %message_id, attempt,
+                        "requestTopUp receipt timed out; will retry on the next under-funded refusal");
+                    false
+                }
+            }
+        }
+        // A revert here (UnknownOperation / RelayAlreadySettled / DeliveryDeadlineReached) means
+        // a top-up could not help anyway; the delivery path reaches the same conclusion through
+        // `top_up_foreclosed` on its next pass. A transport failure at send is retryable.
+        Err(err) => {
+            if is_revert(&err.to_string()) || err.as_revert_data().is_some() {
+                warn!(chain_key, %message_id, attempt, %err, "requestTopUp rejected; not retrying");
+                true
+            } else {
+                warn!(chain_key, %message_id, attempt, %err,
+                    "requestTopUp send failed; will retry on the next under-funded refusal");
+                false
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Revert / receipt classification
+// ---------------------------------------------------------------------------------------------
+
+/// What a `deliverMessage` revert means for the job. Selectors are matched node-agnostically
+/// (raw revert data, the `data: "0x…"` field Creditcoin-style nodes print, or a decoded name), see
+/// [`crate::revert`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeliveryRevert {
+    /// The Inbox or the receiver already processed this message — idempotent success (lost a race
+    /// to another relayer, or a previous stuck attempt mined).
+    Duplicate,
+    /// #36: votes failed validation while native value was attached. Terminal for these votes.
+    ValidationFailedWithNativeValue,
+    /// #36: the Inbox's dispatcher has no code (value attached). Terminal until reconfigured.
+    InvalidMessageDispatcher,
+    /// #36: the destination call failed with too little gas to prove the attested `gasLimit` was
+    /// forwarded. Retryable with a higher tx gas limit.
+    InsufficientGasForDestination,
+    /// Any other deterministic revert: retrying would revert identically.
+    Other,
+}
+
+/// Classify an error from a `deliverMessage` simulate / estimate / send. `None` means it is not a
+/// contract revert at all (transport, timeout, funds, nonce) and should be retried.
+fn classify_delivery_revert(err: &alloy::contract::Error) -> Option<DeliveryRevert> {
+    // Structured revert data first (geth-style nodes return it as the JSON-RPC error `data`),
+    // then the string dialects.
+    let sel = err
+        .as_revert_data()
+        .filter(|d| d.len() >= 4)
+        .map(|d| [d[0], d[1], d[2], d[3]]);
+    let s = err.to_string();
+    classify_revert_str(&s, sel)
+}
+
+/// String-side classification shared by [`classify_delivery_revert`] and the mined-revert replay
+/// (whose reason only exists as an error string). `sel` is a selector already extracted from
+/// structured revert data, if any; the `data: "0x…"` field of the string is used otherwise.
+fn classify_revert_str(s: &str, sel: Option<[u8; 4]>) -> Option<DeliveryRevert> {
+    let sel = sel.or_else(|| revert_selector(s));
+    let is = |selector: [u8; 4], name: &str| sel == Some(selector) || s.contains(name);
+
+    if revert_duplicate_delivery(&s) {
+        return Some(DeliveryRevert::Duplicate);
+    }
+    if is(
+        IInbox::ValidationFailedWithNativeValue::SELECTOR,
+        "ValidationFailedWithNativeValue",
+    ) {
+        return Some(DeliveryRevert::ValidationFailedWithNativeValue);
+    }
+    if is(
+        IInbox::InvalidMessageDispatcher::SELECTOR,
+        "InvalidMessageDispatcher",
+    ) {
+        return Some(DeliveryRevert::InvalidMessageDispatcher);
+    }
+    if is(
+        IMessageDispatcher::InsufficientGasForDestination::SELECTOR,
+        "InsufficientGasForDestination",
+    ) {
+        return Some(DeliveryRevert::InsufficientGasForDestination);
+    }
+    if is_revert(s) || sel.is_some() {
+        return Some(DeliveryRevert::Other);
+    }
+    None
+}
+
+/// Whether a `deliverMessage` error means the inbox already accepted this message (idempotent
+/// success — we lost the race to another relayer, or a previous stuck attempt mined).
+///
+/// Two guards can say so, and both must be matched:
+///
+///  * the **Inbox** duplicate guard — `MessageAlreadyValidated` on current inboxes, or the deployed
+///    `SimpleInbox`'s `require(..., "Already validated")` string revert;
+///  * the **receiver** duplicate guard — `MessageReceiverBase.MessageAlreadyProcessed`, which fires
+///    when the callback already ran for this messageId. A restart replaying the checkpoint hit this
+///    on usc-devnet (2026-09-01): the delivery was long since processed, but because only the Inbox
+///    guard was matched here it logged a terminal ERROR and counted as `Reverted`.
+///
+/// Each is matched three ways because node dialects differ: the revert *string*, the decoded
+/// custom-error *name*, and the raw 4-byte *selector* (see [`crate::revert`]).
+fn revert_duplicate_delivery(err: &impl std::fmt::Display) -> bool {
+    let s = err.to_string();
+    let sel = revert_selector(&s);
+    s.contains("Already validated")
+        || s.contains("MessageAlreadyValidated")
+        || sel == Some(IInbox::MessageAlreadyValidated::SELECTOR)
+        || s.contains("MessageAlreadyProcessed")
+        || sel == Some(IMessageReceiver::MessageAlreadyProcessed::SELECTOR)
+}
+
+/// What the logs of a **successful** `deliverMessage` receipt say happened. Precedence matters:
+/// `MessageExecutionFailed` (#36) is emitted *together with* `MessageDelivered`, so the plain
+/// success arm is only reached when neither of the two qualifying events is present.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReceiptClass {
+    /// `MessageDelivered` alone: destination executed.
+    Delivered,
+    /// `MessageExecutionFailed` + `MessageDelivered`: consumed, destination call failed, no retry.
+    DestinationFailed { dispatcher: Address },
+    /// `MessagePending`: dispatcher deferred/queued; `retryPendingMessage` applies.
+    Pending,
+}
+
+fn classify_success_logs<'a>(
+    inbox: Address,
+    logs: impl IntoIterator<Item = &'a Log>,
+) -> ReceiptClass {
+    let mut pending = false;
+    for log in logs {
+        if log.address() != inbox {
+            continue;
+        }
+        match log.topics().first() {
+            Some(t) if *t == IInbox::MessageExecutionFailed::SIGNATURE_HASH => {
+                // topics[2] is the indexed `dispatcher` (left-padded address).
+                let dispatcher = log
+                    .topics()
+                    .get(2)
+                    .map(|t| Address::from_slice(&t[12..]))
+                    .unwrap_or_default();
+                return ReceiptClass::DestinationFailed { dispatcher };
+            }
+            Some(t) if *t == IInbox::MessagePending::SIGNATURE_HASH => pending = true,
+            _ => {}
+        }
+    }
+    if pending {
+        ReceiptClass::Pending
+    } else {
+        ReceiptClass::Delivered
+    }
+}
+
+/// Next tx gas limit to try after `InsufficientGasForDestination`: 25% over the gas the reverted
+/// attempt ran with (or over the attested envelope `gasLimit` when nothing was pinned — the
+/// destination needs at least that, plus Inbox/router overhead), never above `cap`. `None` when
+/// the cap is already reached (or there is nothing to bump from), i.e. give up.
+fn bumped_gas_limit(current: Option<u64>, envelope_gas: Option<u64>, cap: u64) -> Option<u64> {
+    let base = current.or(envelope_gas)?;
+    if base >= cap {
+        return None;
+    }
+    let bumped = (base.saturating_mul(5) / 4).max(base.saturating_add(1));
+    Some(bumped.min(cap))
+}
+
+/// Delay before pending-retry `attempt` (0-based). The fixed schedule unless the previous attempt
+/// reverted `RetryDeferred(retryAfter)` with a timestamp still in the future — then wait until
+/// that moment plus [`RETRY_DEFERRED_MARGIN`], capped by [`MAX_RETRY_DEFERRED_WAIT`]. `retryAfter
+/// == 0` (dispatcher exposes no schedule) and past timestamps fall back to the fixed schedule.
+fn pending_retry_delay(attempt: usize, retry_after: Option<u64>, now: Option<u64>) -> Duration {
+    let fixed = PENDING_RETRY_DELAYS[attempt.min(PENDING_RETRY_DELAYS.len() - 1)];
+    match (retry_after, now) {
+        (Some(ts), Some(now)) if ts > now => {
+            (Duration::from_secs(ts - now) + RETRY_DEFERRED_MARGIN).min(MAX_RETRY_DEFERRED_WAIT)
+        }
+        _ => fixed,
+    }
+}
+
+/// `Some(retryAfter)` when `err` is a `RetryDeferred(messageId, retryAfter)` revert from
+/// `retryPendingMessage`. Structured revert data first, then the `data: "0x…"` field of the error
+/// string (Creditcoin-style nodes).
+fn decode_retry_deferred(err: &alloy::contract::Error) -> Option<u64> {
+    err.as_decoded_error::<IInbox::RetryDeferred>()
+        .map(|e| e.retryAfter)
+        .or_else(|| decode_retry_deferred_str(&err.to_string()))
+}
+
+fn decode_retry_deferred_str(s: &str) -> Option<u64> {
+    let data = revert_data(s)?;
+    IInbox::RetryDeferred::abi_decode(&data)
+        .ok()
+        .map(|e| e.retryAfter)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The job
+// ---------------------------------------------------------------------------------------------
+
+/// Where a pre-send check ends: hand back a result, or carry on to the send loop.
+enum Stage {
+    Done(DeliveryResultKind),
+    Proceed,
+}
+
+/// Log + count a deterministic revert seen before the send (simulate / estimate) and decide the
+/// job's fate. `InsufficientGasForDestination` is not terminal — the send loop bumps gas — so it
+/// proceeds; everything else that reverts is settled here.
+fn settle_pre_send_revert(
+    route: &ChainRoute,
+    job: &DeliveryJob,
+    metrics: &dyn crate::prom::MetricsTrait,
+    stage: &str,
+    revert: DeliveryRevert,
+    err: &alloy::contract::Error,
+) -> Stage {
+    let chain_key = route.chain_key;
+    let message_id = job.message_id;
+    match revert {
+        DeliveryRevert::Duplicate => {
+            debug!(chain_key, %message_id, "{stage} detected already-validated; idempotent success");
+            metrics.inc_deliver_tx(chain_key, DeliveryStatus::AlreadyValidated);
+            Stage::Done(DeliveryResultKind::Delivered)
+        }
+        DeliveryRevert::ValidationFailedWithNativeValue => {
+            metrics.inc_deliver_tx(chain_key, revert_status(Some(revert)));
+            error!(chain_key, %message_id, %err,
+                "❌ {stage}(deliverMessage) reverted ValidationFailedWithNativeValue — the votes fail \
+                 validation and native value was attached; terminal for this vote bundle");
+            Stage::Done(DeliveryResultKind::Terminal)
+        }
+        DeliveryRevert::InvalidMessageDispatcher => {
+            metrics.inc_deliver_tx(chain_key, revert_status(Some(revert)));
+            error!(chain_key, %message_id, inbox = %route.inbox_address, %err,
+                "❌ {stage}(deliverMessage) reverted InvalidMessageDispatcher — the Inbox's dispatcher \
+                 has no code; terminal until the Inbox is reconfigured");
+            Stage::Done(DeliveryResultKind::Terminal)
+        }
+        DeliveryRevert::InsufficientGasForDestination => {
+            warn!(chain_key, %message_id, %err,
+                "{stage}(deliverMessage) reverted InsufficientGasForDestination; proceeding to send \
+                 with a higher gas limit");
+            Stage::Proceed
+        }
+        DeliveryRevert::Other => {
+            metrics.inc_deliver_tx(chain_key, DeliveryStatus::Reverted);
+            warn!(chain_key, %message_id, %err, "{stage}(deliverMessage) reverted; treating as terminal");
+            Stage::Done(DeliveryResultKind::Terminal)
+        }
+    }
+}
+
 /// Note on liveness: this function deliberately does **not** heartbeat. The caller's tick cannot
 /// fire while this future is awaited from inside its `select!` branch, so a job that retries for
 /// longer than [`crate::health::PROGRESS_DEADLINE`] does report the route stale. That is the lesser
@@ -412,6 +951,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
     job: &DeliveryJob,
     funding: MessageFunding,
     metrics: &dyn crate::prom::MetricsTrait,
+    top_up: Option<&mut TopUpRequester>,
 ) -> Result<DeliveryResultKind> {
     let inbox = IInbox::new(route.inbox_address, provider);
 
@@ -419,16 +959,37 @@ async fn handle_job<P: Provider + Clone + 'static>(
     // `nativeCoinValue` as `msg.value` and recovers it through the fee claim. The router reverts
     // `InvalidNativeCoinValue` if the two differ, so read it from the payload rather than guess.
     // A payload that is not a four-field envelope (legacy dApps, raw bytes) carries no value.
-    let native_value = envelope_native_value(&job.payload);
-    if native_value > MAX_NATIVE_COIN_VALUE_WEI {
+    let terms = envelope_terms(&job.payload);
+    let native_value = terms.native_value;
+    if native_value > route.max_native_coin_value_wei {
+        metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::RefusedNativeValue);
         warn!(
             chain_key = route.chain_key,
             message_id = %job.message_id,
             %native_value,
-            cap = %MAX_NATIVE_COIN_VALUE_WEI,
-            "envelope asks the relayer to front more native value than the cap; refusing (terminal)"
+            cap = %route.max_native_coin_value_wei,
+            "envelope asks the relayer to front more native value than the route's \
+             max_native_coin_value_wei; refusing (terminal — a quoter/publisher-side limit)"
         );
         return Ok(DeliveryResultKind::Terminal);
+    }
+    // The router only rejects gasLimit == 0; an attested gasLimit larger than a destination block
+    // can hold is undeliverable by anyone, forever. Refuse it now rather than retry an unincludable
+    // tx until the pool's LRU evicts it.
+    let envelope_gas: Option<u64> = terms.gas_limit.map(|g| g.saturating_to::<u64>());
+    if let Some(gas_limit) = terms.gas_limit {
+        if gas_limit > U256::from(route.max_gas_limit) {
+            metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::RefusedGasLimit);
+            error!(
+                chain_key = route.chain_key,
+                message_id = %job.message_id,
+                attested_gas_limit = %gas_limit,
+                cap = route.max_gas_limit,
+                "❌ envelope's attested gasLimit exceeds the route's max_gas_limit — it can never be \
+                 delivered; refusing (terminal). Fix on the publisher/quoter side."
+            );
+            return Ok(DeliveryResultKind::Terminal);
+        }
     }
 
     if delivery_config.simulate_before_send {
@@ -452,29 +1013,24 @@ async fn handle_job<P: Provider + Clone + 'static>(
             // PoC §6.5). Any other *revert* is deterministic, so we don't burn gas. A transport
             // failure (RPC blip, timeout) is neither — the pool retries it with backoff; treating
             // it as terminal would silently drop a deliverable message.
-            if revert_duplicate_delivery(&err) {
-                debug!(chain_key = route.chain_key, message_id = %job.message_id,
-                    "simulate detected already-validated; idempotent success");
-                metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::AlreadyValidated);
-                return Ok(DeliveryResultKind::Delivered);
+            match classify_delivery_revert(&err) {
+                Some(revert) => {
+                    if let Stage::Done(kind) =
+                        settle_pre_send_revert(route, job, metrics, "simulate", revert, &err)
+                    {
+                        return Ok(kind);
+                    }
+                }
+                None => {
+                    warn!(
+                        chain_key = route.chain_key,
+                        message_id = %job.message_id,
+                        %err,
+                        "simulate(deliverMessage) failed at transport level; returning to pool for retry"
+                    );
+                    return Ok(DeliveryResultKind::Retryable);
+                }
             }
-            if is_revert(&err.to_string()) {
-                metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::Reverted);
-                warn!(
-                    chain_key = route.chain_key,
-                    message_id = %job.message_id,
-                    %err,
-                    "simulate(deliverMessage) reverted; treating as terminal"
-                );
-                return Ok(DeliveryResultKind::Terminal);
-            }
-            warn!(
-                chain_key = route.chain_key,
-                message_id = %job.message_id,
-                %err,
-                "simulate(deliverMessage) failed at transport level; returning to pool for retry"
-            );
-            return Ok(DeliveryResultKind::Retryable);
         }
     }
 
@@ -521,14 +1077,21 @@ async fn handle_job<P: Provider + Clone + 'static>(
                     );
                     return Ok(DeliveryResultKind::Terminal);
                 }
+                let additional = est.saturating_sub(gas);
                 warn!(
                     chain_key = route.chain_key,
                     message_id = %job.message_id,
                     estimate = est,
                     funded = gas,
+                    additional_gas_needed = additional,
+                    auto_request_top_up = top_up.is_some(),
                     "delivery is under-funded — estimated gas exceeds the funded gasLimit; not \
                      delivering (awaiting a topUpGasLimit). Retrying with backoff."
                 );
+                // Opt-in: tell the payer/quoter on-chain how much more gas is needed, once.
+                if let Some(requester) = top_up {
+                    requester.request(route.chain_key, job.message_id, additional);
+                }
                 return Ok(DeliveryResultKind::Retryable);
             }
             // Funded gas covers the estimate — proceed to send pinned at the funded gas.
@@ -538,32 +1101,25 @@ async fn handle_job<P: Provider + Clone + 'static>(
             // and blanket-retrying a permanent revert would loop forever. Only genuine transport
             // errors are retryable (we must not send unverified: an under-funded message would
             // OOG and be dropped as terminal — the exact failure this guard exists to prevent).
-            Ok(Err(err)) => {
-                if revert_duplicate_delivery(&err) {
-                    debug!(chain_key = route.chain_key, message_id = %job.message_id,
-                        "estimate detected already-validated; idempotent success");
-                    metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::AlreadyValidated);
-                    return Ok(DeliveryResultKind::Delivered);
+            Ok(Err(err)) => match classify_delivery_revert(&err) {
+                Some(revert) => {
+                    if let Stage::Done(kind) =
+                        settle_pre_send_revert(route, job, metrics, "estimate", revert, &err)
+                    {
+                        return Ok(kind);
+                    }
                 }
-                if is_revert(&err.to_string()) {
-                    metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::Reverted);
+                None => {
                     warn!(
                         chain_key = route.chain_key,
                         message_id = %job.message_id,
                         %err,
-                        "estimate(deliverMessage) reverted; treating as terminal"
+                        "could not estimate delivery gas to verify funding (transport); retrying \
+                         rather than risking an out-of-gas send on a possibly under-funded message"
                     );
-                    return Ok(DeliveryResultKind::Terminal);
+                    return Ok(DeliveryResultKind::Retryable);
                 }
-                warn!(
-                    chain_key = route.chain_key,
-                    message_id = %job.message_id,
-                    %err,
-                    "could not estimate delivery gas to verify funding (transport); retrying \
-                     rather than risking an out-of-gas send on a possibly under-funded message"
-                );
-                return Ok(DeliveryResultKind::Retryable);
-            }
+            },
             Err(_elapsed) => {
                 warn!(
                     chain_key = route.chain_key,
@@ -581,6 +1137,11 @@ async fn handle_job<P: Provider + Clone + 'static>(
 
     let mut backoff = INITIAL_BACKOFF;
     let mut attempts = 0u32;
+    // Gas the send is pinned to: the funded gasLimit when known (so the fee is claimable), else
+    // the node's estimate. Raised in 25% steps — up to `route.max_gas_limit` — when an attempt
+    // reverts `InsufficientGasForDestination` (#36: the destination failed AND the tx gas was too
+    // low to prove the attested gasLimit was forwarded, so the failure may be ours to fix).
+    let mut gas_limit: Option<u64> = funding.gas;
     let outcome = loop {
         attempts += 1;
         let mut tx = inbox
@@ -592,7 +1153,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
                 Bytes::from(job.votes_calldata.clone()),
             )
             .value(native_value);
-        if let Some(gas) = funding.gas {
+        if let Some(gas) = gas_limit {
             tx = tx.gas(gas);
         }
         // `send()` is several RPC round trips (gas, fee, nonce, `eth_sendRawTransaction`) and alloy's
@@ -636,24 +1197,77 @@ async fn handle_job<P: Provider + Clone + 'static>(
                 {
                     Ok(Ok(receipt)) => {
                         if receipt.status() {
-                            // `deliverMessage` succeeds even when the dApp callback reverts — the
-                            // inbox stores the message and emits `MessagePending` instead of
-                            // `MessageDelivered`. Detect that from the receipt logs; it is NOT a
-                            // revert (see SimpleInbox.deliverMessage's try/catch).
-                            let left_pending = receipt.inner.logs().iter().any(|l| {
-                                l.address() == route.inbox_address
-                                    && l.topics().first()
-                                        == Some(&IInbox::MessagePending::SIGNATURE_HASH)
-                            });
-                            if left_pending {
-                                break SendOutcome::Pending;
-                            }
-                            break SendOutcome::Succeeded;
+                            // `deliverMessage` succeeds even when the destination does not
+                            // execute: the Inbox emits `MessagePending` (deferred/queued — stored
+                            // for `retryPendingMessage`) or, since #36, `MessageExecutionFailed`
+                            // alongside `MessageDelivered` (destination call failed, message
+                            // consumed). Both are detected from the receipt logs, not a revert.
+                            break match classify_success_logs(
+                                route.inbox_address,
+                                receipt.inner.logs(),
+                            ) {
+                                ReceiptClass::Delivered => SendOutcome::Succeeded,
+                                ReceiptClass::Pending => SendOutcome::Pending,
+                                ReceiptClass::DestinationFailed { dispatcher } => {
+                                    SendOutcome::DestinationFailed { dispatcher }
+                                }
+                            };
                         }
-                        // Receipt with `status = false` means the tx mined but reverted. For PoC
-                        // we don't decode the revert reason from the receipt — we surface it via
-                        // metrics and stop retrying (the next message will get its own attempt).
-                        break SendOutcome::Reverted("tx mined but reverted".into());
+                        // Mined but reverted. Replay the exact call at that block to learn why: an
+                        // `InsufficientGasForDestination` is ours to fix by resending with more gas;
+                        // a duplicate means another relayer's tx landed in the same block (success);
+                        // anything else is a deterministic revert and terminal.
+                        let (class, reason) = replay_revert_reason(
+                            &inbox,
+                            job,
+                            native_value,
+                            gas_limit,
+                            receipt.block_number,
+                        )
+                        .await
+                        .unwrap_or_else(|| (None, "tx mined but reverted".into()));
+                        match class {
+                            Some(DeliveryRevert::Duplicate) => break SendOutcome::AlreadyValidated,
+                            Some(DeliveryRevert::InsufficientGasForDestination)
+                                if attempts <= delivery_config.max_retries =>
+                            {
+                                match bumped_gas_limit(gas_limit, envelope_gas, route.max_gas_limit)
+                                {
+                                    Some(next) => {
+                                        warn!(
+                                            chain_key = route.chain_key,
+                                            message_id = %job.message_id,
+                                            attempts,
+                                            tx = %receipt.transaction_hash,
+                                            previous_gas = ?gas_limit,
+                                            next_gas = next,
+                                            cap = route.max_gas_limit,
+                                            funded = ?funding.gas,
+                                            "delivery reverted InsufficientGasForDestination; \
+                                             retrying with more gas (above the funded gasLimit the \
+                                             fee may be unclaimable)"
+                                        );
+                                        gas_limit = Some(next);
+                                    }
+                                    None => {
+                                        break SendOutcome::Reverted {
+                                            revert: class,
+                                            reason: format!(
+                                                "InsufficientGasForDestination at the route's \
+                                                 max_gas_limit ({}): {reason}",
+                                                route.max_gas_limit
+                                            ),
+                                        };
+                                    }
+                                }
+                            }
+                            _ => {
+                                break SendOutcome::Reverted {
+                                    revert: class,
+                                    reason,
+                                }
+                            }
+                        }
                     }
                     Ok(Err(err)) if attempts <= delivery_config.max_retries => {
                         warn!(
@@ -675,26 +1289,58 @@ async fn handle_job<P: Provider + Clone + 'static>(
                     }
                 }
             }
-            Err(err) if revert_duplicate_delivery(&err) => {
+            Err(err) => match classify_delivery_revert(&err) {
                 // Lost the race to another relayer (PoC §6.5). Treat as success.
-                break SendOutcome::AlreadyValidated;
-            }
-            Err(err) if is_revert(&err.to_string()) => {
+                Some(DeliveryRevert::Duplicate) => break SendOutcome::AlreadyValidated,
+                // Surfaced at the node's gas estimation (nothing pinned): resend pinned higher.
+                Some(DeliveryRevert::InsufficientGasForDestination)
+                    if attempts <= delivery_config.max_retries =>
+                {
+                    match bumped_gas_limit(gas_limit, envelope_gas, route.max_gas_limit) {
+                        Some(next) => {
+                            warn!(
+                                chain_key = route.chain_key,
+                                message_id = %job.message_id,
+                                attempts,
+                                previous_gas = ?gas_limit,
+                                next_gas = next,
+                                cap = route.max_gas_limit,
+                                "send reverted InsufficientGasForDestination; retrying with more gas"
+                            );
+                            gas_limit = Some(next);
+                        }
+                        None => {
+                            break SendOutcome::Reverted {
+                                revert: Some(DeliveryRevert::InsufficientGasForDestination),
+                                reason: format!(
+                                    "InsufficientGasForDestination at the route's max_gas_limit ({}): {err}",
+                                    route.max_gas_limit
+                                ),
+                            };
+                        }
+                    }
+                }
                 // Deterministic contract revert at send / gas-estimation time — retrying would
-                // revert identically, so don't burn the retry budget on it.
-                break SendOutcome::Reverted(err.to_string());
-            }
-            Err(err) if attempts <= delivery_config.max_retries => {
-                warn!(
-                    chain_key = route.chain_key,
-                    message_id = %job.message_id,
-                    attempts,
-                    backoff_ms = backoff.as_millis() as u64,
-                    %err,
-                    "send failed; retrying"
-                );
-            }
-            Err(err) => break SendOutcome::Failed(err.to_string()),
+                // revert identically, so don't burn the retry budget on it. The class travels with
+                // the outcome so the #36 errors get their own metric label, not `Reverted`.
+                Some(revert) => {
+                    break SendOutcome::Reverted {
+                        revert: Some(revert),
+                        reason: revert_summary(revert, &err),
+                    }
+                }
+                None if attempts <= delivery_config.max_retries => {
+                    warn!(
+                        chain_key = route.chain_key,
+                        message_id = %job.message_id,
+                        attempts,
+                        backoff_ms = backoff.as_millis() as u64,
+                        %err,
+                        "send failed; retrying"
+                    );
+                }
+                None => break SendOutcome::Failed(err.to_string()),
+            },
         }
 
         tokio::time::sleep(backoff).await;
@@ -714,6 +1360,24 @@ async fn handle_job<P: Provider + Clone + 'static>(
             );
             Ok(DeliveryResultKind::Delivered)
         }
+        SendOutcome::DestinationFailed { dispatcher } => {
+            // Delivered and consumed (processedAt set) — the relayer is paid on claim — but the
+            // destination call failed for good. Nothing to retry: `retryPendingMessage` reverts
+            // `MessageNotPending`. Surfaced distinctly so a misbehaving destination dApp shows up
+            // as its own series instead of inflating `Succeeded`.
+            metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::DestinationFailed);
+            metrics.observe_time_to_deliver(started.elapsed());
+            warn!(
+                chain_key = route.chain_key,
+                message_id = %job.message_id,
+                %dispatcher,
+                signer_count = job.signer_count,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "⚠️ message delivered but the destination call FAILED (MessageExecutionFailed) — \
+                 consumed on-chain, no retry possible; delivery still counts for the fee claim"
+            );
+            Ok(DeliveryResultKind::Delivered)
+        }
         SendOutcome::AlreadyValidated => {
             metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::AlreadyValidated);
             info!(
@@ -728,7 +1392,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
             warn!(
                 chain_key = route.chain_key,
                 message_id = %job.message_id,
-                "⚠️ votes validated but the dApp callback reverted — message left pending; \
+                "⚠️ votes validated but the dispatcher deferred/queued the message — left pending; \
                  scheduling bounded retryPendingMessage attempts"
             );
             // The votes are consumed on-chain (`validatedMessages[messageId] = true`), so from the
@@ -744,11 +1408,12 @@ async fn handle_job<P: Provider + Clone + 'static>(
             );
             Ok(DeliveryResultKind::Delivered)
         }
-        SendOutcome::Reverted(reason) => {
-            metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::Reverted);
+        SendOutcome::Reverted { revert, reason } => {
+            metrics.inc_deliver_tx(route.chain_key, revert_status(revert));
             error!(
                 chain_key = route.chain_key,
                 message_id = %job.message_id,
+                revert = ?revert,
                 %reason,
                 "❌ delivery reverted; no further retries"
             );
@@ -767,47 +1432,105 @@ async fn handle_job<P: Provider + Clone + 'static>(
     }
 }
 
+/// The `relayer_deliver_tx` label for a terminal revert, whichever stage surfaced it (simulate,
+/// estimate, send, or the mined-revert replay). The #36 hard failures get their own series;
+/// everything else is the generic `Reverted`. Single source of truth so the send-time path cannot
+/// drift from the pre-send one (Bugbot, PR #63).
+fn revert_status(revert: Option<DeliveryRevert>) -> DeliveryStatus {
+    match revert {
+        Some(DeliveryRevert::ValidationFailedWithNativeValue) => {
+            DeliveryStatus::ValidationFailedWithNativeValue
+        }
+        Some(DeliveryRevert::InvalidMessageDispatcher) => DeliveryStatus::InvalidDispatcher,
+        Some(DeliveryRevert::Duplicate) => DeliveryStatus::AlreadyValidated,
+        Some(DeliveryRevert::InsufficientGasForDestination | DeliveryRevert::Other) | None => {
+            DeliveryStatus::Reverted
+        }
+    }
+}
+
+/// Human-readable reason for a terminal send-time revert, naming the #36 errors that would
+/// otherwise only show as a selector on Creditcoin-style nodes.
+fn revert_summary(revert: DeliveryRevert, err: &alloy::contract::Error) -> String {
+    match revert {
+        DeliveryRevert::ValidationFailedWithNativeValue => {
+            format!("ValidationFailedWithNativeValue (votes invalid, value attached): {err}")
+        }
+        DeliveryRevert::InvalidMessageDispatcher => {
+            format!("InvalidMessageDispatcher (Inbox dispatcher has no code): {err}")
+        }
+        DeliveryRevert::InsufficientGasForDestination => {
+            format!("InsufficientGasForDestination (retry budget exhausted): {err}")
+        }
+        DeliveryRevert::Duplicate | DeliveryRevert::Other => err.to_string(),
+    }
+}
+
+/// Replay a mined-but-reverted `deliverMessage` as an `eth_call` at the block it mined in, with the
+/// same `msg.value` and gas, to recover the revert reason the receipt does not carry. Returns the
+/// classification made from the *structured* error (selector from `as_revert_data()` first, the
+/// string dialects second — geth-style nodes put the selector only in the JSON-RPC error `data`,
+/// which a plain `to_string()` does not reliably carry; Bugbot, PR #63) plus the printable reason.
+/// Best-effort and bounded: `None` when the replay succeeds (state moved on) or cannot be made in
+/// time — the caller then falls back to a generic terminal revert, which is what it did before
+/// this existed.
+async fn replay_revert_reason<P: Provider>(
+    inbox: &IInbox::IInboxInstance<P>,
+    job: &DeliveryJob,
+    native_value: U256,
+    gas_limit: Option<u64>,
+    block_number: Option<u64>,
+) -> Option<(Option<DeliveryRevert>, String)> {
+    let mut call = inbox
+        .deliverMessage(
+            job.message_id,
+            job.outbox,
+            job.emitter,
+            Bytes::from(job.payload.clone()),
+            Bytes::from(job.votes_calldata.clone()),
+        )
+        .value(native_value);
+    if let Some(gas) = gas_limit {
+        call = call.gas(gas);
+    }
+    if let Some(n) = block_number {
+        call = call.block(BlockId::number(n));
+    }
+    match tokio::time::timeout(FUNDED_GAS_READ_TIMEOUT, call.call()).await {
+        Ok(Err(err)) => Some((classify_delivery_revert(&err), err.to_string())),
+        Ok(Ok(_)) => None,
+        Err(_elapsed) => None,
+    }
+}
+
 #[derive(Debug)]
 enum SendOutcome {
     Succeeded,
     AlreadyValidated,
-    /// Tx succeeded but the receipt carries `MessagePending` — the dApp callback reverted and the
-    /// message is stored for `retryPendingMessage`.
+    /// Tx succeeded but the receipt carries `MessagePending` — the dispatcher deferred/queued the
+    /// message and it is stored for `retryPendingMessage`.
     Pending,
-    /// Deterministic revert (mined-and-reverted, or revert at send/estimation time).
-    Reverted(String),
+    /// Tx succeeded and the receipt carries `MessageExecutionFailed` (#36): the destination call
+    /// failed, the message is consumed, no retry is possible.
+    DestinationFailed {
+        dispatcher: Address,
+    },
+    /// Deterministic revert (mined-and-reverted, or revert at send/estimation time). `revert` is
+    /// the classification when one was possible; it selects the metric label.
+    Reverted {
+        revert: Option<DeliveryRevert>,
+        reason: String,
+    },
     /// Transient infrastructure failure — returned to the pool's bounded retry.
     Failed(String),
-}
-
-/// Whether a `deliverMessage` error means the inbox already accepted this message (idempotent
-/// success — we lost the race to another relayer, or a previous stuck attempt mined).
-///
-/// Whether a delivery revert means the message was already delivered, so retrying is pointless and
-/// the outcome is an idempotent success. Two guards can say so, and both must be matched:
-///
-///  * the **Inbox** duplicate guard — `MessageAlreadyValidated` on current inboxes, or the deployed
-///    `SimpleInbox`'s `require(..., "Already validated")` string revert;
-///  * the **receiver** duplicate guard — `MessageReceiverBase.MessageAlreadyProcessed`, which fires
-///    when the callback already ran for this messageId. A restart replaying the checkpoint hit this
-///    on usc-devnet (2026-09-01): the delivery was long since processed, but because only the Inbox
-///    guard was matched here it logged a terminal ERROR and counted as `Reverted`.
-///
-/// Each is matched three ways because node dialects differ: the revert *string*, the decoded
-/// custom-error *name*, and the raw 4-byte *selector* (see [`crate::revert`]).
-fn revert_duplicate_delivery(err: &impl std::fmt::Display) -> bool {
-    let s = err.to_string();
-    s.contains("Already validated")
-        || s.contains("MessageAlreadyValidated")
-        || has_selector(&s, IInbox::MessageAlreadyValidated::SELECTOR)
-        || s.contains("MessageAlreadyProcessed")
-        || has_selector(&s, IMessageReceiver::MessageAlreadyProcessed::SELECTOR)
 }
 
 /// Bounded, detached best-effort `retryPendingMessage` attempts. Detached because it must not
 /// block the route's serial delivery worker; bounded ([`PENDING_RETRY_DELAYS`]) because the call
 /// is permissionless — anyone (including a future relayer restart) can retry a message that is
-/// still pending, so giving up here strands nothing.
+/// still pending, so giving up here strands nothing. A `RetryDeferred(retryAfter)` revert (#36)
+/// moves the next attempt to `retryAfter` instead of the fixed backoff (still counted against the
+/// same bounded budget).
 fn spawn_pending_retry<P: Provider + 'static>(
     provider: P,
     signer_address: Address,
@@ -818,8 +1541,16 @@ fn spawn_pending_retry<P: Provider + 'static>(
 ) {
     tokio::spawn(async move {
         let inbox = IInbox::new(inbox_address, &provider);
-        for (attempt, delay) in PENDING_RETRY_DELAYS.iter().enumerate() {
-            tokio::time::sleep(*delay).await;
+        // `retryAfter` from the previous attempt's `RetryDeferred`, if any.
+        let mut retry_after: Option<u64> = None;
+        for attempt in 0..PENDING_RETRY_DELAYS.len() {
+            let delay = pending_retry_delay(attempt, retry_after, now_unix());
+            if let Some(ts) = retry_after {
+                info!(chain_key, %message_id, attempt, retry_after = ts, delay_secs = delay.as_secs(),
+                    "⏳ retryPendingMessage deferred by the dispatcher; waiting for retryAfter");
+            }
+            retry_after = None;
+            tokio::time::sleep(delay).await;
             // Someone (a dApp user, another relayer) may have completed the retry meanwhile.
             match inbox.isPending(message_id).call().await {
                 Ok(ret) if !ret => {
@@ -857,7 +1588,17 @@ fn spawn_pending_retry<P: Provider + 'static>(
                     .await
                     {
                         Ok(Ok(receipt)) if receipt.status() => {
-                            info!(chain_key, %message_id, "♻️ retryPendingMessage succeeded");
+                            // Executed — or (#36) consumed as a destination failure: either way
+                            // the message is no longer pending.
+                            match classify_success_logs(inbox_address, receipt.inner.logs()) {
+                                ReceiptClass::DestinationFailed { dispatcher } => {
+                                    warn!(chain_key, %message_id, %dispatcher,
+                                        "♻️ retryPendingMessage consumed the message but the destination call FAILED (MessageExecutionFailed)");
+                                }
+                                _ => {
+                                    info!(chain_key, %message_id, "♻️ retryPendingMessage succeeded")
+                                }
+                            }
                             return;
                         }
                         Ok(Ok(_)) => {
@@ -872,7 +1613,18 @@ fn spawn_pending_retry<P: Provider + 'static>(
                     }
                 }
                 Err(err) => {
-                    warn!(chain_key, %message_id, attempt, %err, "retryPendingMessage send failed");
+                    // The node's gas estimation reverted before anything was broadcast. A
+                    // `RetryDeferred` carries the dispatcher's next-available hint: honour it.
+                    match decode_retry_deferred(&err) {
+                        Some(ts) => {
+                            retry_after = Some(ts);
+                            debug!(chain_key, %message_id, attempt, retry_after = ts, %err,
+                                "retryPendingMessage reverted RetryDeferred");
+                        }
+                        None => {
+                            warn!(chain_key, %message_id, attempt, %err, "retryPendingMessage send failed");
+                        }
+                    }
                 }
             }
         }
@@ -888,28 +1640,27 @@ fn spawn_pending_retry<P: Provider + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::LogData;
+
+    fn envelope(native_value: u64, gas_limit: u64) -> Vec<u8> {
+        (
+            Address::repeat_byte(0x11),
+            U256::from(native_value),
+            U256::from(gas_limit),
+            Bytes::from(vec![0xde, 0xad]),
+        )
+            .abi_encode_params()
+    }
 
     /// A four-field envelope `abi.encode(destination, nativeCoinValue, gasLimit, payloadData)` yields
     /// its second word; anything else (legacy raw payloads, truncated bytes) yields zero so the
     /// delivery goes out with `msg.value == 0`, which is what every pre-envelope Inbox expects.
     #[test]
     fn envelope_native_value_reads_the_second_word_or_zero() {
-        let envelope = (
-            Address::repeat_byte(0x11),
-            U256::from(1_500u64),
-            U256::from(300_000u64),
-            Bytes::from(vec![0xde, 0xad]),
-        )
-            .abi_encode_params();
+        let envelope = envelope(1_500, 300_000);
         assert_eq!(envelope_native_value(&envelope), U256::from(1_500u64));
 
-        let zero_value = (
-            Address::repeat_byte(0x11),
-            U256::ZERO,
-            U256::from(300_000u64),
-            Bytes::from(vec![0xde, 0xad]),
-        )
-            .abi_encode_params();
+        let zero_value = self::envelope(0, 300_000);
         assert_eq!(envelope_native_value(&zero_value), U256::ZERO);
 
         assert_eq!(envelope_native_value(b"not an envelope"), U256::ZERO);
@@ -920,10 +1671,478 @@ mod tests {
         assert_eq!(envelope_native_value(&envelope[..64]), U256::ZERO);
     }
 
-    /// Until the cap policy is decided the relayer fronts nothing: the constant is the whole policy.
+    /// The third word is the attested destination gasLimit; a non-envelope has none (so the cap
+    /// cannot refuse legacy payloads by mistake).
     #[test]
-    fn native_value_cap_is_zero_until_policy_lands() {
-        assert_eq!(MAX_NATIVE_COIN_VALUE_WEI, U256::ZERO);
+    fn envelope_terms_read_gas_limit_or_nothing() {
+        let terms = envelope_terms(&envelope(7, 4_999_999));
+        assert_eq!(terms.native_value, U256::from(7u64));
+        assert_eq!(terms.gas_limit, Some(U256::from(4_999_999u64)));
+        assert_eq!(envelope_terms(b"raw").gas_limit, None);
+        assert_eq!(envelope_terms(&[]), EnvelopeTerms::default());
+    }
+
+    /// The route-level cap replaces the old hard-coded constant; its default is still zero, so a
+    /// route that never set it fronts nothing (the constant is now the whole default policy).
+    #[test]
+    fn native_value_cap_defaults_to_zero() {
+        assert_eq!(crate::config::DEFAULT_MAX_NATIVE_COIN_VALUE_WEI, U256::ZERO);
+        // What handle_job compares: an envelope with any value is over a zero cap; a zero-value
+        // envelope and a non-envelope are not.
+        let cap = crate::config::DEFAULT_MAX_NATIVE_COIN_VALUE_WEI;
+        assert!(envelope_native_value(&envelope(1, 100_000)) > cap);
+        assert!(envelope_native_value(&envelope(0, 100_000)) <= cap);
+        assert!(envelope_native_value(b"raw") <= cap);
+    }
+
+    /// The gas cap refuses exactly what exceeds it, and nothing the router itself would accept
+    /// below it. Compared as U256 so a 2^64+ attested gasLimit cannot wrap into an acceptable value.
+    #[test]
+    fn gas_limit_cap_refuses_only_oversized_envelopes() {
+        let cap = crate::config::DEFAULT_MAX_GAS_LIMIT;
+        let over = |payload: &[u8]| {
+            envelope_terms(payload)
+                .gas_limit
+                .is_some_and(|g| g > U256::from(cap))
+        };
+        assert!(!over(&envelope(0, cap)));
+        assert!(!over(&envelope(0, cap - 1)));
+        assert!(over(&envelope(0, cap + 1)));
+        assert!(!over(b"legacy payload"));
+        // A gasLimit word above u64: still refused, never silently truncated.
+        let huge = (
+            Address::repeat_byte(0x11),
+            U256::ZERO,
+            U256::from(u64::MAX) + U256::from(1u64),
+            Bytes::from(vec![0xde]),
+        )
+            .abi_encode_params();
+        assert!(over(&huge));
+    }
+
+    fn inbox_log(inbox: Address, topics: Vec<B256>) -> Log {
+        Log {
+            inner: alloy::primitives::Log {
+                address: inbox,
+                data: LogData::new_unchecked(topics, Bytes::new()),
+            },
+            ..Default::default()
+        }
+    }
+
+    fn addr_topic(a: Address) -> B256 {
+        B256::left_padding_from(a.as_slice())
+    }
+
+    /// Receipt fixtures for the three successful-tx shapes the Inbox can produce. #36's
+    /// `MessageExecutionFailed` arrives *with* `MessageDelivered`, so it must win over the plain
+    /// success arm, and it must carry the dispatcher out of topics[2].
+    #[test]
+    fn success_receipt_logs_classify_delivered_pending_and_destination_failed() {
+        let inbox = Address::repeat_byte(0xaa);
+        let other = Address::repeat_byte(0xbb);
+        let dispatcher = Address::repeat_byte(0xdd);
+        let relayer = Address::repeat_byte(0xee);
+        let id = B256::repeat_byte(0x01);
+
+        let delivered = inbox_log(
+            inbox,
+            vec![
+                IInbox::MessageDelivered::SIGNATURE_HASH,
+                id,
+                addr_topic(other),
+                addr_topic(relayer),
+            ],
+        );
+        let failed = inbox_log(
+            inbox,
+            vec![
+                IInbox::MessageExecutionFailed::SIGNATURE_HASH,
+                id,
+                addr_topic(dispatcher),
+                addr_topic(relayer),
+            ],
+        );
+        let pending = inbox_log(
+            inbox,
+            vec![
+                IInbox::MessagePending::SIGNATURE_HASH,
+                id,
+                addr_topic(dispatcher),
+                addr_topic(relayer),
+            ],
+        );
+        // The same topic0 from a different contract (a dApp re-emitting) must not count.
+        let foreign_failed = inbox_log(
+            other,
+            vec![
+                IInbox::MessageExecutionFailed::SIGNATURE_HASH,
+                id,
+                addr_topic(dispatcher),
+                addr_topic(relayer),
+            ],
+        );
+
+        assert_eq!(
+            classify_success_logs(inbox, [&delivered]),
+            ReceiptClass::Delivered
+        );
+        assert_eq!(
+            classify_success_logs(inbox, [&failed, &delivered]),
+            ReceiptClass::DestinationFailed { dispatcher }
+        );
+        // Order-independent.
+        assert_eq!(
+            classify_success_logs(inbox, [&delivered, &failed]),
+            ReceiptClass::DestinationFailed { dispatcher }
+        );
+        assert_eq!(
+            classify_success_logs(inbox, [&pending]),
+            ReceiptClass::Pending
+        );
+        assert_eq!(
+            classify_success_logs(inbox, [&foreign_failed, &delivered]),
+            ReceiptClass::Delivered
+        );
+        assert_eq!(
+            classify_success_logs(inbox, std::iter::empty()),
+            ReceiptClass::Delivered
+        );
+    }
+
+    /// The topic0 values the classifier keys on are the compiled contract's (pinned by the
+    /// abi_surface gate); this pins the Rust side so a mirror edit cannot move them unnoticed.
+    #[test]
+    fn message_execution_failed_topic0_is_the_36_signature() {
+        assert_eq!(
+            IInbox::MessageExecutionFailed::SIGNATURE,
+            "MessageExecutionFailed(bytes32,address,address)"
+        );
+        assert_ne!(
+            IInbox::MessageExecutionFailed::SIGNATURE_HASH,
+            IInbox::MessageDelivered::SIGNATURE_HASH
+        );
+    }
+
+    fn cc_style(data: &[u8]) -> String {
+        format!(
+            "server returned an error response: error code -32603: VM Exception while processing \
+             transaction: revert, data: \"0x{}\"",
+            alloy::hex::encode(data)
+        )
+    }
+
+    /// Each #36 revert is recognised from raw selector data (Creditcoin-style node), from a decoded
+    /// name (name-decoding node), and is kept apart from the generic revert and transport arms.
+    #[test]
+    fn delivery_reverts_classify_by_selector_and_by_name() {
+        let id = B256::repeat_byte(0x02);
+        let vf = IInbox::ValidationFailedWithNativeValue {
+            messageId: id,
+            value: U256::from(5u64),
+        }
+        .abi_encode();
+        assert_eq!(
+            classify_revert_str(&cc_style(&vf), None),
+            Some(DeliveryRevert::ValidationFailedWithNativeValue)
+        );
+        assert_eq!(
+            classify_revert_str("reverted: ValidationFailedWithNativeValue", None),
+            Some(DeliveryRevert::ValidationFailedWithNativeValue)
+        );
+
+        let imd = IInbox::InvalidMessageDispatcher {
+            dispatcher: Address::repeat_byte(0xdd),
+        }
+        .abi_encode();
+        assert_eq!(
+            classify_revert_str(&cc_style(&imd), None),
+            Some(DeliveryRevert::InvalidMessageDispatcher)
+        );
+
+        let igd = IMessageDispatcher::InsufficientGasForDestination {}.abi_encode();
+        assert_eq!(
+            classify_revert_str(&cc_style(&igd), None),
+            Some(DeliveryRevert::InsufficientGasForDestination)
+        );
+        // Structured revert data takes precedence over (an absent) string field.
+        assert_eq!(
+            classify_revert_str(
+                "execution reverted",
+                Some(IMessageDispatcher::InsufficientGasForDestination::SELECTOR)
+            ),
+            Some(DeliveryRevert::InsufficientGasForDestination)
+        );
+
+        let dup = IInbox::MessageAlreadyValidated { messageId: id }.abi_encode();
+        assert_eq!(
+            classify_revert_str(&cc_style(&dup), None),
+            Some(DeliveryRevert::Duplicate)
+        );
+        assert_eq!(
+            classify_revert_str("execution reverted: Already validated", None),
+            Some(DeliveryRevert::Duplicate)
+        );
+
+        assert_eq!(
+            classify_revert_str("execution reverted: VotesBelowThreshold", None),
+            Some(DeliveryRevert::Other)
+        );
+        // Unknown selector, no phrasing: still a revert (data present), so Other — not a retry.
+        assert_eq!(
+            classify_revert_str(&cc_style(&[0x12, 0x34, 0x56, 0x78]), None),
+            Some(DeliveryRevert::Other)
+        );
+        assert_eq!(classify_revert_str("connection refused", None), None);
+        assert_eq!(
+            classify_revert_str("error code -32000: insufficient funds for gas", None),
+            None
+        );
+    }
+
+    /// Build the error alloy hands back for a geth-style JSON-RPC revert: the selector lives only
+    /// in the structured `data` field of the error payload.
+    fn structured_revert(message: &str, data: &[u8]) -> alloy::contract::Error {
+        // Deserialized rather than named: `ErrorPayload` lives in alloy-json-rpc, which the
+        // umbrella crate only re-exports behind a feature this workspace does not enable.
+        let payload = serde_json::from_value(serde_json::json!({
+            "code": 3,
+            "message": message,
+            "data": format!("0x{}", alloy::hex::encode(data)),
+        }))
+        .unwrap();
+        alloy::contract::Error::TransportError(alloy::transports::RpcError::ErrorResp(payload))
+    }
+
+    /// The mined-revert replay (and every send-time revert) must classify from the structured
+    /// revert data, not only from the stringified error — geth-style nodes carry the selector in
+    /// the JSON-RPC `data` field. A funded delivery pins gas and skips the estimate, so this
+    /// replay is the only place it can learn `InsufficientGasForDestination` and bump gas.
+    #[test]
+    fn structured_revert_data_classifies_without_string_dialects() {
+        let igd = IMessageDispatcher::InsufficientGasForDestination {}.abi_encode();
+        let err = structured_revert("execution reverted", &igd);
+        assert!(
+            err.as_revert_data().is_some(),
+            "fixture must carry structured revert data: {err}"
+        );
+        assert_eq!(
+            classify_delivery_revert(&err),
+            Some(DeliveryRevert::InsufficientGasForDestination)
+        );
+
+        let vf = IInbox::ValidationFailedWithNativeValue {
+            messageId: B256::repeat_byte(0x04),
+            value: U256::from(1u64),
+        }
+        .abi_encode();
+        assert_eq!(
+            classify_delivery_revert(&structured_revert("execution reverted", &vf)),
+            Some(DeliveryRevert::ValidationFailedWithNativeValue)
+        );
+        let imd = IInbox::InvalidMessageDispatcher {
+            dispatcher: Address::repeat_byte(0xdd),
+        }
+        .abi_encode();
+        assert_eq!(
+            classify_delivery_revert(&structured_revert("execution reverted", &imd)),
+            Some(DeliveryRevert::InvalidMessageDispatcher)
+        );
+        // Structured RetryDeferred decodes retryAfter the same way.
+        let deferred = IInbox::RetryDeferred {
+            messageId: B256::repeat_byte(0x05),
+            retryAfter: 1_800_000_777,
+        }
+        .abi_encode();
+        assert_eq!(
+            decode_retry_deferred(&structured_revert("execution reverted", &deferred)),
+            Some(1_800_000_777)
+        );
+    }
+
+    /// Every stage that ends in a terminal revert maps the classification to the same label: the
+    /// #36 hard failures get their own series whether they surfaced at simulate, send, or in the
+    /// mined-revert replay; everything else is the generic `Reverted`.
+    #[test]
+    fn revert_status_gives_36_errors_their_own_labels_at_every_stage() {
+        assert_eq!(
+            revert_status(Some(DeliveryRevert::ValidationFailedWithNativeValue)),
+            DeliveryStatus::ValidationFailedWithNativeValue
+        );
+        assert_eq!(
+            revert_status(Some(DeliveryRevert::InvalidMessageDispatcher)),
+            DeliveryStatus::InvalidDispatcher
+        );
+        assert_eq!(
+            revert_status(Some(DeliveryRevert::Duplicate)),
+            DeliveryStatus::AlreadyValidated
+        );
+        assert_eq!(
+            revert_status(Some(DeliveryRevert::InsufficientGasForDestination)),
+            DeliveryStatus::Reverted
+        );
+        assert_eq!(
+            revert_status(Some(DeliveryRevert::Other)),
+            DeliveryStatus::Reverted
+        );
+        assert_eq!(revert_status(None), DeliveryStatus::Reverted);
+    }
+
+    /// The top-up signal is idempotent on success but NOT on failure: a send that never completed
+    /// must be retryable on the next under-funded refusal (bounded), and an in-flight one must not
+    /// be doubled.
+    #[test]
+    fn top_up_ledger_retries_failed_sends_but_not_settled_or_in_flight_ones() {
+        let id = B256::repeat_byte(0x06);
+        let other = B256::repeat_byte(0x07);
+        let mut ledger = TopUpLedger::default();
+
+        // First request goes out; a second while in flight does not.
+        assert_eq!(ledger.begin(id), Ok(1));
+        assert_eq!(ledger.begin(id), Err("a request is already in flight"));
+        // Independent messages do not interfere.
+        assert_eq!(ledger.begin(other), Ok(1));
+
+        // A failed send frees the slot for a retry, counting attempts.
+        ledger.fail(id);
+        assert_eq!(ledger.begin(id), Ok(2));
+        ledger.fail(id);
+        assert_eq!(ledger.begin(id), Ok(3));
+        ledger.fail(id);
+        // Budget spent: bounded, never a hot loop.
+        assert_eq!(MAX_TOP_UP_ATTEMPTS, 3);
+        assert_eq!(ledger.begin(id), Err("attempts exhausted"));
+
+        // A landed (or deterministically rejected) request settles the message for good…
+        ledger.settle(other);
+        assert_eq!(ledger.begin(other), Err("already requested"));
+        // …and a late failure report cannot un-settle it.
+        ledger.fail(other);
+        assert_eq!(ledger.begin(other), Err("already requested"));
+
+        // A failure reported for an id the ledger never saw is recorded, not panicked on.
+        let stray = B256::repeat_byte(0x08);
+        ledger.fail(stray);
+        assert_eq!(ledger.begin(stray), Ok(2));
+    }
+
+    /// `retryAfter` comes out of the RetryDeferred revert payload; a different error, a truncated
+    /// payload, or no payload yields nothing (→ fixed backoff).
+    #[test]
+    fn retry_deferred_decodes_retry_after_from_revert_data() {
+        let id = B256::repeat_byte(0x03);
+        let deferred = IInbox::RetryDeferred {
+            messageId: id,
+            retryAfter: 1_800_000_123,
+        }
+        .abi_encode();
+        assert_eq!(
+            decode_retry_deferred_str(&cc_style(&deferred)),
+            Some(1_800_000_123)
+        );
+        // Unknown hint: the contract encodes 0 — decodes as Some(0), which the scheduler treats
+        // as "no hint".
+        let unknown = IInbox::RetryDeferred {
+            messageId: id,
+            retryAfter: 0,
+        }
+        .abi_encode();
+        assert_eq!(decode_retry_deferred_str(&cc_style(&unknown)), Some(0));
+        // Wrong error, truncated payload, no payload.
+        let other = IInbox::MessageAlreadyValidated { messageId: id }.abi_encode();
+        assert_eq!(decode_retry_deferred_str(&cc_style(&other)), None);
+        assert_eq!(
+            decode_retry_deferred_str(&cc_style(&deferred[..deferred.len() - 8])),
+            None
+        );
+        assert_eq!(decode_retry_deferred_str("connection refused"), None);
+    }
+
+    /// A usable hint replaces the fixed delay (plus margin); 0, past, missing-clock and absent
+    /// hints fall back to the fixed schedule; a far-future hint is capped.
+    #[test]
+    fn pending_retry_delay_honours_retry_after_within_bounds() {
+        let now = 1_800_000_000u64;
+        assert_eq!(
+            pending_retry_delay(0, None, Some(now)),
+            PENDING_RETRY_DELAYS[0]
+        );
+        assert_eq!(
+            pending_retry_delay(1, None, Some(now)),
+            PENDING_RETRY_DELAYS[1]
+        );
+        assert_eq!(
+            pending_retry_delay(2, None, Some(now)),
+            PENDING_RETRY_DELAYS[2]
+        );
+        // Past the table: sticks to the last delay rather than panicking.
+        assert_eq!(
+            pending_retry_delay(9, None, Some(now)),
+            PENDING_RETRY_DELAYS[2]
+        );
+
+        assert_eq!(
+            pending_retry_delay(0, Some(now + 90), Some(now)),
+            Duration::from_secs(90) + RETRY_DEFERRED_MARGIN
+        );
+        // 0 = "no schedule exposed"; a past timestamp = the window already opened.
+        assert_eq!(
+            pending_retry_delay(1, Some(0), Some(now)),
+            PENDING_RETRY_DELAYS[1]
+        );
+        assert_eq!(
+            pending_retry_delay(1, Some(now - 1), Some(now)),
+            PENDING_RETRY_DELAYS[1]
+        );
+        assert_eq!(
+            pending_retry_delay(1, Some(now), Some(now)),
+            PENDING_RETRY_DELAYS[1]
+        );
+        // No local clock: cannot compute a wait, so the fixed schedule.
+        assert_eq!(
+            pending_retry_delay(0, Some(now + 90), None),
+            PENDING_RETRY_DELAYS[0]
+        );
+        // Bogus far-future hint is capped.
+        assert_eq!(
+            pending_retry_delay(0, Some(now + 30 * 24 * 3600), Some(now)),
+            MAX_RETRY_DEFERRED_WAIT
+        );
+    }
+
+    /// +25% per attempt from the pinned gas (or the attested gasLimit when unpinned), clamped to the
+    /// route cap, and `None` once the cap is reached so the loop terminates.
+    #[test]
+    fn gas_bump_is_25_percent_capped_at_the_route_limit() {
+        assert_eq!(
+            bumped_gas_limit(Some(1_000_000), None, 5_000_000),
+            Some(1_250_000)
+        );
+        assert_eq!(
+            bumped_gas_limit(Some(4_500_000), None, 5_000_000),
+            Some(5_000_000)
+        );
+        assert_eq!(bumped_gas_limit(Some(5_000_000), None, 5_000_000), None);
+        assert_eq!(bumped_gas_limit(Some(6_000_000), None, 5_000_000), None);
+        // Nothing pinned: start from the attested gasLimit.
+        assert_eq!(
+            bumped_gas_limit(None, Some(400_000), 5_000_000),
+            Some(500_000)
+        );
+        // Neither: nothing to bump from.
+        assert_eq!(bumped_gas_limit(None, None, 5_000_000), None);
+        // Always makes progress even for tiny values.
+        assert_eq!(bumped_gas_limit(Some(1), None, 10), Some(2));
+        // Chain of bumps from a funded 1M under the default cap terminates.
+        let mut g = Some(1_000_000);
+        let mut steps = 0;
+        while let Some(next) = bumped_gas_limit(g, None, crate::config::DEFAULT_MAX_GAS_LIMIT) {
+            assert!(next > g.unwrap());
+            g = Some(next);
+            steps += 1;
+            assert!(steps < 20, "bump chain must converge on the cap");
+        }
+        assert_eq!(g, Some(crate::config::DEFAULT_MAX_GAS_LIMIT));
     }
 
     // -------------------------------------------------------------------------------------

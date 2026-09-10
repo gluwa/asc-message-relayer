@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
@@ -44,6 +44,17 @@ pub const DEFAULT_ACK_NOT_READY_POLL_SECS: u64 = 20;
 /// proof that never appears does not hot-loop until the 24 h give-up. Healthy destination
 /// finality + attestation is minutes; 30 min is far outside it.
 pub const DEFAULT_ACK_NOT_READY_POLL_WINDOW_SECS: u64 = 30 * 60;
+/// Default cap on the native value (destination wei) the relayer fronts as `msg.value` on one
+/// `deliverMessage` (asc-contracts #36: the envelope's `nativeCoinValue`). The relayer is only made
+/// whole on `claimDelivery`, so this is working capital at risk per message. Zero refuses every
+/// value-bearing envelope (terminal) — the product decision (10 Sep) is small per-chain caps, about
+/// 0.1 CTC equivalent, enforced in the quoter AND here; the operator sets the per-route number.
+pub const DEFAULT_MAX_NATIVE_COIN_VALUE_WEI: U256 = U256::ZERO;
+/// Default cap on the attested envelope `gasLimit` a route will deliver. The `DispatcherRouter`
+/// only rejects `gasLimit == 0`, so an attested `gasLimit` larger than a destination block can hold
+/// can never be delivered by anyone; refusing it up front (terminal, with a metric) beats retrying
+/// an unincludable tx forever. 5M sits comfortably under every mainstream block gas limit.
+pub const DEFAULT_MAX_GAS_LIMIT: u64 = 5_000_000;
 
 // ---------------------------------------------------------------------------
 // Validated runtime config
@@ -121,6 +132,77 @@ pub struct ChainRoute {
     /// fetches a native USC proof, and submits it to the Creditcoin-side claim target so the
     /// user never has to claim manually. `None` disables it for the route (the default).
     pub claim: Option<ClaimConfig>,
+    /// Most native value (destination wei) this route fronts as `msg.value` on one delivery
+    /// (asc-contracts #36 envelope `nativeCoinValue`). An envelope above it is refused as terminal
+    /// with `relayer_deliver_tx{status="RefusedNativeValue"}`. Default
+    /// [`DEFAULT_MAX_NATIVE_COIN_VALUE_WEI`] (0: front nothing). Logged at startup.
+    pub max_native_coin_value_wei: U256,
+    /// Largest attested envelope `gasLimit` this route will deliver. Above it the message can never
+    /// fit a destination block, so it is refused as terminal with
+    /// `relayer_deliver_tx{status="RefusedGasLimit"}`. Also the ceiling for the gas bump on an
+    /// `InsufficientGasForDestination` retry. Must be non-zero. Default [`DEFAULT_MAX_GAS_LIMIT`].
+    pub max_gas_limit: u64,
+    /// Opt-in: when a job is refused because the funded gas is below the estimate (the "awaiting a
+    /// topUpGasLimit" path), call `RelayerContract(Lite).requestTopUp(messageId,
+    /// additionalGasNeeded)` on Creditcoin once per message from the route's ack (or claim)
+    /// signer. `requestTopUp` is permissionless; calling it is relayer-service policy and the
+    /// default is off. Requires `relayer_contract_address` and an `ack` or `claim` signer key.
+    pub auto_request_top_up: bool,
+}
+
+impl ChainRoute {
+    /// The Creditcoin-side key the top-up request is signed with: the ack signer (the key that
+    /// already talks to the RelayerContract for `claimDelivery`), else the claim signer.
+    pub fn top_up_signer_key(&self) -> Option<&str> {
+        self.ack
+            .as_ref()
+            .map(|a| a.signer_key.as_str())
+            .or_else(|| self.claim.as_ref().map(|c| c.signer_key.as_str()))
+    }
+
+    /// Cross-field checks shared by the YAML and `--single-route` paths.
+    pub fn validate(&self) -> Result<()> {
+        let origin = format!("chain_key {}", self.chain_key);
+        validate_max_gas_limit(self.max_gas_limit, &origin)?;
+        if self.auto_request_top_up {
+            if self.relayer_contract_address.is_none() {
+                bail!(
+                    "{origin}: auto_request_top_up requires relayer_contract_address (requestTopUp \
+                     is a RelayerContract call)"
+                );
+            }
+            if self.top_up_signer_key().is_none() {
+                bail!(
+                    "{origin}: auto_request_top_up requires an `ack` or `claim` signer_key to sign \
+                     requestTopUp on Creditcoin"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Parse a wei amount from config/CLI: a decimal integer or `0x`-prefixed hex, up to 256 bits.
+/// Shared by the YAML and CLI paths so both accept the same spellings.
+pub fn parse_wei(raw: &str) -> Result<U256> {
+    let s = raw.trim().replace('_', "");
+    if s.is_empty() {
+        bail!("empty wei amount");
+    }
+    let parsed = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => U256::from_str_radix(hex, 16),
+        None => U256::from_str_radix(&s, 10),
+    };
+    parsed.with_context(|| format!("not a valid wei amount (decimal or 0x-hex, ≤ 256 bits): {raw}"))
+}
+
+/// Reject a zero `max_gas_limit`: every envelope carries a non-zero attested `gasLimit` (the
+/// router rejects zero), so a zero cap would refuse every message as terminal.
+pub fn validate_max_gas_limit(cap: u64, origin: &str) -> Result<()> {
+    if cap == 0 {
+        bail!("{origin}: max_gas_limit must be > 0 (a zero cap refuses every envelope)");
+    }
+    Ok(())
 }
 
 /// Off-chain acknowledgment submitter config (research §05/§10). See [`ChainRoute::ack`].
@@ -409,6 +491,34 @@ pub struct ChainRouteFile {
     pub ack: Option<AckConfigFile>,
     #[serde(default)]
     pub claim: Option<ClaimConfigFile>,
+    /// See [`ChainRoute::max_native_coin_value_wei`]. A YAML integer or a string (decimal or
+    /// `0x`-hex) — wei amounts routinely exceed what a YAML integer can carry, so the string form
+    /// is the one to use for anything non-trivial. Omitted = 0.
+    #[serde(default)]
+    pub max_native_coin_value_wei: Option<WeiFile>,
+    /// See [`ChainRoute::max_gas_limit`].
+    #[serde(default = "default_max_gas_limit")]
+    pub max_gas_limit: u64,
+    /// See [`ChainRoute::auto_request_top_up`].
+    #[serde(default)]
+    pub auto_request_top_up: bool,
+}
+
+/// On-disk spelling of a wei amount: bare YAML integer or a string (decimal / `0x`-hex).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum WeiFile {
+    Int(u64),
+    Str(String),
+}
+
+impl WeiFile {
+    fn parse(&self) -> Result<U256> {
+        match self {
+            WeiFile::Int(n) => Ok(U256::from(*n)),
+            WeiFile::Str(s) => parse_wei(s),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -472,6 +582,9 @@ fn default_ack_not_ready_poll_secs() -> u64 {
 }
 fn default_ack_not_ready_poll_window_secs() -> u64 {
     DEFAULT_ACK_NOT_READY_POLL_WINDOW_SECS
+}
+fn default_max_gas_limit() -> u64 {
+    DEFAULT_MAX_GAS_LIMIT
 }
 
 impl ConfigFile {
@@ -631,7 +744,20 @@ impl ChainRouteFile {
             })
             .transpose()?;
 
-        Ok(ChainRoute {
+        let max_native_coin_value_wei = self
+            .max_native_coin_value_wei
+            .as_ref()
+            .map(WeiFile::parse)
+            .transpose()
+            .with_context(|| {
+                format!(
+                    "invalid max_native_coin_value_wei for chain_key {}",
+                    self.chain_key
+                )
+            })?
+            .unwrap_or(DEFAULT_MAX_NATIVE_COIN_VALUE_WEI);
+
+        let route = ChainRoute {
             chain_key: self.chain_key,
             creditcoin_chain_id: self.creditcoin_chain_id,
             destination_rpc_url: self.destination_rpc_url,
@@ -645,7 +771,12 @@ impl ChainRouteFile {
             threshold_override: self.threshold_override,
             ack,
             claim,
-        })
+            max_native_coin_value_wei,
+            max_gas_limit: self.max_gas_limit,
+            auto_request_top_up: self.auto_request_top_up,
+        };
+        route.validate()?;
+        Ok(route)
     }
 }
 
@@ -727,6 +858,130 @@ routes:
         let policy = ack.not_ready_policy();
         assert_eq!(policy.poll_interval, std::time::Duration::from_secs(20));
         assert_eq!(policy.poll_window, std::time::Duration::from_secs(30 * 60));
+        // #36 knobs are optional; the defaults are the conservative policy: front no native value,
+        // 5M gas ceiling, never call requestTopUp.
+        assert_eq!(cfg.routes[0].max_native_coin_value_wei, U256::ZERO);
+        assert_eq!(
+            cfg.routes[0].max_native_coin_value_wei,
+            DEFAULT_MAX_NATIVE_COIN_VALUE_WEI
+        );
+        assert_eq!(cfg.routes[0].max_gas_limit, DEFAULT_MAX_GAS_LIMIT);
+        assert_eq!(cfg.routes[0].max_gas_limit, 5_000_000);
+        assert!(!cfg.routes[0].auto_request_top_up);
+    }
+
+    fn with_route_fields(extra: &str) -> String {
+        sample_yaml().replace(
+            "    block_confirmation_depth: 12\n",
+            &format!("    block_confirmation_depth: 12\n{extra}"),
+        )
+    }
+
+    #[test]
+    fn post_36_route_knobs_parse_in_every_spelling() {
+        // String wei (the form that survives amounts past u64), hex wei, and a bare integer.
+        for (spelling, expected) in [
+            (
+                "\"100000000000000000\"",
+                U256::from(100_000_000_000_000_000u128),
+            ),
+            (
+                "\"0x16345785d8a0000\"",
+                U256::from(100_000_000_000_000_000u128),
+            ),
+            (
+                "\"1_000_000_000_000_000_000_000\"",
+                U256::from(10u128.pow(21)),
+            ),
+            ("25000", U256::from(25_000u64)),
+        ] {
+            let yaml = with_route_fields(&format!(
+                "    max_native_coin_value_wei: {spelling}\n    max_gas_limit: 8000000\n    \
+                 auto_request_top_up: true\n    relayer_contract_address: \
+                 \"0x0000000000000000000000000000000000000009\"\n"
+            ));
+            let file: ConfigFile = serde_yaml::from_str(&yaml).unwrap();
+            let cfg = file
+                .into_config("ws://cc3".into(), "http://cc3-eth".into(), None)
+                .unwrap_or_else(|e| panic!("{spelling}: {e}"));
+            let route = &cfg.routes[0];
+            assert_eq!(route.max_native_coin_value_wei, expected, "{spelling}");
+            assert_eq!(route.max_gas_limit, 8_000_000);
+            assert!(route.auto_request_top_up);
+            // The ack signer is the top-up signer when present.
+            assert_eq!(
+                route.top_up_signer_key(),
+                Some("0x0000000000000000000000000000000000000000000000000000000000000001")
+            );
+        }
+    }
+
+    #[test]
+    fn post_36_route_knobs_reject_bad_values() {
+        // Garbage wei.
+        let file: ConfigFile = serde_yaml::from_str(&with_route_fields(
+            "    max_native_coin_value_wei: \"lots\"\n",
+        ))
+        .unwrap();
+        let err = file
+            .into_config("ws://cc3".into(), "http://cc3-eth".into(), None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("max_native_coin_value_wei"),
+            "{err}"
+        );
+
+        // A zero gas cap would refuse every envelope.
+        let file: ConfigFile =
+            serde_yaml::from_str(&with_route_fields("    max_gas_limit: 0\n")).unwrap();
+        let err = file
+            .into_config("ws://cc3".into(), "http://cc3-eth".into(), None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("max_gas_limit must be > 0"),
+            "{err}"
+        );
+
+        // requestTopUp is a RelayerContract call: the opt-in needs the contract address…
+        let file: ConfigFile =
+            serde_yaml::from_str(&with_route_fields("    auto_request_top_up: true\n")).unwrap();
+        let err = file
+            .into_config("ws://cc3".into(), "http://cc3-eth".into(), None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("relayer_contract_address"),
+            "{err}"
+        );
+
+        // …and a Creditcoin-side signer (ack or claim) to send it from.
+        let yaml = with_route_fields(
+            "    auto_request_top_up: true\n    relayer_contract_address: \
+             \"0x0000000000000000000000000000000000000009\"\n",
+        );
+        let yaml = yaml.split("    ack:\n").next().unwrap().to_string(); // drop the ack AND claim blocks (claim follows ack in the sample)
+        let file: ConfigFile = serde_yaml::from_str(&yaml).unwrap();
+        let err = file
+            .into_config("ws://cc3".into(), "http://cc3-eth".into(), None)
+            .unwrap_err();
+        assert!(err.to_string().contains("signer_key"), "{err}");
+    }
+
+    #[test]
+    fn parse_wei_accepts_decimal_and_hex_and_rejects_the_rest() {
+        assert_eq!(parse_wei("0").unwrap(), U256::ZERO);
+        assert_eq!(parse_wei(" 42 ").unwrap(), U256::from(42u64));
+        assert_eq!(parse_wei("0x2a").unwrap(), U256::from(42u64));
+        assert_eq!(parse_wei("0X2A").unwrap(), U256::from(42u64));
+        // 2^256 - 1 fits; 2^256 does not.
+        assert_eq!(
+            parse_wei(&format!("0x{}", "f".repeat(64))).unwrap(),
+            U256::MAX
+        );
+        assert!(parse_wei(&format!("0x1{}", "0".repeat(64))).is_err());
+        assert!(parse_wei("").is_err());
+        assert!(parse_wei("-1").is_err());
+        assert!(parse_wei("1.5").is_err());
+        assert!(parse_wei("1e18").is_err());
     }
 
     #[test]
