@@ -27,8 +27,8 @@
 //! of PoC scope"). Each route runs in its own [`tokio::spawn`] so a slow destination chain
 //! does not block the others.
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::eips::BlockId;
@@ -449,11 +449,75 @@ fn now_unix() -> Option<u64> {
 // requestTopUp (opt-in)
 // ---------------------------------------------------------------------------------------------
 
+/// Most `requestTopUp` sends attempted per message before giving up on the signal. Each attempt
+/// only happens when the delivery is refused as under-funded again, so this is bounded by the
+/// pool's own retry cadence, not a hot loop.
+const MAX_TOP_UP_ATTEMPTS: u8 = 3;
+
+/// Per-message state of the `requestTopUp` signal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TopUpMark {
+    /// A send is in progress (detached task running); do not double-send.
+    InFlight { attempts: u8 },
+    /// The signal landed (mined), or the contract rejected it deterministically (a top-up could
+    /// not help anyway). Nothing more to send for this message.
+    Settled,
+    /// The last send did not complete (stalled broadcast, receipt error/timeout). Eligible for
+    /// another attempt on the next under-funded refusal, up to [`MAX_TOP_UP_ATTEMPTS`].
+    Failed { attempts: u8 },
+}
+
+/// Idempotency + retry bookkeeping for `requestTopUp`, one entry per message id. Only a mined or
+/// deterministically rejected request settles a message; a transport failure leaves it eligible
+/// for a bounded retry — recording the id before the send completed meant one timeout suppressed
+/// the signal for the life of the process (Bugbot, PR #63). Restarts forget the ledger, so a
+/// message still under-funded across a restart is requested again: one duplicate event, harmless.
+#[derive(Debug, Default)]
+struct TopUpLedger {
+    marks: HashMap<B256, TopUpMark>,
+}
+
+impl TopUpLedger {
+    /// Whether a request for `id` should go out now; if so, marks it in flight and returns the
+    /// attempt number (1-based). `Err` names why not.
+    fn begin(&mut self, id: B256) -> Result<u8, &'static str> {
+        let attempts = match self.marks.get(&id) {
+            Some(TopUpMark::InFlight { .. }) => return Err("a request is already in flight"),
+            Some(TopUpMark::Settled) => return Err("already requested"),
+            Some(TopUpMark::Failed { attempts }) if *attempts >= MAX_TOP_UP_ATTEMPTS => {
+                return Err("attempts exhausted")
+            }
+            Some(TopUpMark::Failed { attempts }) => attempts + 1,
+            None => 1,
+        };
+        self.marks.insert(id, TopUpMark::InFlight { attempts });
+        Ok(attempts)
+    }
+
+    /// The in-flight request for `id` landed or was deterministically rejected.
+    fn settle(&mut self, id: B256) {
+        self.marks.insert(id, TopUpMark::Settled);
+    }
+
+    /// The in-flight request for `id` did not complete; keep the attempt count for the cap.
+    fn fail(&mut self, id: B256) {
+        let attempts = match self.marks.get(&id) {
+            Some(TopUpMark::InFlight { attempts }) | Some(TopUpMark::Failed { attempts }) => {
+                *attempts
+            }
+            Some(TopUpMark::Settled) => return,
+            None => 1,
+        };
+        self.marks.insert(id, TopUpMark::Failed { attempts });
+    }
+}
+
 /// Sends `RelayerContract(Lite).requestTopUp(messageId, additionalGasNeeded)` on Creditcoin when a
-/// delivery is refused for being under-funded, at most once per message for the life of the
-/// process (`requested`). Signed by the route's ack (else claim) key — the same key that already
-/// talks to the RelayerContract for `claimDelivery` — and serialized through the shared
-/// [`crate::broadcast::BroadcastLocks`] so it cannot race the ack worker for that key's nonce.
+/// delivery is refused for being under-funded, once per message (retried a bounded number of
+/// times only if the send itself failed — see [`TopUpLedger`]). Signed by the route's ack (else
+/// claim) key — the same key that already talks to the RelayerContract for `claimDelivery` — and
+/// serialized through the shared [`crate::broadcast::BroadcastLocks`] so it cannot race the ack
+/// worker for that key's nonce.
 ///
 /// The call is a pure on-chain signal (`TopUpRequested` event; no state change) for the payer /
 /// quoter to act on with `topUpGasLimit`. It is permissionless, so whether to send it at all is
@@ -463,9 +527,8 @@ struct TopUpRequester {
     relayer_contract: Address,
     signer_address: Address,
     broadcast_locks: Arc<crate::broadcast::BroadcastLocks>,
-    /// Message ids already requested. Restarts forget this, so a message still under-funded
-    /// across a restart is requested again — one duplicate event, harmless.
-    requested: HashSet<B256>,
+    /// Shared with the detached send tasks, which report their outcome back into it.
+    ledger: Arc<Mutex<TopUpLedger>>,
 }
 
 impl TopUpRequester {
@@ -508,69 +571,126 @@ impl TopUpRequester {
             relayer_contract,
             signer_address,
             broadcast_locks,
-            requested: HashSet::new(),
+            ledger: Arc::new(Mutex::new(TopUpLedger::default())),
         })
     }
 
-    /// Request a top-up of `additional_gas` for `message_id`, unless already requested. Detached:
-    /// the send + receipt wait must not sit in the serial delivery worker's critical path (it is
-    /// a side signal, not part of delivering anything). The idempotency mark is taken *before*
-    /// spawning so a second refusal of the same message while the first request is still in
-    /// flight does not double-send.
+    /// Request a top-up of `additional_gas` for `message_id`, unless one already landed, is in
+    /// flight, or the bounded attempt budget is spent. Detached: the send + receipt wait must not
+    /// sit in the serial delivery worker's critical path (it is a side signal, not part of
+    /// delivering anything). The in-flight mark is taken *before* spawning so a second refusal of
+    /// the same message while the first request is still pending does not double-send; the task
+    /// reports back so a send that never completed can be retried on the next refusal.
     fn request(&mut self, chain_key: u64, message_id: B256, additional_gas: u64) {
-        if !self.requested.insert(message_id) {
-            debug!(chain_key, %message_id, "requestTopUp already sent for this message; not repeating");
-            return;
-        }
+        let attempt = match self
+            .ledger
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .begin(message_id)
+        {
+            Ok(n) => n,
+            Err(why) => {
+                debug!(chain_key, %message_id, why, "requestTopUp not (re)sent");
+                return;
+            }
+        };
         let locks = self.broadcast_locks.clone();
         let provider = self.provider.clone();
         let relayer_contract = self.relayer_contract;
         let signer_address = self.signer_address;
+        let ledger = self.ledger.clone();
         tokio::spawn(async move {
-            let ledger = IRelayerContract::new(relayer_contract, &provider);
-            let call = ledger.requestTopUp(message_id, U256::from(additional_gas));
-            let sent = match locks
-                .broadcast(signer_address, SEND_TIMEOUT, call.send())
-                .await
-            {
-                Ok(res) => res,
-                Err(stalled) => {
-                    warn!(chain_key, %message_id, %stalled, "requestTopUp send did not complete");
-                    return;
-                }
-            };
-            match sent {
-                Ok(builder) => {
-                    match tokio::time::timeout(
-                        RECEIPT_TIMEOUT,
-                        crate::receipt::await_receipt(&builder),
-                    )
-                    .await
-                    {
-                        Ok(Ok(receipt)) if receipt.status() => {
-                            info!(chain_key, %message_id, additional_gas, tx = %receipt.transaction_hash,
-                                "🪙 requestTopUp emitted (TopUpRequested) — awaiting the payer's topUpGasLimit");
-                        }
-                        Ok(Ok(receipt)) => {
-                            warn!(chain_key, %message_id, tx = %receipt.transaction_hash,
-                                "requestTopUp tx mined but reverted");
-                        }
-                        Ok(Err(err)) => {
-                            warn!(chain_key, %message_id, %err, "requestTopUp receipt failed");
-                        }
-                        Err(_) => {
-                            warn!(chain_key, %message_id, "requestTopUp receipt timed out");
-                        }
-                    }
-                }
-                // A revert here (UnknownOperation / RelayAlreadySettled / DeliveryDeadlineReached)
-                // means a top-up could not help anyway; the delivery path reaches the same
-                // conclusion through `top_up_foreclosed` on its next pass. Not retried.
-                Err(err) => {
-                    warn!(chain_key, %message_id, %err, "requestTopUp rejected; not retrying");
-                }
+            let landed = send_top_up_request(
+                &provider,
+                &locks,
+                relayer_contract,
+                signer_address,
+                chain_key,
+                message_id,
+                additional_gas,
+                attempt,
+            )
+            .await;
+            let mut ledger = ledger.lock().unwrap_or_else(|p| p.into_inner());
+            if landed {
+                ledger.settle(message_id);
+            } else {
+                ledger.fail(message_id);
             }
         });
+    }
+}
+
+/// One `requestTopUp` send + receipt wait. `true` when the message is settled from the relayer's
+/// point of view (mined, or deterministically rejected so a top-up could not help anyway); `false`
+/// when the send did not complete and may be retried.
+#[allow(clippy::too_many_arguments)]
+async fn send_top_up_request(
+    provider: &DynProvider,
+    locks: &crate::broadcast::BroadcastLocks,
+    relayer_contract: Address,
+    signer_address: Address,
+    chain_key: u64,
+    message_id: B256,
+    additional_gas: u64,
+    attempt: u8,
+) -> bool {
+    let ledger = IRelayerContract::new(relayer_contract, provider);
+    let call = ledger.requestTopUp(message_id, U256::from(additional_gas));
+    let sent = match locks
+        .broadcast(signer_address, SEND_TIMEOUT, call.send())
+        .await
+    {
+        Ok(res) => res,
+        Err(stalled) => {
+            warn!(chain_key, %message_id, attempt, %stalled,
+                "requestTopUp send did not complete; will retry on the next under-funded refusal");
+            return false;
+        }
+    };
+    match sent {
+        Ok(builder) => {
+            match tokio::time::timeout(RECEIPT_TIMEOUT, crate::receipt::await_receipt(&builder))
+                .await
+            {
+                Ok(Ok(receipt)) if receipt.status() => {
+                    info!(chain_key, %message_id, additional_gas, attempt, tx = %receipt.transaction_hash,
+                        "🪙 requestTopUp emitted (TopUpRequested) — awaiting the payer's topUpGasLimit");
+                    true
+                }
+                Ok(Ok(receipt)) => {
+                    // Mined and reverted: the same state-dependent rejection as the send-time
+                    // revert below; resending would revert identically.
+                    warn!(chain_key, %message_id, attempt, tx = %receipt.transaction_hash,
+                        "requestTopUp tx mined but reverted; not retrying");
+                    true
+                }
+                Ok(Err(err)) => {
+                    warn!(chain_key, %message_id, attempt, %err,
+                        "requestTopUp receipt failed; will retry on the next under-funded refusal");
+                    false
+                }
+                Err(_) => {
+                    // The tx may still land later (one duplicate TopUpRequested event, harmless).
+                    warn!(chain_key, %message_id, attempt,
+                        "requestTopUp receipt timed out; will retry on the next under-funded refusal");
+                    false
+                }
+            }
+        }
+        // A revert here (UnknownOperation / RelayAlreadySettled / DeliveryDeadlineReached) means
+        // a top-up could not help anyway; the delivery path reaches the same conclusion through
+        // `top_up_foreclosed` on its next pass. A transport failure at send is retryable.
+        Err(err) => {
+            if is_revert(&err.to_string()) || err.as_revert_data().is_some() {
+                warn!(chain_key, %message_id, attempt, %err, "requestTopUp rejected; not retrying");
+                true
+            } else {
+                warn!(chain_key, %message_id, attempt, %err,
+                    "requestTopUp send failed; will retry on the next under-funded refusal");
+                false
+            }
+        }
     }
 }
 
@@ -784,14 +904,14 @@ fn settle_pre_send_revert(
             Stage::Done(DeliveryResultKind::Delivered)
         }
         DeliveryRevert::ValidationFailedWithNativeValue => {
-            metrics.inc_deliver_tx(chain_key, DeliveryStatus::ValidationFailedWithNativeValue);
+            metrics.inc_deliver_tx(chain_key, revert_status(Some(revert)));
             error!(chain_key, %message_id, %err,
                 "❌ {stage}(deliverMessage) reverted ValidationFailedWithNativeValue — the votes fail \
                  validation and native value was attached; terminal for this vote bundle");
             Stage::Done(DeliveryResultKind::Terminal)
         }
         DeliveryRevert::InvalidMessageDispatcher => {
-            metrics.inc_deliver_tx(chain_key, DeliveryStatus::InvalidDispatcher);
+            metrics.inc_deliver_tx(chain_key, revert_status(Some(revert)));
             error!(chain_key, %message_id, inbox = %route.inbox_address, %err,
                 "❌ {stage}(deliverMessage) reverted InvalidMessageDispatcher — the Inbox's dispatcher \
                  has no code; terminal until the Inbox is reconfigured");
@@ -1097,16 +1217,15 @@ async fn handle_job<P: Provider + Clone + 'static>(
                         // `InsufficientGasForDestination` is ours to fix by resending with more gas;
                         // a duplicate means another relayer's tx landed in the same block (success);
                         // anything else is a deterministic revert and terminal.
-                        let reason = replay_revert_reason(
+                        let (class, reason) = replay_revert_reason(
                             &inbox,
                             job,
                             native_value,
                             gas_limit,
                             receipt.block_number,
                         )
-                        .await;
-                        let class = reason.as_deref().and_then(|r| classify_revert_str(r, None));
-                        let reason = reason.unwrap_or_else(|| "tx mined but reverted".into());
+                        .await
+                        .unwrap_or_else(|| (None, "tx mined but reverted".into()));
                         match class {
                             Some(DeliveryRevert::Duplicate) => break SendOutcome::AlreadyValidated,
                             Some(DeliveryRevert::InsufficientGasForDestination)
@@ -1131,15 +1250,23 @@ async fn handle_job<P: Provider + Clone + 'static>(
                                         gas_limit = Some(next);
                                     }
                                     None => {
-                                        break SendOutcome::Reverted(format!(
-                                            "InsufficientGasForDestination at the route's \
-                                             max_gas_limit ({}): {reason}",
-                                            route.max_gas_limit
-                                        ));
+                                        break SendOutcome::Reverted {
+                                            revert: class,
+                                            reason: format!(
+                                                "InsufficientGasForDestination at the route's \
+                                                 max_gas_limit ({}): {reason}",
+                                                route.max_gas_limit
+                                            ),
+                                        };
                                     }
                                 }
                             }
-                            _ => break SendOutcome::Reverted(reason),
+                            _ => {
+                                break SendOutcome::Reverted {
+                                    revert: class,
+                                    reason,
+                                }
+                            }
                         }
                     }
                     Ok(Err(err)) if attempts <= delivery_config.max_retries => {
@@ -1183,16 +1310,25 @@ async fn handle_job<P: Provider + Clone + 'static>(
                             gas_limit = Some(next);
                         }
                         None => {
-                            break SendOutcome::Reverted(format!(
-                                "InsufficientGasForDestination at the route's max_gas_limit ({}): {err}",
-                                route.max_gas_limit
-                            ));
+                            break SendOutcome::Reverted {
+                                revert: Some(DeliveryRevert::InsufficientGasForDestination),
+                                reason: format!(
+                                    "InsufficientGasForDestination at the route's max_gas_limit ({}): {err}",
+                                    route.max_gas_limit
+                                ),
+                            };
                         }
                     }
                 }
                 // Deterministic contract revert at send / gas-estimation time — retrying would
-                // revert identically, so don't burn the retry budget on it.
-                Some(revert) => break SendOutcome::Reverted(revert_summary(revert, &err)),
+                // revert identically, so don't burn the retry budget on it. The class travels with
+                // the outcome so the #36 errors get their own metric label, not `Reverted`.
+                Some(revert) => {
+                    break SendOutcome::Reverted {
+                        revert: Some(revert),
+                        reason: revert_summary(revert, &err),
+                    }
+                }
                 None if attempts <= delivery_config.max_retries => {
                     warn!(
                         chain_key = route.chain_key,
@@ -1272,11 +1408,12 @@ async fn handle_job<P: Provider + Clone + 'static>(
             );
             Ok(DeliveryResultKind::Delivered)
         }
-        SendOutcome::Reverted(reason) => {
-            metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::Reverted);
+        SendOutcome::Reverted { revert, reason } => {
+            metrics.inc_deliver_tx(route.chain_key, revert_status(revert));
             error!(
                 chain_key = route.chain_key,
                 message_id = %job.message_id,
+                revert = ?revert,
                 %reason,
                 "❌ delivery reverted; no further retries"
             );
@@ -1291,6 +1428,23 @@ async fn handle_job<P: Provider + Clone + 'static>(
                 "send exhausted delivery worker retries; returning to pool for bounded retry"
             );
             Ok(DeliveryResultKind::Retryable)
+        }
+    }
+}
+
+/// The `relayer_deliver_tx` label for a terminal revert, whichever stage surfaced it (simulate,
+/// estimate, send, or the mined-revert replay). The #36 hard failures get their own series;
+/// everything else is the generic `Reverted`. Single source of truth so the send-time path cannot
+/// drift from the pre-send one (Bugbot, PR #63).
+fn revert_status(revert: Option<DeliveryRevert>) -> DeliveryStatus {
+    match revert {
+        Some(DeliveryRevert::ValidationFailedWithNativeValue) => {
+            DeliveryStatus::ValidationFailedWithNativeValue
+        }
+        Some(DeliveryRevert::InvalidMessageDispatcher) => DeliveryStatus::InvalidDispatcher,
+        Some(DeliveryRevert::Duplicate) => DeliveryStatus::AlreadyValidated,
+        Some(DeliveryRevert::InsufficientGasForDestination | DeliveryRevert::Other) | None => {
+            DeliveryStatus::Reverted
         }
     }
 }
@@ -1313,16 +1467,20 @@ fn revert_summary(revert: DeliveryRevert, err: &alloy::contract::Error) -> Strin
 }
 
 /// Replay a mined-but-reverted `deliverMessage` as an `eth_call` at the block it mined in, with the
-/// same `msg.value` and gas, to recover the revert reason the receipt does not carry. Best-effort
-/// and bounded: `None` when the replay succeeds (state moved on) or cannot be made in time — the
-/// caller then falls back to a generic terminal revert, which is what it did before this existed.
+/// same `msg.value` and gas, to recover the revert reason the receipt does not carry. Returns the
+/// classification made from the *structured* error (selector from `as_revert_data()` first, the
+/// string dialects second — geth-style nodes put the selector only in the JSON-RPC error `data`,
+/// which a plain `to_string()` does not reliably carry; Bugbot, PR #63) plus the printable reason.
+/// Best-effort and bounded: `None` when the replay succeeds (state moved on) or cannot be made in
+/// time — the caller then falls back to a generic terminal revert, which is what it did before
+/// this existed.
 async fn replay_revert_reason<P: Provider>(
     inbox: &IInbox::IInboxInstance<P>,
     job: &DeliveryJob,
     native_value: U256,
     gas_limit: Option<u64>,
     block_number: Option<u64>,
-) -> Option<String> {
+) -> Option<(Option<DeliveryRevert>, String)> {
     let mut call = inbox
         .deliverMessage(
             job.message_id,
@@ -1339,7 +1497,7 @@ async fn replay_revert_reason<P: Provider>(
         call = call.block(BlockId::number(n));
     }
     match tokio::time::timeout(FUNDED_GAS_READ_TIMEOUT, call.call()).await {
-        Ok(Err(err)) => Some(err.to_string()),
+        Ok(Err(err)) => Some((classify_delivery_revert(&err), err.to_string())),
         Ok(Ok(_)) => None,
         Err(_elapsed) => None,
     }
@@ -1357,8 +1515,12 @@ enum SendOutcome {
     DestinationFailed {
         dispatcher: Address,
     },
-    /// Deterministic revert (mined-and-reverted, or revert at send/estimation time).
-    Reverted(String),
+    /// Deterministic revert (mined-and-reverted, or revert at send/estimation time). `revert` is
+    /// the classification when one was possible; it selects the metric label.
+    Reverted {
+        revert: Option<DeliveryRevert>,
+        reason: String,
+    },
     /// Transient infrastructure failure — returned to the pool's bounded retry.
     Failed(String),
 }
@@ -1736,6 +1898,132 @@ mod tests {
             classify_revert_str("error code -32000: insufficient funds for gas", None),
             None
         );
+    }
+
+    /// Build the error alloy hands back for a geth-style JSON-RPC revert: the selector lives only
+    /// in the structured `data` field of the error payload.
+    fn structured_revert(message: &str, data: &[u8]) -> alloy::contract::Error {
+        // Deserialized rather than named: `ErrorPayload` lives in alloy-json-rpc, which the
+        // umbrella crate only re-exports behind a feature this workspace does not enable.
+        let payload = serde_json::from_value(serde_json::json!({
+            "code": 3,
+            "message": message,
+            "data": format!("0x{}", alloy::hex::encode(data)),
+        }))
+        .unwrap();
+        alloy::contract::Error::TransportError(alloy::transports::RpcError::ErrorResp(payload))
+    }
+
+    /// The mined-revert replay (and every send-time revert) must classify from the structured
+    /// revert data, not only from the stringified error — geth-style nodes carry the selector in
+    /// the JSON-RPC `data` field. A funded delivery pins gas and skips the estimate, so this
+    /// replay is the only place it can learn `InsufficientGasForDestination` and bump gas.
+    #[test]
+    fn structured_revert_data_classifies_without_string_dialects() {
+        let igd = IMessageDispatcher::InsufficientGasForDestination {}.abi_encode();
+        let err = structured_revert("execution reverted", &igd);
+        assert!(
+            err.as_revert_data().is_some(),
+            "fixture must carry structured revert data: {err}"
+        );
+        assert_eq!(
+            classify_delivery_revert(&err),
+            Some(DeliveryRevert::InsufficientGasForDestination)
+        );
+
+        let vf = IInbox::ValidationFailedWithNativeValue {
+            messageId: B256::repeat_byte(0x04),
+            value: U256::from(1u64),
+        }
+        .abi_encode();
+        assert_eq!(
+            classify_delivery_revert(&structured_revert("execution reverted", &vf)),
+            Some(DeliveryRevert::ValidationFailedWithNativeValue)
+        );
+        let imd = IInbox::InvalidMessageDispatcher {
+            dispatcher: Address::repeat_byte(0xdd),
+        }
+        .abi_encode();
+        assert_eq!(
+            classify_delivery_revert(&structured_revert("execution reverted", &imd)),
+            Some(DeliveryRevert::InvalidMessageDispatcher)
+        );
+        // Structured RetryDeferred decodes retryAfter the same way.
+        let deferred = IInbox::RetryDeferred {
+            messageId: B256::repeat_byte(0x05),
+            retryAfter: 1_800_000_777,
+        }
+        .abi_encode();
+        assert_eq!(
+            decode_retry_deferred(&structured_revert("execution reverted", &deferred)),
+            Some(1_800_000_777)
+        );
+    }
+
+    /// Every stage that ends in a terminal revert maps the classification to the same label: the
+    /// #36 hard failures get their own series whether they surfaced at simulate, send, or in the
+    /// mined-revert replay; everything else is the generic `Reverted`.
+    #[test]
+    fn revert_status_gives_36_errors_their_own_labels_at_every_stage() {
+        assert_eq!(
+            revert_status(Some(DeliveryRevert::ValidationFailedWithNativeValue)),
+            DeliveryStatus::ValidationFailedWithNativeValue
+        );
+        assert_eq!(
+            revert_status(Some(DeliveryRevert::InvalidMessageDispatcher)),
+            DeliveryStatus::InvalidDispatcher
+        );
+        assert_eq!(
+            revert_status(Some(DeliveryRevert::Duplicate)),
+            DeliveryStatus::AlreadyValidated
+        );
+        assert_eq!(
+            revert_status(Some(DeliveryRevert::InsufficientGasForDestination)),
+            DeliveryStatus::Reverted
+        );
+        assert_eq!(
+            revert_status(Some(DeliveryRevert::Other)),
+            DeliveryStatus::Reverted
+        );
+        assert_eq!(revert_status(None), DeliveryStatus::Reverted);
+    }
+
+    /// The top-up signal is idempotent on success but NOT on failure: a send that never completed
+    /// must be retryable on the next under-funded refusal (bounded), and an in-flight one must not
+    /// be doubled.
+    #[test]
+    fn top_up_ledger_retries_failed_sends_but_not_settled_or_in_flight_ones() {
+        let id = B256::repeat_byte(0x06);
+        let other = B256::repeat_byte(0x07);
+        let mut ledger = TopUpLedger::default();
+
+        // First request goes out; a second while in flight does not.
+        assert_eq!(ledger.begin(id), Ok(1));
+        assert_eq!(ledger.begin(id), Err("a request is already in flight"));
+        // Independent messages do not interfere.
+        assert_eq!(ledger.begin(other), Ok(1));
+
+        // A failed send frees the slot for a retry, counting attempts.
+        ledger.fail(id);
+        assert_eq!(ledger.begin(id), Ok(2));
+        ledger.fail(id);
+        assert_eq!(ledger.begin(id), Ok(3));
+        ledger.fail(id);
+        // Budget spent: bounded, never a hot loop.
+        assert_eq!(MAX_TOP_UP_ATTEMPTS, 3);
+        assert_eq!(ledger.begin(id), Err("attempts exhausted"));
+
+        // A landed (or deterministically rejected) request settles the message for good…
+        ledger.settle(other);
+        assert_eq!(ledger.begin(other), Err("already requested"));
+        // …and a late failure report cannot un-settle it.
+        ledger.fail(other);
+        assert_eq!(ledger.begin(other), Err("already requested"));
+
+        // A failure reported for an id the ledger never saw is recorded, not panicked on.
+        let stray = B256::repeat_byte(0x08);
+        ledger.fail(stray);
+        assert_eq!(ledger.begin(stray), Ok(2));
     }
 
     /// `retryAfter` comes out of the RetryDeferred revert payload; a different error, a truncated
