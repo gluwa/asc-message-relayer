@@ -331,7 +331,7 @@ pub async fn run(
                     funding,
                     metrics.as_ref(),
                     top_up.as_mut(),
-                    outcomes.as_ref(),
+                    &outcomes,
                 ).await {
                     Ok(outcome) => outcome,
                     Err(err) => {
@@ -905,6 +905,13 @@ fn settle_pre_send_revert(
         DeliveryRevert::Duplicate => {
             debug!(chain_key, %message_id, "{stage} detected already-validated; idempotent success");
             metrics.inc_deliver_tx(chain_key, DeliveryStatus::AlreadyValidated);
+            outcomes.record(
+                message_id,
+                DeliveryOutcome::new(OutcomeKind::Delivered, chain_key).with_reason(format!(
+                    "already validated on the Inbox before {stage} (another relayer, or an earlier \
+                     attempt of ours mined)"
+                )),
+            );
             Stage::Done(DeliveryResultKind::Delivered)
         }
         DeliveryRevert::ValidationFailedWithNativeValue => {
@@ -939,7 +946,7 @@ fn settle_pre_send_revert(
         }
         DeliveryRevert::Other => {
             metrics.inc_deliver_tx(chain_key, DeliveryStatus::Reverted);
-            let detail = describe_unknown_revert(&err.to_string(), &job.payload);
+            let detail = describe_unknown_revert(err, &job.payload);
             warn!(chain_key, %message_id, %err, %detail,
                 "{stage}(deliverMessage) reverted; treating as terminal (undeliverable as published)");
             outcomes.record(
@@ -958,8 +965,15 @@ fn settle_pre_send_revert(
 /// envelope decode: the payload is not `abi.encode(address destination, uint256 nativeCoinValue,
 /// uint256 gasLimit, bytes payloadData)`. Say so, instead of leaving the operator with
 /// "execution reverted" (usc-devnet, 15 Sep 2026: eight such messages, a day of head-scratching).
-fn describe_unknown_revert(err: &str, payload: &[u8]) -> String {
-    match revert_data(err) {
+fn describe_unknown_revert(err: &alloy::contract::Error, payload: &[u8]) -> String {
+    // Structured revert data first (geth-style nodes return it as the JSON-RPC error `data`),
+    // then the `data: "0x…"` field of the string dialects — the same order as
+    // `classify_delivery_revert`.
+    let data = err
+        .as_revert_data()
+        .map(|d| d.to_vec())
+        .or_else(|| revert_data(&err.to_string()));
+    match data {
         Some(data) if data.len() >= 4 => format!(
             "custom error selector 0x{} ({} bytes of revert data)",
             hex::encode(&data[..4]),
@@ -1001,7 +1015,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
     funding: MessageFunding,
     metrics: &dyn crate::prom::MetricsTrait,
     top_up: Option<&mut TopUpRequester>,
-    outcomes: &OutcomeStore,
+    outcomes: &Arc<OutcomeStore>,
 ) -> Result<DeliveryResultKind> {
     let inbox = IInbox::new(route.inbox_address, provider);
 
@@ -1515,6 +1529,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
                 *inbox.address(),
                 job.message_id,
                 route.chain_key,
+                outcomes.clone(),
             );
             Ok(DeliveryResultKind::Delivered)
         }
@@ -1658,6 +1673,7 @@ fn spawn_pending_retry<P: Provider + 'static>(
     inbox_address: Address,
     message_id: B256,
     chain_key: u64,
+    outcomes: Arc<OutcomeStore>,
 ) {
     tokio::spawn(async move {
         let inbox = IInbox::new(inbox_address, &provider);
@@ -1675,6 +1691,13 @@ fn spawn_pending_retry<P: Provider + 'static>(
             match inbox.isPending(message_id).call().await {
                 Ok(ret) if !ret => {
                     info!(chain_key, %message_id, "♻️ pending message already resolved");
+                    // Consumed by someone else's `retryPendingMessage` (or a dApp user's); we did
+                    // not see the receipt, so the verdict carries no tx hash.
+                    outcomes.record(
+                        message_id,
+                        DeliveryOutcome::new(OutcomeKind::Delivered, chain_key)
+                            .with_reason("pending message resolved on-chain by another party"),
+                    );
                     return;
                 }
                 Ok(_) => {}
@@ -1710,13 +1733,28 @@ fn spawn_pending_retry<P: Provider + 'static>(
                         Ok(Ok(receipt)) if receipt.status() => {
                             // Executed — or (#36) consumed as a destination failure: either way
                             // the message is no longer pending.
+                            let tx_hash = receipt.transaction_hash;
                             match classify_success_logs(inbox_address, receipt.inner.logs()) {
                                 ReceiptClass::DestinationFailed { dispatcher } => {
-                                    warn!(chain_key, %message_id, %dispatcher,
+                                    warn!(chain_key, %message_id, %dispatcher, tx = %tx_hash,
                                         "♻️ retryPendingMessage consumed the message but the destination call FAILED (MessageExecutionFailed)");
+                                    outcomes.record(
+                                        message_id,
+                                        DeliveryOutcome::new(OutcomeKind::DestinationFailed, chain_key)
+                                            .with_tx(tx_hash)
+                                            .with_reason(format!(
+                                                "MessageExecutionFailed on retryPendingMessage (dispatcher {dispatcher})"
+                                            )),
+                                    );
                                 }
                                 _ => {
-                                    info!(chain_key, %message_id, "♻️ retryPendingMessage succeeded")
+                                    info!(chain_key, %message_id, tx = %tx_hash, "♻️ retryPendingMessage succeeded");
+                                    outcomes.record(
+                                        message_id,
+                                        DeliveryOutcome::new(OutcomeKind::Delivered, chain_key)
+                                            .with_tx(tx_hash)
+                                            .with_reason("delivered by retryPendingMessage"),
+                                    );
                                 }
                             }
                             return;
