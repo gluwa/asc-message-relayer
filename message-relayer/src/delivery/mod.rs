@@ -45,6 +45,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::abi::{IInbox, IMessageDispatcher, IMessageReceiver, IRelayerContract};
 use crate::config::{ChainRoute, DeliveryConfig};
+use crate::outcome::{DeliveryOutcome, OutcomeKind, OutcomeStore};
 use crate::prom::{DeliveryStatus, Metrics};
 use crate::revert::{is_revert, revert_data, revert_selector};
 
@@ -186,6 +187,7 @@ pub async fn run(
     metrics: Metrics,
     health: Arc<crate::health::Health>,
     broadcast_locks: Arc<crate::broadcast::BroadcastLocks>,
+    outcomes: Arc<OutcomeStore>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let chain_key = route.chain_key;
@@ -329,6 +331,7 @@ pub async fn run(
                     funding,
                     metrics.as_ref(),
                     top_up.as_mut(),
+                    &outcomes,
                 ).await {
                     Ok(outcome) => outcome,
                     Err(err) => {
@@ -891,6 +894,7 @@ fn settle_pre_send_revert(
     route: &ChainRoute,
     job: &DeliveryJob,
     metrics: &dyn crate::prom::MetricsTrait,
+    outcomes: &OutcomeStore,
     stage: &str,
     revert: DeliveryRevert,
     err: &alloy::contract::Error,
@@ -901,6 +905,13 @@ fn settle_pre_send_revert(
         DeliveryRevert::Duplicate => {
             debug!(chain_key, %message_id, "{stage} detected already-validated; idempotent success");
             metrics.inc_deliver_tx(chain_key, DeliveryStatus::AlreadyValidated);
+            outcomes.record(
+                message_id,
+                DeliveryOutcome::new(OutcomeKind::Delivered, chain_key).with_reason(format!(
+                    "already validated on the Inbox before {stage} (another relayer, or an earlier \
+                     attempt of ours mined)"
+                )),
+            );
             Stage::Done(DeliveryResultKind::Delivered)
         }
         DeliveryRevert::ValidationFailedWithNativeValue => {
@@ -908,6 +919,11 @@ fn settle_pre_send_revert(
             error!(chain_key, %message_id, %err,
                 "❌ {stage}(deliverMessage) reverted ValidationFailedWithNativeValue — the votes fail \
                  validation and native value was attached; terminal for this vote bundle");
+            outcomes.record(
+                message_id,
+                DeliveryOutcome::new(OutcomeKind::Terminal, chain_key)
+                    .with_reason("ValidationFailedWithNativeValue: votes failed validation"),
+            );
             Stage::Done(DeliveryResultKind::Terminal)
         }
         DeliveryRevert::InvalidMessageDispatcher => {
@@ -915,6 +931,11 @@ fn settle_pre_send_revert(
             error!(chain_key, %message_id, inbox = %route.inbox_address, %err,
                 "❌ {stage}(deliverMessage) reverted InvalidMessageDispatcher — the Inbox's dispatcher \
                  has no code; terminal until the Inbox is reconfigured");
+            outcomes.record(
+                message_id,
+                DeliveryOutcome::new(OutcomeKind::Terminal, chain_key)
+                    .with_reason("InvalidMessageDispatcher: the Inbox's dispatcher has no code"),
+            );
             Stage::Done(DeliveryResultKind::Terminal)
         }
         DeliveryRevert::InsufficientGasForDestination => {
@@ -925,8 +946,50 @@ fn settle_pre_send_revert(
         }
         DeliveryRevert::Other => {
             metrics.inc_deliver_tx(chain_key, DeliveryStatus::Reverted);
-            warn!(chain_key, %message_id, %err, "{stage}(deliverMessage) reverted; treating as terminal");
+            let detail = describe_unknown_revert(err, &job.payload);
+            warn!(chain_key, %message_id, %err, %detail,
+                "{stage}(deliverMessage) reverted; treating as terminal (undeliverable as published)");
+            outcomes.record(
+                message_id,
+                DeliveryOutcome::new(OutcomeKind::Undeliverable, chain_key)
+                    .with_reason(format!("{stage}(deliverMessage) reverted: {detail}")),
+            );
             Stage::Done(DeliveryResultKind::Terminal)
+        }
+    }
+}
+
+/// Make an unclassified pre-send revert readable. The RPC's error string carries the revert data
+/// when there is any; a `data`-less "execution reverted" from `deliverMessage` means the Inbox
+/// reverted before reaching the dispatcher, which since asc-contracts #36 is almost always the
+/// envelope decode: the payload is not `abi.encode(address destination, uint256 nativeCoinValue,
+/// uint256 gasLimit, bytes payloadData)`. Say so, instead of leaving the operator with
+/// "execution reverted" (usc-devnet, 15 Sep 2026: eight such messages, a day of head-scratching).
+fn describe_unknown_revert(err: &alloy::contract::Error, payload: &[u8]) -> String {
+    // Structured revert data first (geth-style nodes return it as the JSON-RPC error `data`),
+    // then the `data: "0x…"` field of the string dialects — the same order as
+    // `classify_delivery_revert`.
+    let data = err
+        .as_revert_data()
+        .map(|d| d.to_vec())
+        .or_else(|| revert_data(&err.to_string()));
+    match data {
+        Some(data) if data.len() >= 4 => format!(
+            "custom error selector 0x{} ({} bytes of revert data)",
+            hex::encode(&data[..4]),
+            data.len()
+        ),
+        _ => {
+            let looks_like_envelope = envelope_terms(payload).gas_limit.is_some();
+            if looks_like_envelope {
+                "reverted with empty data".to_string()
+            } else {
+                format!(
+                    "reverted with empty data before dispatch; the {}-byte payload does not decode as \
+                     the abi.encode(address,uint256,uint256,bytes) envelope the Inbox requires",
+                    payload.len()
+                )
+            }
         }
     }
 }
@@ -952,6 +1015,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
     funding: MessageFunding,
     metrics: &dyn crate::prom::MetricsTrait,
     top_up: Option<&mut TopUpRequester>,
+    outcomes: &Arc<OutcomeStore>,
 ) -> Result<DeliveryResultKind> {
     let inbox = IInbox::new(route.inbox_address, provider);
 
@@ -971,6 +1035,13 @@ async fn handle_job<P: Provider + Clone + 'static>(
             "envelope asks the relayer to front more native value than the route's \
              max_native_coin_value_wei; refusing (terminal — a quoter/publisher-side limit)"
         );
+        outcomes.record(
+            job.message_id,
+            DeliveryOutcome::new(OutcomeKind::Undeliverable, route.chain_key).with_reason(format!(
+                "envelope nativeCoinValue {native_value} wei exceeds the route cap {} wei",
+                route.max_native_coin_value_wei
+            )),
+        );
         return Ok(DeliveryResultKind::Terminal);
     }
     // The router only rejects gasLimit == 0; an attested gasLimit larger than a destination block
@@ -987,6 +1058,15 @@ async fn handle_job<P: Provider + Clone + 'static>(
                 cap = route.max_gas_limit,
                 "❌ envelope's attested gasLimit exceeds the route's max_gas_limit — it can never be \
                  delivered; refusing (terminal). Fix on the publisher/quoter side."
+            );
+            outcomes.record(
+                job.message_id,
+                DeliveryOutcome::new(OutcomeKind::Undeliverable, route.chain_key).with_reason(
+                    format!(
+                        "envelope gasLimit {gas_limit} exceeds the route cap {}",
+                        route.max_gas_limit
+                    ),
+                ),
             );
             return Ok(DeliveryResultKind::Terminal);
         }
@@ -1015,9 +1095,9 @@ async fn handle_job<P: Provider + Clone + 'static>(
             // it as terminal would silently drop a deliverable message.
             match classify_delivery_revert(&err) {
                 Some(revert) => {
-                    if let Stage::Done(kind) =
-                        settle_pre_send_revert(route, job, metrics, "simulate", revert, &err)
-                    {
+                    if let Stage::Done(kind) = settle_pre_send_revert(
+                        route, job, metrics, outcomes, "simulate", revert, &err,
+                    ) {
                         return Ok(kind);
                     }
                 }
@@ -1075,6 +1155,15 @@ async fn handle_job<P: Provider + Clone + 'static>(
                          funded gasLimit was set at publish time and cannot now be raised; this \
                          needs fixing on the publisher/quoter side, not here."
                     );
+                    outcomes.record(
+                        job.message_id,
+                        DeliveryOutcome::new(OutcomeKind::Terminal, route.chain_key).with_reason(
+                            format!(
+                                "under-funded: estimate {est} > funded gasLimit {gas}, top-up no \
+                                 longer possible ({reason})"
+                            ),
+                        ),
+                    );
                     return Ok(DeliveryResultKind::Terminal);
                 }
                 let additional = est.saturating_sub(gas);
@@ -1103,9 +1192,9 @@ async fn handle_job<P: Provider + Clone + 'static>(
             // OOG and be dropped as terminal — the exact failure this guard exists to prevent).
             Ok(Err(err)) => match classify_delivery_revert(&err) {
                 Some(revert) => {
-                    if let Stage::Done(kind) =
-                        settle_pre_send_revert(route, job, metrics, "estimate", revert, &err)
-                    {
+                    if let Stage::Done(kind) = settle_pre_send_revert(
+                        route, job, metrics, outcomes, "estimate", revert, &err,
+                    ) {
                         return Ok(kind);
                     }
                 }
@@ -1206,10 +1295,17 @@ async fn handle_job<P: Provider + Clone + 'static>(
                                 route.inbox_address,
                                 receipt.inner.logs(),
                             ) {
-                                ReceiptClass::Delivered => SendOutcome::Succeeded,
-                                ReceiptClass::Pending => SendOutcome::Pending,
+                                ReceiptClass::Delivered => SendOutcome::Succeeded {
+                                    tx_hash: receipt.transaction_hash,
+                                },
+                                ReceiptClass::Pending => SendOutcome::Pending {
+                                    tx_hash: receipt.transaction_hash,
+                                },
                                 ReceiptClass::DestinationFailed { dispatcher } => {
-                                    SendOutcome::DestinationFailed { dispatcher }
+                                    SendOutcome::DestinationFailed {
+                                        dispatcher,
+                                        tx_hash: receipt.transaction_hash,
+                                    }
                                 }
                             };
                         }
@@ -1348,19 +1444,27 @@ async fn handle_job<P: Provider + Clone + 'static>(
     };
 
     match outcome {
-        SendOutcome::Succeeded => {
+        SendOutcome::Succeeded { tx_hash } => {
             metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::Succeeded);
             metrics.observe_time_to_deliver(started.elapsed());
             info!(
                 chain_key = route.chain_key,
                 message_id = %job.message_id,
+                tx = %tx_hash,
                 signer_count = job.signer_count,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "✅ message delivered"
             );
+            outcomes.record(
+                job.message_id,
+                DeliveryOutcome::new(OutcomeKind::Delivered, route.chain_key).with_tx(tx_hash),
+            );
             Ok(DeliveryResultKind::Delivered)
         }
-        SendOutcome::DestinationFailed { dispatcher } => {
+        SendOutcome::DestinationFailed {
+            dispatcher,
+            tx_hash,
+        } => {
             // Delivered and consumed (processedAt set) — the relayer is paid on claim — but the
             // destination call failed for good. Nothing to retry: `retryPendingMessage` reverts
             // `MessageNotPending`. Surfaced distinctly so a misbehaving destination dApp shows up
@@ -1371,10 +1475,19 @@ async fn handle_job<P: Provider + Clone + 'static>(
                 chain_key = route.chain_key,
                 message_id = %job.message_id,
                 %dispatcher,
+                tx = %tx_hash,
                 signer_count = job.signer_count,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "⚠️ message delivered but the destination call FAILED (MessageExecutionFailed) — \
                  consumed on-chain, no retry possible; delivery still counts for the fee claim"
+            );
+            outcomes.record(
+                job.message_id,
+                DeliveryOutcome::new(OutcomeKind::DestinationFailed, route.chain_key)
+                    .with_tx(tx_hash)
+                    .with_reason(format!(
+                        "MessageExecutionFailed: the destination call reverted (dispatcher {dispatcher})"
+                    )),
             );
             Ok(DeliveryResultKind::Delivered)
         }
@@ -1385,15 +1498,26 @@ async fn handle_job<P: Provider + Clone + 'static>(
                 message_id = %job.message_id,
                 "↩️ another relayer already delivered — idempotent success"
             );
+            outcomes.record(
+                job.message_id,
+                DeliveryOutcome::new(OutcomeKind::Delivered, route.chain_key)
+                    .with_reason("delivered by another relayer (AlreadyValidated)"),
+            );
             Ok(DeliveryResultKind::Delivered)
         }
-        SendOutcome::Pending => {
+        SendOutcome::Pending { tx_hash } => {
             metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::Pending);
             warn!(
                 chain_key = route.chain_key,
                 message_id = %job.message_id,
                 "⚠️ votes validated but the dispatcher deferred/queued the message — left pending; \
                  scheduling bounded retryPendingMessage attempts"
+            );
+            outcomes.record(
+                job.message_id,
+                DeliveryOutcome::new(OutcomeKind::Pending, route.chain_key)
+                    .with_tx(tx_hash)
+                    .with_reason("MessagePending: the dispatcher deferred the message"),
             );
             // The votes are consumed on-chain (`validatedMessages[messageId] = true`), so from the
             // pool's perspective delivery is complete — a re-dispatch would revert as a duplicate.
@@ -1405,6 +1529,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
                 *inbox.address(),
                 job.message_id,
                 route.chain_key,
+                outcomes.clone(),
             );
             Ok(DeliveryResultKind::Delivered)
         }
@@ -1416,6 +1541,11 @@ async fn handle_job<P: Provider + Clone + 'static>(
                 revert = ?revert,
                 %reason,
                 "❌ delivery reverted; no further retries"
+            );
+            outcomes.record(
+                job.message_id,
+                DeliveryOutcome::new(OutcomeKind::Terminal, route.chain_key)
+                    .with_reason(format!("delivery reverted ({revert:?}): {reason}")),
             );
             Ok(DeliveryResultKind::Terminal)
         }
@@ -1505,15 +1635,20 @@ async fn replay_revert_reason<P: Provider>(
 
 #[derive(Debug)]
 enum SendOutcome {
-    Succeeded,
+    Succeeded {
+        tx_hash: B256,
+    },
     AlreadyValidated,
     /// Tx succeeded but the receipt carries `MessagePending` — the dispatcher deferred/queued the
     /// message and it is stored for `retryPendingMessage`.
-    Pending,
+    Pending {
+        tx_hash: B256,
+    },
     /// Tx succeeded and the receipt carries `MessageExecutionFailed` (#36): the destination call
     /// failed, the message is consumed, no retry is possible.
     DestinationFailed {
         dispatcher: Address,
+        tx_hash: B256,
     },
     /// Deterministic revert (mined-and-reverted, or revert at send/estimation time). `revert` is
     /// the classification when one was possible; it selects the metric label.
@@ -1538,6 +1673,7 @@ fn spawn_pending_retry<P: Provider + 'static>(
     inbox_address: Address,
     message_id: B256,
     chain_key: u64,
+    outcomes: Arc<OutcomeStore>,
 ) {
     tokio::spawn(async move {
         let inbox = IInbox::new(inbox_address, &provider);
@@ -1555,6 +1691,25 @@ fn spawn_pending_retry<P: Provider + 'static>(
             match inbox.isPending(message_id).call().await {
                 Ok(ret) if !ret => {
                     info!(chain_key, %message_id, "♻️ pending message already resolved");
+                    // Consumed by someone else's `retryPendingMessage` (or a dApp user's, or our
+                    // own retry whose receipt we never saw). `isPending == false` says only that
+                    // it is no longer pending — #36 clears it on `MessageExecutionFailed` too — so
+                    // do NOT claim `Delivered`: keep the `Pending` verdict and its original tx
+                    // hash, and say the final result was not observed.
+                    if let Some(prev) = outcomes.get(&message_id) {
+                        outcomes.record(
+                            message_id,
+                            DeliveryOutcome {
+                                reason: Some(
+                                    "no longer pending on-chain (resolved by another party or an \
+                                     unobserved retry); final destination result not observed — \
+                                     check the Inbox's MessageDelivered / MessageExecutionFailed logs"
+                                        .into(),
+                                ),
+                                ..prev
+                            },
+                        );
+                    }
                     return;
                 }
                 Ok(_) => {}
@@ -1590,13 +1745,28 @@ fn spawn_pending_retry<P: Provider + 'static>(
                         Ok(Ok(receipt)) if receipt.status() => {
                             // Executed — or (#36) consumed as a destination failure: either way
                             // the message is no longer pending.
+                            let tx_hash = receipt.transaction_hash;
                             match classify_success_logs(inbox_address, receipt.inner.logs()) {
                                 ReceiptClass::DestinationFailed { dispatcher } => {
-                                    warn!(chain_key, %message_id, %dispatcher,
+                                    warn!(chain_key, %message_id, %dispatcher, tx = %tx_hash,
                                         "♻️ retryPendingMessage consumed the message but the destination call FAILED (MessageExecutionFailed)");
+                                    outcomes.record(
+                                        message_id,
+                                        DeliveryOutcome::new(OutcomeKind::DestinationFailed, chain_key)
+                                            .with_tx(tx_hash)
+                                            .with_reason(format!(
+                                                "MessageExecutionFailed on retryPendingMessage (dispatcher {dispatcher})"
+                                            )),
+                                    );
                                 }
                                 _ => {
-                                    info!(chain_key, %message_id, "♻️ retryPendingMessage succeeded")
+                                    info!(chain_key, %message_id, tx = %tx_hash, "♻️ retryPendingMessage succeeded");
+                                    outcomes.record(
+                                        message_id,
+                                        DeliveryOutcome::new(OutcomeKind::Delivered, chain_key)
+                                            .with_tx(tx_hash)
+                                            .with_reason("delivered by retryPendingMessage"),
+                                    );
                                 }
                             }
                             return;

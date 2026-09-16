@@ -503,18 +503,22 @@ impl MetricsTrait for RelayerMetrics {
     }
 }
 
-/// Build the HTTP surface (`/metrics` + `/health` + `/votes/{message_hash}`). `query_tx` reaches the
-/// vote pool so the votes endpoint can serve the live accumulated bundle for a message.
+/// Build the HTTP surface (`/metrics` + `/health` + `/votes/{message_hash}` + `/outcomes`).
+/// `query_tx` reaches the vote pool so the votes endpoint can serve the live accumulated bundle for
+/// a message; `outcomes` is the delivery workers' record of terminal verdicts.
 pub fn build_router(
     metrics: Arc<RelayerMetrics>,
     query_tx: tokio::sync::mpsc::Sender<crate::pool::PoolQuery>,
     health: Arc<crate::health::Health>,
+    outcomes: Arc<crate::outcome::OutcomeStore>,
 ) -> axum::Router {
     use axum::routing::get;
     use axum::Extension;
 
     axum::Router::new()
         .route("/health", get(health_handler))
+        .route("/outcomes/{message_id}", get(outcome_handler))
+        .route("/outcomes", get(outcomes_handler))
         .route(
             "/metrics",
             get(
@@ -529,6 +533,75 @@ pub fn build_router(
         .layer(Extension(metrics))
         .layer(Extension(query_tx))
         .layer(Extension(health))
+        .layer(Extension(outcomes))
+}
+
+/// `GET /outcomes/{message_id}` — the delivery worker's terminal verdict for one message
+/// (`delivered` with the destination tx, `destination_failed`, `pending`, `undeliverable`,
+/// `terminal`). 404 when the relayer reached no verdict: never seen, still in flight (ask
+/// `/votes`), or evicted from the bounded store.
+async fn outcome_handler(
+    axum::extract::Path(id_str): axum::extract::Path<String>,
+    axum::Extension(outcomes): axum::Extension<Arc<crate::outcome::OutcomeStore>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Ok(message_id) = id_str.parse::<alloy::primitives::B256>() else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "message_id must be 0x-prefixed 32-byte hex",
+        )
+            .into_response();
+    };
+    match outcomes.get(&message_id) {
+        Some(outcome) => axum::Json(outcome).into_response(),
+        None => (axum::http::StatusCode::NOT_FOUND, "no outcome recorded").into_response(),
+    }
+}
+
+/// Upper bound on ids per `/outcomes?ids=` request — one dashboard page of messages.
+const OUTCOMES_BATCH_MAX: usize = 256;
+
+#[derive(serde::Deserialize)]
+struct OutcomesQuery {
+    /// Comma-separated 0x-prefixed 32-byte message ids.
+    ids: String,
+}
+
+/// `GET /outcomes?ids=0x…,0x…` — batch form of [`outcome_handler`]: a JSON object keyed by message
+/// id holding the verdict for every id that has one. Ids without a verdict are simply absent, so
+/// one round trip answers a whole table. 400 on a malformed id or more than
+/// [`OUTCOMES_BATCH_MAX`] ids.
+async fn outcomes_handler(
+    axum::extract::Query(q): axum::extract::Query<OutcomesQuery>,
+    axum::Extension(outcomes): axum::Extension<Arc<crate::outcome::OutcomeStore>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let mut ids = Vec::new();
+    for part in q.ids.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match part.parse::<alloy::primitives::B256>() {
+            Ok(id) => ids.push(id),
+            Err(_) => {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    format!("bad message id: {part}"),
+                )
+                    .into_response();
+            }
+        }
+    }
+    if ids.len() > OUTCOMES_BATCH_MAX {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("at most {OUTCOMES_BATCH_MAX} ids per request"),
+        )
+            .into_response();
+    }
+    let found: std::collections::BTreeMap<String, crate::outcome::DeliveryOutcome> = outcomes
+        .get_many(&ids)
+        .into_iter()
+        .map(|(id, o)| (format!("{id:#x}"), o))
+        .collect();
+    axum::Json(found).into_response()
 }
 
 /// `GET /health` — `200 ok` when every registered worker has reported progress within the deadline,
