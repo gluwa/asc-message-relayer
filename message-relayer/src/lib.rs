@@ -42,6 +42,7 @@ pub mod delivery;
 pub mod events;
 pub mod hash;
 pub mod health;
+pub mod outcome;
 pub mod p2p;
 pub mod pacing;
 pub mod pending;
@@ -173,6 +174,9 @@ impl Server {
         let mut delivery_txs: HashMap<u64, mpsc::Sender<DeliveryJob>> = HashMap::new();
         let (delivery_result_tx, delivery_result_rx) =
             mpsc::channel::<delivery::DeliveryResult>(DELIVERY_CHANNEL_CAP);
+        // Terminal per-message verdicts (delivered / destination failed / undeliverable …), written
+        // by the delivery workers and served over `/outcomes` for operators and the dashboard.
+        let outcomes = Arc::new(outcome::OutcomeStore::new(outcome::DEFAULT_CAP));
 
         let mut tasks = JoinSet::new();
 
@@ -192,6 +196,7 @@ impl Server {
                     metrics.clone(),
                     health.clone(),
                     broadcast_locks.clone(),
+                    outcomes.clone(),
                     cancel.clone(),
                 ),
             );
@@ -438,7 +443,12 @@ impl Server {
                 )
             })?;
         let bind_addr = SocketAddr::new(ip, self.config.bind_port);
-        let app = prom::build_router(self.prom_metrics.clone(), query_tx, health.clone());
+        let app = prom::build_router(
+            self.prom_metrics.clone(),
+            query_tx,
+            health.clone(),
+            outcomes.clone(),
+        );
         let listener = tokio::net::TcpListener::bind(bind_addr)
             .await
             .with_context(|| format!("failed to bind HTTP listener at {bind_addr}"))?;
