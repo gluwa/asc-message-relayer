@@ -1691,13 +1691,25 @@ fn spawn_pending_retry<P: Provider + 'static>(
             match inbox.isPending(message_id).call().await {
                 Ok(ret) if !ret => {
                     info!(chain_key, %message_id, "♻️ pending message already resolved");
-                    // Consumed by someone else's `retryPendingMessage` (or a dApp user's); we did
-                    // not see the receipt, so the verdict carries no tx hash.
-                    outcomes.record(
-                        message_id,
-                        DeliveryOutcome::new(OutcomeKind::Delivered, chain_key)
-                            .with_reason("pending message resolved on-chain by another party"),
-                    );
+                    // Consumed by someone else's `retryPendingMessage` (or a dApp user's, or our
+                    // own retry whose receipt we never saw). `isPending == false` says only that
+                    // it is no longer pending — #36 clears it on `MessageExecutionFailed` too — so
+                    // do NOT claim `Delivered`: keep the `Pending` verdict and its original tx
+                    // hash, and say the final result was not observed.
+                    if let Some(prev) = outcomes.get(&message_id) {
+                        outcomes.record(
+                            message_id,
+                            DeliveryOutcome {
+                                reason: Some(
+                                    "no longer pending on-chain (resolved by another party or an \
+                                     unobserved retry); final destination result not observed — \
+                                     check the Inbox's MessageDelivered / MessageExecutionFailed logs"
+                                        .into(),
+                                ),
+                                ..prev
+                            },
+                        );
+                    }
                     return;
                 }
                 Ok(_) => {}
