@@ -97,9 +97,9 @@ pub fn targets_from_routes(
 /// Providers are built lazily and dropped on a failed read, so the next tick re-dials rather than
 /// retrying a dead socket forever. Health is heartbeated once per completed sweep — including a
 /// sweep where every RPC read failed. That is deliberately weaker than the indexing workers'
-/// success-only heartbeat: an unreachable RPC already starves *their* heartbeats and trips the
-/// restart, and this auxiliary worker adding a second finger to that trigger would only make the
-/// restart storm worse while the metric it maintains is a nice-to-have.
+/// success-only heartbeat: an unreachable RPC already marks *them* degraded on `/health`, and
+/// this auxiliary worker adding its own verdict for the same outage would only add noise while
+/// the metric it maintains is a nice-to-have.
 pub async fn run(
     targets: Vec<BalanceTarget>,
     metrics: Arc<dyn MetricsTrait>,
@@ -254,8 +254,12 @@ mod tests {
         // any positive age, a registered component is stale and only a never-registered one
         // keeps /health green.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let (alive, stale) = health.status();
-        assert!(alive, "idle balance watcher poisoned /health via {stale:?}");
+        let report = health.status();
+        assert!(
+            report.is_alive(),
+            "idle balance watcher poisoned /health via {:?}",
+            report.stale
+        );
     }
 
     /// An unparseable key is the used-by worker's error to raise with full context; the balance

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, B256};
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::Provider;
 use alloy::rpc::types::Filter;
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
@@ -97,24 +97,29 @@ pub async fn watch_outbox(
     let health_key = checkpoint_key.clone();
     // Register at startup so a watcher that wedges before its first successful scan still goes stale.
     health.heartbeat(&health_key);
-    let provider = ProviderBuilder::new()
-        .connect(&creditcoin_eth_rpc_url)
+    // The source-chain provider lives in a rebuilding slot: after `rpc::REBUILD_AFTER_FAILURES`
+    // failed scans it is dropped and re-dialed on the next tick, so a dead transport heals
+    // in-process instead of through a liveness restart (see `crate::health`). The slot hands out
+    // type-erased handles, which is also what `resolve()` needs through the `dyn OutboxResolver`
+    // trait object; cloning one is cheap (Arc-backed transport).
+    let mut source_rpc = crate::rpc::Reconnecting::new(
+        format!("outbox:{chain_key} source"),
+        creditcoin_eth_rpc_url.clone(),
+    );
+    let provider = source_rpc
+        .connect()
         .await
         .with_context(|| {
             format!(
                 "chain_key {chain_key}: failed to connect to Creditcoin EVM RPC at {creditcoin_eth_rpc_url}"
             )
-        })?;
-
-    // `resolve()` needs a type-erased provider so it can be called through the `dyn OutboxResolver`
-    // trait object; cloning the concrete provider is cheap (Arc-backed transport) and leaves
-    // `provider` itself free for the rest of this function's direct, generic-typed calls.
-    let dyn_provider = provider.clone().erased();
+        })?
+        .clone();
 
     // Startup bootstrap: retry until `resolve()` produces an address — resolves on the first try
     // or not at all (a registry read is a single atomic lookup, nothing to catch up on).
     let resolved = loop {
-        match resolver.resolve(&route, &dyn_provider).await {
+        match resolver.resolve(&route, &provider).await {
             Ok(resolved) => break resolved,
             Err(err) => {
                 warn!(chain_key, %err, "outbox resolution not ready yet; retrying");
@@ -240,7 +245,14 @@ pub async fn watch_outbox(
                 return Ok(());
             }
             _ = resolve_tick.tick() => {
-                match resolver.resolve(&route, &dyn_provider).await {
+                let provider = match source_rpc.connect().await {
+                    Ok(provider) => provider.clone(),
+                    Err(err) => {
+                        warn!(chain_key, %err, "outbox re-resolution skipped; source RPC not connectable");
+                        continue;
+                    }
+                };
+                match resolver.resolve(&route, &provider).await {
                     Ok(fresh) => {
                         if fresh.address != outbox {
                             // Switching now would abandon any not-yet-scanned MessagePublished
@@ -279,22 +291,31 @@ pub async fn watch_outbox(
                 }
             }
             _ = tick.tick() => {
-                match poll_once(
-                    chain_key,
-                    outbox,
-                    destination_chain_key,
-                    creditcoin_chain_id,
-                    &policy,
-                    &mut finality,
-                    &provider,
-                    &mut last_seen,
-                    &indexed_tx,
-                    metrics.as_ref(),
-                    &cancel,
-                ).await {
+                let scan = match source_rpc.connect().await {
+                    Ok(provider) => {
+                        let provider = provider.clone();
+                        poll_once(
+                            chain_key,
+                            outbox,
+                            destination_chain_key,
+                            creditcoin_chain_id,
+                            &policy,
+                            &mut finality,
+                            &provider,
+                            &mut last_seen,
+                            &indexed_tx,
+                            metrics.as_ref(),
+                            &cancel,
+                        ).await
+                    }
+                    Err(err) => Err(err),
+                };
+                match scan {
                     Ok(()) => {
-                        // Successful scan = forward progress; a dead provider errors here instead,
-                        // so the heartbeat goes stale and /health trips a restart (C2r).
+                        // Successful scan = forward progress (C2r). A failing provider reports an
+                        // error below instead: the worker shows as degraded, and after a streak
+                        // the provider is re-dialed; only a *silent* worker trips a restart.
+                        source_rpc.note_ok();
                         health.heartbeat(&health_key);
                         if let Some(cp) = &checkpoint {
                             // Clamp the *persisted* cursor to before the pool's oldest undelivered
@@ -312,7 +333,11 @@ pub async fn watch_outbox(
                             }
                         }
                     }
-                    Err(err) => warn!(chain_key, %err, "outbox poll iteration failed; will retry"),
+                    Err(err) => {
+                        health.error(&health_key);
+                        source_rpc.note_err();
+                        warn!(chain_key, %err, "outbox poll iteration failed; will retry");
+                    }
                 }
             }
         }
@@ -432,15 +457,24 @@ async fn poll_once<P: Provider>(
                 // logs and the cursor advances past them), so they must not be dropped: block if
                 // the pool is briefly saturated, but bail promptly on shutdown.
                 tokio::select! {
-                    res = indexed_tx.send(indexed) => {
-                        if res.is_err() {
-                            error!(chain_key, "vote pool channel closed — exiting watcher");
-                            anyhow::bail!("vote pool channel closed");
-                        }
-                    }
+                    // Cancel first: on shutdown the pool drops its receiver at the same instant
+                    // the token fires, and without `biased` the closed-channel arm could win and
+                    // turn an orderly exit into an ERROR (the set-update aggregator did exactly
+                    // that on 2026-09-17 and misled the incident report).
+                    biased;
                     () = cancel.cancelled() => {
                         debug!(chain_key, "cancel during indexed dispatch; stopping poll");
                         return Ok(());
+                    }
+                    res = indexed_tx.send(indexed) => {
+                        if res.is_err() {
+                            if cancel.is_cancelled() {
+                                debug!(chain_key, "cancel during indexed dispatch; stopping poll");
+                                return Ok(());
+                            }
+                            error!(chain_key, "vote pool channel closed outside shutdown — exiting watcher");
+                            anyhow::bail!("vote pool channel closed");
+                        }
                     }
                 }
             }

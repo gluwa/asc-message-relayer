@@ -129,6 +129,7 @@ pub struct RelayerMetrics {
     #[allow(dead_code)]
     start_time_seconds: Gauge<f64, AtomicU64>,
     worker_last_success: Family<LabelWorker, Gauge<f64, AtomicU64>>,
+    worker_degraded: Family<LabelWorker, Gauge<i64, AtomicI64>>,
 }
 
 impl RelayerMetrics {
@@ -290,6 +291,18 @@ impl RelayerMetrics {
             worker_last_success.clone(),
         );
 
+        let worker_degraded = Family::default();
+        registry.register(
+            "relayer_worker_degraded",
+            "1 while the worker has made no successful poll within the health deadline but is \
+             still ticking and erroring (upstream outage, rate limit) — alive, retrying and \
+             rebuilding its provider, so /health stays 200 and no restart happens; 0 otherwise. A \
+             worker that is silent (neither success nor error) is not degraded but stale, which \
+             fails /health — see relayer_worker_last_success_timestamp_seconds. Synced at scrape \
+             time from the /health registry.",
+            worker_degraded.clone(),
+        );
+
         registry.register(
             "relayer_server",
             "Relayer information",
@@ -324,6 +337,7 @@ impl RelayerMetrics {
             thread_count,
             start_time_seconds,
             worker_last_success,
+            worker_degraded,
         }
     }
 
@@ -334,11 +348,18 @@ impl RelayerMetrics {
     /// unincremented counter family would emit nothing and absence is indistinguishable from
     /// health, the exact trap this metric closes).
     pub fn sync_worker_progress(&self, health: &crate::health::Health) {
+        let report = health.status();
         for (worker, last_ms) in health.snapshot() {
+            let degraded = i64::from(report.degraded.contains(&worker));
             #[allow(clippy::cast_precision_loss)] // unix millis fit f64 exactly until year 287396
             self.worker_last_success
-                .get_or_create(&LabelWorker { worker })
+                .get_or_create(&LabelWorker {
+                    worker: worker.clone(),
+                })
                 .set(last_ms as f64 / 1000.0);
+            self.worker_degraded
+                .get_or_create(&LabelWorker { worker })
+                .set(degraded);
         }
     }
 
@@ -604,19 +625,33 @@ async fn outcomes_handler(
     axum::Json(found).into_response()
 }
 
-/// `GET /health` — `200 ok` when every registered worker has reported progress within the deadline,
-/// `503` naming the stale worker(s) otherwise, so the k8s liveness probe restarts a wedged relayer.
+/// `GET /health` — `200 ok` when every registered worker has reported progress within the deadline;
+/// `200` naming the *degraded* worker(s) when some are erroring without progress (alive, retrying,
+/// not restart-worthy — see `crate::health`); `503` naming the *stale* worker(s) when one has gone
+/// silent, so the k8s liveness probe restarts a wedged relayer. Uses `Health::report`, which logs
+/// each transition, so the probe failure is attributable from the pod log.
 async fn health_handler(
     axum::Extension(health): axum::Extension<Arc<crate::health::Health>>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    match health.status() {
-        (true, _) => (axum::http::StatusCode::OK, "ok").into_response(),
-        (false, stale) => (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            format!("stale workers: {}", stale.join(", ")),
-        )
-            .into_response(),
+    let report = health.report();
+    let degraded = if report.degraded.is_empty() {
+        String::new()
+    } else {
+        format!("degraded workers: {}", report.degraded.join(", "))
+    };
+    if !report.is_alive() {
+        let mut body = format!("stale workers: {}", report.stale.join(", "));
+        if !degraded.is_empty() {
+            body.push_str("; ");
+            body.push_str(&degraded);
+        }
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response();
+    }
+    if degraded.is_empty() {
+        (axum::http::StatusCode::OK, "ok").into_response()
+    } else {
+        (axum::http::StatusCode::OK, degraded).into_response()
     }
 }
 
@@ -855,6 +890,32 @@ mod tests {
         assert!(
             (1.0e9..1.0e10).contains(&value),
             "expected unix SECONDS (~1.7e9), got {value} — a ms/seconds mixup breaks time()-based alerts"
+        );
+    }
+
+    /// The 2026-09-17 shape on the wire: a Base worker erroring past the deadline must show as
+    /// `relayer_worker_degraded{worker="ack:9"} 1` while a healthy worker on the same scrape is
+    /// present at 0 — present, so `absent()` alerting cannot confuse "healthy" with "never
+    /// registered".
+    #[test]
+    fn degraded_worker_reaches_the_scrape_body() {
+        let m = RelayerMetrics::new(&[8, 9]);
+        let h = crate::health::Health::new(Duration::from_secs(5 * 60));
+        h.set_for_test(
+            "ack:9",
+            Duration::from_secs(6 * 60),
+            Some(Duration::from_secs(20)),
+        );
+        h.heartbeat("ack:8");
+        m.sync_worker_progress(&h);
+        let body = m.encode();
+        assert!(
+            body.contains("relayer_worker_degraded{worker=\"ack:9\"} 1"),
+            "erroring-without-progress worker must be degraded=1:\n{body}"
+        );
+        assert!(
+            body.contains("relayer_worker_degraded{worker=\"ack:8\"} 0"),
+            "healthy worker must be present at degraded=0:\n{body}"
         );
     }
 

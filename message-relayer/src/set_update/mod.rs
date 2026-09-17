@@ -308,6 +308,11 @@ pub async fn run(
 
     loop {
         tokio::select! {
+            // Cancel first. On shutdown the p2p/spy vote source drops its sender at the same
+            // instant the token fires; without `biased` the closed-channel arm below could win the
+            // race and log an ERROR for an orderly exit. It did, at 05:19:39 UTC on 2026-09-17,
+            // and the network report read that line as the reason the relayer exited.
+            biased;
             () = cancel.cancelled() => {
                 info!("🛑 attestor-set-update aggregator exiting on cancel");
                 return Ok(());
@@ -336,6 +341,10 @@ pub async fn run(
                         Err(err) => {
                             rate_limited = rate_limited
                                 || crate::pacing::error_looks_rate_limited(&format!("{err:#}"));
+                            // Still ticking: degraded rather than stale (see `crate::health`).
+                            // `refresh` dials a fresh provider every time, so there is nothing
+                            // further to rebuild here.
+                            health.error(&health_key(*chain_key));
                             warn!(%chain_key, %err, "attestor-set-update: on-chain refresh failed; keeping last-known view");
                         }
                     }
@@ -356,9 +365,16 @@ pub async fn run(
                 match maybe {
                     Some(vote) => handle_vote(&mut states, &broadcast_locks, vote).await,
                     None => {
-                        // All senders dropped — the p2p/spy source is gone.
-                        error!("attestor-set-update vote channel closed — exiting");
-                        return Ok(());
+                        // All senders dropped. During shutdown that is the vote source draining
+                        // ahead of us (the `biased` cancel arm normally wins, this is the backstop);
+                        // outside shutdown the p2p/spy source is gone and the supervisor should
+                        // hear about it as a failure, not a clean exit.
+                        if cancel.is_cancelled() {
+                            info!("🛑 attestor-set-update aggregator exiting on cancel");
+                            return Ok(());
+                        }
+                        error!("attestor-set-update vote channel closed outside shutdown — the p2p/spy vote source is gone; exiting");
+                        anyhow::bail!("attestor-set-update vote channel closed outside shutdown");
                     }
                 }
             }
