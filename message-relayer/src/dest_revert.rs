@@ -173,14 +173,28 @@ fn panic_kind_name(kind: PanicKind) -> &'static str {
     }
 }
 
-/// Revert bytes carried by an `eth_call` error, from the structured JSON-RPC `data` first and the
-/// node's error string second (Creditcoin-style `data: "0x…"` dialect).
-fn revert_bytes(err: &RpcError<TransportErrorKind>) -> Vec<u8> {
-    err.as_error_resp()
+/// What an `eth_call` error was: an EVM revert (with whatever data the contract returned, possibly
+/// none), or the RPC not answering the question at all (transport failure, rate limit, method not
+/// supported), which must not be mistaken for a bare revert.
+enum CallFailure {
+    Reverted(Vec<u8>),
+    Rpc(String),
+}
+
+fn classify_call_error(err: &RpcError<TransportErrorKind>) -> CallFailure {
+    let text = err.to_string();
+    // Structured JSON-RPC `data` first (geth-style nodes), the `data: "0x…"` field of the error
+    // string second (Creditcoin-style nodes), then the plain "execution reverted" wording.
+    let data = err
+        .as_error_resp()
         .and_then(|payload| payload.as_revert_data())
         .map(|b| b.to_vec())
-        .or_else(|| crate::revert::revert_data(&err.to_string()))
-        .unwrap_or_default()
+        .or_else(|| crate::revert::revert_data(&text));
+    match data {
+        Some(data) => CallFailure::Reverted(data),
+        None if crate::revert::is_revert(&text) => CallFailure::Reverted(Vec::new()),
+        None => CallFailure::Rpc(text),
+    }
 }
 
 /// Replay the destination call the dispatcher made for `payload` and explain why it reverted.
@@ -190,7 +204,8 @@ fn revert_bytes(err: &RpcError<TransportErrorKind>) -> Vec<u8> {
 /// `delegatecall`). `emitter` is appended to the calldata exactly as the dispatcher does.
 /// `block` is the delivery receipt's block so the replay sees the same state.
 ///
-/// `None` when the payload is not an envelope (nothing to replay) or the RPC did not answer.
+/// `None` when the payload is not an envelope (nothing to replay) or the RPC did not answer, so
+/// the caller can say "not recoverable" rather than invent a reason.
 pub async fn probe_destination_revert<P: Provider>(
     provider: &P,
     dispatcher: Address,
@@ -202,38 +217,76 @@ pub async fn probe_destination_revert<P: Provider>(
         <(Address, U256, U256, Bytes)>::abi_decode_params(payload).ok()?;
     let mut input = payload_data.to_vec();
     input.extend_from_slice(emitter.as_slice());
+    let at = block.map_or(BlockId::latest(), BlockId::number);
+    let at_text = block.map_or_else(|| "latest".to_string(), |b| b.to_string());
+
+    // A raw `eth_call` to an address with no code *succeeds* (nothing runs), but the dispatcher
+    // treats it as a failed destination — so check the code first or an empty destination would
+    // read as "succeeds when replayed".
+    match provider.get_code_at(destination).block_id(at).await {
+        Ok(code) if code.is_empty() => {
+            return Some(format!(
+                "the envelope destination {destination} has no code at block {at_text} — nothing \
+                 to call (wrong address, wrong chain, or not deployed yet)"
+            ));
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::debug!(%err, %destination, "destination code lookup failed; replaying anyway");
+        }
+    }
 
     let base = TransactionRequest::default()
         .with_from(dispatcher)
         .with_to(destination)
         .with_input(Bytes::from(input))
         .with_value(native_value);
-    let at = block.map_or(BlockId::latest(), BlockId::number);
     let gas: u64 = gas_limit.try_into().unwrap_or(u64::MAX);
 
-    match provider
+    let capped = provider
         .call(base.clone().with_gas_limit(gas))
         .block(at)
-        .await
-    {
-        Ok(_) => Some(format!(
-            "the destination call succeeds when replayed at block {} with the envelope gasLimit \
-             {gas} — the failure was state-dependent (balance or allowance changed since, or the \
-             dispatcher's overhead on top of gasLimit)",
-            block.map_or_else(|| "latest".to_string(), |b| b.to_string())
-        )),
-        Err(err) => {
-            let data = revert_bytes(&err);
-            // Empty data is what an out-of-gas looks like. Retry without the cap: if the call
-            // then passes, the gasLimit was the problem.
-            if data.is_empty() && provider.call(base).block(at).await.is_ok() {
-                return Some(format!(
-                    "out of gas: the destination call needs more than the envelope gasLimit \
-                     {gas}; quote at least 300 000 for calls through the router"
-                ));
-            }
-            Some(describe_revert_data(&data))
+        .await;
+    let data = match capped {
+        Ok(_) => {
+            return Some(format!(
+                "the destination call succeeds when replayed at block {at_text} with the envelope \
+                 gasLimit {gas} — the failure was state-dependent (balance or allowance changed \
+                 since) or the dispatcher's own overhead on top of gasLimit"
+            ));
         }
+        Err(err) => match classify_call_error(&err) {
+            CallFailure::Reverted(data) => data,
+            CallFailure::Rpc(text) => {
+                tracing::debug!(error = %text, "destination replay did not get an EVM answer");
+                return None;
+            }
+        },
+    };
+    if !data.is_empty() {
+        return Some(describe_revert_data(&data));
+    }
+
+    // Empty revert data is what an out-of-gas looks like, but also a bare `revert()`. Replay
+    // without the gas cap to tell them apart: passing means the gasLimit was the problem; a
+    // revert *with* data means the cap hid the real reason and that data is the answer; the same
+    // empty revert means it is genuinely a bare revert.
+    match provider.call(base).block(at).await {
+        Ok(_) => Some(format!(
+            "out of gas: the destination call needs more than the envelope gasLimit {gas}; quote \
+             at least 300 000 for calls through the router"
+        )),
+        Err(err) => match classify_call_error(&err) {
+            CallFailure::Reverted(uncapped) if !uncapped.is_empty() => Some(format!(
+                "{} (the reason surfaced only when replayed without the {gas} gasLimit cap)",
+                describe_revert_data(&uncapped)
+            )),
+            CallFailure::Reverted(_) => Some(describe_revert_data(&[])),
+            CallFailure::Rpc(text) => {
+                tracing::debug!(error = %text, "uncapped destination replay did not get an EVM answer");
+                Some(describe_revert_data(&[]))
+            }
+        },
     }
 }
 
