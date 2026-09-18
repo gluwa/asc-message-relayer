@@ -974,11 +974,9 @@ fn describe_unknown_revert(err: &alloy::contract::Error, payload: &[u8]) -> Stri
         .map(|d| d.to_vec())
         .or_else(|| revert_data(&err.to_string()));
     match data {
-        Some(data) if data.len() >= 4 => format!(
-            "custom error selector 0x{} ({} bytes of revert data)",
-            hex::encode(&data[..4]),
-            data.len()
-        ),
+        // Decode what we can (Error(string), Panic, the OZ custom errors, our own); an unknown
+        // selector still comes out as `custom error 0x… (N bytes)`.
+        Some(data) if data.len() >= 4 => crate::dest_revert::describe_revert_data(&data),
         _ => {
             let looks_like_envelope = envelope_terms(payload).gas_limit.is_some();
             if looks_like_envelope {
@@ -1305,6 +1303,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
                                     SendOutcome::DestinationFailed {
                                         dispatcher,
                                         tx_hash: receipt.transaction_hash,
+                                        block_number: receipt.block_number,
                                     }
                                 }
                             };
@@ -1464,6 +1463,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
         SendOutcome::DestinationFailed {
             dispatcher,
             tx_hash,
+            block_number,
         } => {
             // Delivered and consumed (processedAt set) — the relayer is paid on claim — but the
             // destination call failed for good. Nothing to retry: `retryPendingMessage` reverts
@@ -1471,11 +1471,29 @@ async fn handle_job<P: Provider + Clone + 'static>(
             // as its own series instead of inflating `Succeeded`.
             metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::DestinationFailed);
             metrics.observe_time_to_deliver(started.elapsed());
+            // The receipt does not say why the dApp reverted (the dispatcher swallowed the revert
+            // bytes), so replay the destination call at the delivery block and decode what comes
+            // back. Best-effort and bounded: a silent RPC leaves the reason at the generic text.
+            let detail = tokio::time::timeout(
+                FUNDED_GAS_READ_TIMEOUT,
+                crate::dest_revert::probe_destination_revert(
+                    provider,
+                    dispatcher,
+                    job.emitter,
+                    &job.payload,
+                    block_number,
+                ),
+            )
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "revert reason not recoverable (replay failed or timed out)".into());
             warn!(
                 chain_key = route.chain_key,
                 message_id = %job.message_id,
                 %dispatcher,
                 tx = %tx_hash,
+                revert = %detail,
                 signer_count = job.signer_count,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "⚠️ message delivered but the destination call FAILED (MessageExecutionFailed) — \
@@ -1486,7 +1504,8 @@ async fn handle_job<P: Provider + Clone + 'static>(
                 DeliveryOutcome::new(OutcomeKind::DestinationFailed, route.chain_key)
                     .with_tx(tx_hash)
                     .with_reason(format!(
-                        "MessageExecutionFailed: the destination call reverted (dispatcher {dispatcher})"
+                        "MessageExecutionFailed: the destination call reverted (dispatcher \
+                         {dispatcher}): {detail}"
                     )),
             );
             Ok(DeliveryResultKind::Delivered)
@@ -1645,10 +1664,12 @@ enum SendOutcome {
         tx_hash: B256,
     },
     /// Tx succeeded and the receipt carries `MessageExecutionFailed` (#36): the destination call
-    /// failed, the message is consumed, no retry is possible.
+    /// failed, the message is consumed, no retry is possible. `block_number` is where it mined,
+    /// so the destination call can be replayed against that state to learn *why* it failed.
     DestinationFailed {
         dispatcher: Address,
         tx_hash: B256,
+        block_number: Option<u64>,
     },
     /// Deterministic revert (mined-and-reverted, or revert at send/estimation time). `revert` is
     /// the classification when one was possible; it selects the metric label.
