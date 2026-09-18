@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 
 use alloy::network::{Ethereum, EthereumWallet};
 use alloy::primitives::{Address, B256, U256};
-use alloy::providers::{PendingTransactionBuilder, Provider, ProviderBuilder};
+use alloy::providers::{PendingTransactionBuilder, Provider};
 use alloy::rpc::types::Filter;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::{SolError, SolEvent};
@@ -174,16 +174,23 @@ pub async fn run(
     // report on, and registering one would make it go stale forever.
     health.heartbeat(&health_key);
 
-    // Read-only provider on the destination chain (where MessageDelivered is emitted).
-    let dest_provider = ProviderBuilder::new()
-        .connect(&route.destination_rpc_url)
+    // Read-only provider on the destination chain (where MessageDelivered is emitted). Held in a
+    // rebuilding slot: after `rpc::REBUILD_AFTER_FAILURES` failed scans it is re-dialed, so a dead
+    // transport heals in-process rather than through a liveness restart (see `crate::health`).
+    let mut dest_rpc = crate::rpc::Reconnecting::new(
+        format!("ack:{chain_key} destination"),
+        route.destination_rpc_url.clone(),
+    );
+    let dest_provider = dest_rpc
+        .connect()
         .await
         .with_context(|| {
             format!(
                 "chain_key {chain_key}: ack submitter failed to connect to destination RPC at {}",
                 route.destination_rpc_url
             )
-        })?;
+        })?
+        .clone();
 
     // Wallet-bearing provider on the source (Creditcoin) chain, where we submit the ack.
     let signer: PrivateKeySigner = ack
@@ -337,19 +344,27 @@ pub async fn run(
                     continue;
                 }
                 let mut rate_limited = false;
-                match discover_delivered(
-                    chain_key,
-                    route.inbox_address,
-                    ack.confirmation_depth,
-                    &dest_provider,
-                    &mut last_seen,
-                    &mut pending,
-                    &done,
-                    outbox,
-                    &mut pending_outbox,
-                ).await {
+                let scan = match dest_rpc.connect().await {
+                    Ok(provider) => {
+                        let provider = provider.clone();
+                        discover_delivered(
+                            chain_key,
+                            route.inbox_address,
+                            ack.confirmation_depth,
+                            &provider,
+                            &mut last_seen,
+                            &mut pending,
+                            &done,
+                            outbox,
+                            &mut pending_outbox,
+                        ).await
+                    }
+                    Err(err) => Err(err),
+                };
+                match scan {
                     Ok(()) => {
                         // Successful destination scan = loop progress (C2r).
+                        dest_rpc.note_ok();
                         health.heartbeat(&health_key);
                         if let Some(cp) = &checkpoint {
                             // Clamp the *persisted* cursor so it never advances past a tx that is
@@ -368,6 +383,10 @@ pub async fn run(
                     }
                     Err(err) => {
                         rate_limited = crate::pacing::error_looks_rate_limited(&format!("{err:#}"));
+                        // The loop is turning, the upstream is not: degraded, not stale (see
+                        // `crate::health`), and the provider is re-dialed after a failure streak.
+                        health.error(&health_key);
+                        dest_rpc.note_err();
                         warn!(chain_key, %err, "ack discovery iteration failed; will retry");
                     }
                 }

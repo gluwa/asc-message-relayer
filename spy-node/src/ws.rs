@@ -39,14 +39,26 @@ pub fn build_router(state: WsState) -> Router {
         .with_state(state)
 }
 
+/// `200 ok` when every worker has made progress within the deadline, `200` naming degraded
+/// workers (erroring but alive), `503` naming stale (silent) ones — the same two-tier verdict as
+/// the relayer's `/health`; see `message_relayer::health`.
 async fn health_handler(State(state): State<WsState>) -> axum::response::Response {
-    match state.health.status() {
-        (true, _) => (axum::http::StatusCode::OK, "ok").into_response(),
-        (false, stale) => (
+    let report = state.health.report();
+    if !report.is_alive() {
+        return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            format!("stale workers: {}", stale.join(", ")),
+            format!("stale workers: {}", report.stale.join(", ")),
         )
-            .into_response(),
+            .into_response();
+    }
+    if report.degraded.is_empty() {
+        (axum::http::StatusCode::OK, "ok").into_response()
+    } else {
+        (
+            axum::http::StatusCode::OK,
+            format!("degraded workers: {}", report.degraded.join(", ")),
+        )
+            .into_response()
     }
 }
 

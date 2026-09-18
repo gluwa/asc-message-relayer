@@ -51,6 +51,7 @@ pub mod prom;
 pub mod proofgen;
 pub mod receipt;
 pub mod revert;
+pub mod rpc;
 pub mod set_update;
 pub mod spy_client;
 
