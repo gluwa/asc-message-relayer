@@ -173,28 +173,51 @@ fn panic_kind_name(kind: PanicKind) -> &'static str {
     }
 }
 
-/// What an `eth_call` error was: an EVM revert (with whatever data the contract returned, possibly
-/// none), or the RPC not answering the question at all (transport failure, rate limit, method not
-/// supported), which must not be mistaken for a bare revert.
+/// What an `eth_call` error was.
+#[derive(Debug, PartialEq, Eq)]
 enum CallFailure {
+    /// An EVM revert, with whatever data the contract returned (possibly none).
     Reverted(Vec<u8>),
+    /// The EVM ran out of gas. Geth-style nodes report this as `out of gas` / `gas required
+    /// exceeds allowance` with no revert data, not as `execution reverted`.
+    OutOfGas,
+    /// The node executed (or refused to execute) the call and said why in words we do not decode
+    /// further: `insufficient funds for transfer` (the router cannot forward `nativeCoinValue`),
+    /// `invalid opcode`, an over-strict RPC. Worth relaying verbatim, never mistaken for a revert.
+    Node(String),
+    /// The RPC did not answer the question at all: transport failure, timeout, deserialisation.
     Rpc(String),
 }
 
 fn classify_call_error(err: &RpcError<TransportErrorKind>) -> CallFailure {
     let text = err.to_string();
     // Structured JSON-RPC `data` first (geth-style nodes), the `data: "0x…"` field of the error
-    // string second (Creditcoin-style nodes), then the plain "execution reverted" wording.
+    // string second (Creditcoin-style nodes), then the wording.
     let data = err
         .as_error_resp()
         .and_then(|payload| payload.as_revert_data())
         .map(|b| b.to_vec())
         .or_else(|| crate::revert::revert_data(&text));
-    match data {
-        Some(data) => CallFailure::Reverted(data),
-        None if crate::revert::is_revert(&text) => CallFailure::Reverted(Vec::new()),
-        None => CallFailure::Rpc(text),
+    classify_parts(err.as_error_resp().is_some(), data, text)
+}
+
+/// The node-agnostic half of [`classify_call_error`]: `node_answered` is whether the error is a
+/// JSON-RPC error response (the node ran or refused the call) rather than a transport failure.
+fn classify_parts(node_answered: bool, revert_data: Option<Vec<u8>>, text: String) -> CallFailure {
+    if let Some(data) = revert_data {
+        return CallFailure::Reverted(data);
     }
+    if crate::revert::is_revert(&text) {
+        return CallFailure::Reverted(Vec::new());
+    }
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("out of gas") || lower.contains("gas required exceeds") {
+        return CallFailure::OutOfGas;
+    }
+    if node_answered {
+        return CallFailure::Node(text);
+    }
+    CallFailure::Rpc(text)
 }
 
 /// Replay the destination call the dispatcher made for `payload` and explain why it reverted.
@@ -247,7 +270,7 @@ pub async fn probe_destination_revert<P: Provider>(
         .call(base.clone().with_gas_limit(gas))
         .block(at)
         .await;
-    let data = match capped {
+    match capped {
         Ok(_) => {
             return Some(format!(
                 "the destination call succeeds when replayed at block {at_text} with the envelope \
@@ -256,21 +279,25 @@ pub async fn probe_destination_revert<P: Provider>(
             ));
         }
         Err(err) => match classify_call_error(&err) {
-            CallFailure::Reverted(data) => data,
+            CallFailure::Reverted(data) if !data.is_empty() => {
+                return Some(describe_revert_data(&data));
+            }
+            // Empty revert data and an explicit out-of-gas both fall through to the uncapped
+            // replay below: a bare `revert()` and an OOG look the same to a capped call.
+            CallFailure::Reverted(_) | CallFailure::OutOfGas => {}
+            CallFailure::Node(text) => {
+                return Some(format!("the node rejected the destination call: {text}"));
+            }
             CallFailure::Rpc(text) => {
                 tracing::debug!(error = %text, "destination replay did not get an EVM answer");
                 return None;
             }
         },
-    };
-    if !data.is_empty() {
-        return Some(describe_revert_data(&data));
     }
 
-    // Empty revert data is what an out-of-gas looks like, but also a bare `revert()`. Replay
-    // without the gas cap to tell them apart: passing means the gasLimit was the problem; a
-    // revert *with* data means the cap hid the real reason and that data is the answer; the same
-    // empty revert means it is genuinely a bare revert.
+    // Replay without the gas cap to tell out-of-gas from a bare `revert()`: passing means the
+    // gasLimit was the problem; a revert *with* data means the cap hid the real reason and that
+    // data is the answer; the same empty revert means it is genuinely a bare revert.
     match provider.call(base).block(at).await {
         Ok(_) => Some(format!(
             "out of gas: the destination call needs more than the envelope gasLimit {gas}; quote \
@@ -282,9 +309,21 @@ pub async fn probe_destination_revert<P: Provider>(
                 describe_revert_data(&uncapped)
             )),
             CallFailure::Reverted(_) => Some(describe_revert_data(&[])),
+            CallFailure::OutOfGas => Some(
+                "out of gas even with no gasLimit cap — the destination call cannot complete \
+                 within the block gas limit (unbounded loop, or an absurd allocation)"
+                    .to_string(),
+            ),
+            CallFailure::Node(text) => Some(format!(
+                "reverted with empty data under the {gas} gasLimit cap; the uncapped replay was \
+                 rejected by the node: {text}"
+            )),
             CallFailure::Rpc(text) => {
                 tracing::debug!(error = %text, "uncapped destination replay did not get an EVM answer");
-                Some(describe_revert_data(&[]))
+                Some(format!(
+                    "reverted with empty data under the {gas} gasLimit cap (out of gas or a bare \
+                     revert); the uncapped replay did not answer"
+                ))
             }
         },
     }
@@ -333,6 +372,49 @@ mod tests {
             describe_revert_data(&unknown),
             "custom error 0x12345678 (8 bytes of revert data)"
         );
+    }
+
+    /// Geth reports a capped `eth_call` running out of gas as `out of gas` with no data — that
+    /// must reach the uncapped follow-up, not be dropped as "RPC did not answer" (Bugbot on #68).
+    #[test]
+    fn classify_tells_oog_revert_node_and_rpc_apart() {
+        let node = |msg: &str| classify_parts(true, None, msg.to_owned());
+        assert_eq!(node("out of gas"), CallFailure::OutOfGas);
+        assert_eq!(
+            node("gas required exceeds allowance (50000)"),
+            CallFailure::OutOfGas
+        );
+        assert_eq!(
+            node("execution reverted"),
+            CallFailure::Reverted(Vec::new())
+        );
+        assert_eq!(
+            classify_parts(
+                true,
+                Some(vec![0xe4, 0x50, 0xd3, 0x8c]),
+                "execution reverted".to_owned()
+            ),
+            CallFailure::Reverted(vec![0xe4, 0x50, 0xd3, 0x8c])
+        );
+        // Creditcoin-style string dialect: the data rides in the message.
+        assert_eq!(
+            classify_parts(
+                true,
+                crate::revert::revert_data(
+                    "VM Exception while processing transaction: revert, data: \"0xe450d38c\""
+                ),
+                String::new()
+            ),
+            CallFailure::Reverted(vec![0xe4, 0x50, 0xd3, 0x8c])
+        );
+        assert!(matches!(
+            node("insufficient funds for transfer"),
+            CallFailure::Node(_)
+        ));
+        assert!(matches!(
+            classify_call_error(&TransportErrorKind::custom_str("connection reset")),
+            CallFailure::Rpc(_)
+        ));
     }
 
     #[test]
