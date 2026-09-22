@@ -524,7 +524,7 @@ impl MetricsTrait for RelayerMetrics {
     }
 }
 
-/// Build the HTTP surface (`/metrics` + `/health` + `/votes/{message_hash}` + `/outcomes`).
+/// Build the HTTP surface (`/metrics` + `/health` + `/votes/{message_id}` + `/outcomes`).
 /// `query_tx` reaches the vote pool so the votes endpoint can serve the live accumulated bundle for
 /// a message; `outcomes` is the delivery workers' record of terminal verdicts.
 pub fn build_router(
@@ -550,7 +550,7 @@ pub fn build_router(
                 },
             ),
         )
-        .route("/votes/{message_hash}", get(votes_handler))
+        .route("/votes/{message_id}", get(votes_handler))
         .layer(Extension(metrics))
         .layer(Extension(query_tx))
         .layer(Extension(health))
@@ -655,29 +655,26 @@ async fn health_handler(
     }
 }
 
-/// `GET /votes/{message_hash}` — return the votes the relayer has accumulated for a message, so it
+/// `GET /votes/{message_id}` — return the votes the relayer has accumulated for a message, so it
 /// acts as a queryable spy node (an operator or sibling relayer can ask what we have and act on it).
-/// `message_hash` is a 0x-prefixed 32-byte hex string. 404 if we have not indexed it.
+/// `message_id` is a 0x-prefixed 32-byte hex string. 404 if we have not indexed it.
 async fn votes_handler(
-    axum::extract::Path(hash_str): axum::extract::Path<String>,
+    axum::extract::Path(id_str): axum::extract::Path<String>,
     axum::Extension(query_tx): axum::Extension<tokio::sync::mpsc::Sender<crate::pool::PoolQuery>>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    let Ok(message_hash) = hash_str.parse::<alloy::primitives::B256>() else {
+    let Ok(message_id) = id_str.parse::<alloy::primitives::B256>() else {
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            "message_hash must be 0x-prefixed 32-byte hex",
+            "message_id must be 0x-prefixed 32-byte hex",
         )
             .into_response();
     };
 
     let (reply, rx) = tokio::sync::oneshot::channel();
     if query_tx
-        .send(crate::pool::PoolQuery {
-            message_hash,
-            reply,
-        })
+        .send(crate::pool::PoolQuery { message_id, reply })
         .await
         .is_err()
     {
@@ -729,9 +726,10 @@ pub enum DeliveryStatus {
     AlreadyValidated,
     /// Votes validated, dApp callback deferred/reverted — stored for `retryPendingMessage`.
     Pending,
-    /// asc-contracts #36: delivered AND consumed, but the destination call failed
-    /// (`MessageExecutionFailed` alongside `MessageDelivered`). Not retryable; the relayer is still
-    /// paid on claim. A rising count here is a destination-dApp problem, not a relayer one.
+    /// asc-contracts #54: the destination call failed on this attempt (`DestinationFailed`
+    /// alongside `MessageReceived`). NOT consumed — the delivery worker returns the job to the
+    /// pool to retry `deliverMessage` with the same votes; the relayer is still paid on claim
+    /// regardless. A rising count here is a destination-dApp problem, not a relayer one.
     DestinationFailed,
     /// The envelope asked the relayer to front more native value than the route's
     /// `max_native_coin_value_wei`. Terminal (quoter/publisher-side fix).

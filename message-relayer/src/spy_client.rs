@@ -199,10 +199,10 @@ enum SpyEvent {
 struct SpyVote {
     chain_key: u64,
     message_id: String,
-    message_hash: String,
     signer: String,
     signature: String,
-    // `signature_valid` is deliberately not read — the pool re-validates (module docs).
+    // `message_hash` (equal to `message_id` since asc-contracts #54 — see the spy's event docs)
+    // and `signature_valid` are deliberately not read — the pool re-validates (module docs).
 }
 
 #[derive(Debug, Deserialize)]
@@ -293,12 +293,11 @@ fn handle_event(
 }
 
 /// Reconstruct the wire envelope from a spy event. The pool re-validates from these raw fields
-/// (ecrecover over `message_hash`, signer allowlist), so nothing here trusts the spy.
+/// (ecrecover over `message_id`, signer allowlist), so nothing here trusts the spy.
 fn convert_vote(vote: SpyVote) -> Result<MessageVote> {
     Ok(MessageVote {
         chain_key: vote.chain_key,
         message_id: parse_hex::<32>(&vote.message_id).context("message_id")?,
-        message_hash: parse_hex::<32>(&vote.message_hash).context("message_hash")?,
         signer: parse_hex::<20>(&vote.signer).context("signer")?,
         signature: parse_hex::<65>(&vote.signature).context("signature")?,
     })
@@ -359,7 +358,6 @@ mod tests {
         let wire = convert_vote(vote).unwrap();
         assert_eq!(wire.chain_key, 7);
         assert_eq!(wire.message_id, [0x01; 32]);
-        assert_eq!(wire.message_hash, [0x02; 32]);
         assert_eq!(wire.signer, [0x0A; 20]);
         assert_eq!(wire.signature, [0x03; 65]);
     }
@@ -428,7 +426,6 @@ mod tests {
         let vote = SpyVote {
             chain_key: 7,
             message_id: "0x1234".into(), // wrong length
-            message_hash: format!("0x{}", "02".repeat(32)),
             signer: format!("0x{}", "0a".repeat(20)),
             signature: format!("0x{}", "03".repeat(65)),
         };

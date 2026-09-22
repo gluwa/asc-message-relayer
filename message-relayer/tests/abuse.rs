@@ -2,7 +2,7 @@
 //!
 //! Spawns the real pool task and floods it with junk gossip:
 //!
-//!  * votes for `messageHash`es never indexed (chain-first allowlist drop),
+//!  * votes for `messageId`s never indexed (chain-first allowlist drop),
 //!  * votes by signers not in the attestor allowlist,
 //!  * grossly more messages than `vote_cache.max_messages` permits.
 //!
@@ -62,15 +62,14 @@ async fn pool_drops_unknown_messages_and_emits_no_jobs() {
         cancel_for_pool,
     ));
 
-    // 1 000 votes for unique never-indexed message hashes — chain-first allowlist must drop
+    // 1 000 votes for unique never-indexed message ids — chain-first allowlist must drop
     // each one without growing pool state.
     for i in 0u32..1_000 {
-        let mut h = [0u8; 32];
-        h[..4].copy_from_slice(&i.to_le_bytes());
+        let mut id = [0u8; 32];
+        id[..4].copy_from_slice(&i.to_le_bytes());
         let vote = MessageVote {
             chain_key: 2,
-            message_id: [0u8; 32],
-            message_hash: h,
+            message_id: id,
             signer: [0x0au8; 20],
             signature: [0u8; 65],
         };
@@ -130,18 +129,17 @@ async fn pool_drops_votes_from_unknown_signers() {
         cancel_for_pool,
     ));
 
-    // Index one message so its messageHash is in the allowlist, then send votes signed by an
+    // Index one message so its messageId is in the allowlist, then send votes signed by an
     // unknown signer — they must all be rejected.
-    let hash = [9u8; 32];
     let indexed = IndexedMessage {
         chain_key: 2,
         message_id: alloy::primitives::B256::from([7u8; 32]),
         emitter: address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
         outbox: address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        sequence: 1,
         destination_chain_key: alloy::primitives::B256::ZERO,
         creditcoin_chain_id: 1,
         payload: vec![],
-        message_hash: alloy::primitives::B256::from(hash),
         tx_hash: alloy::primitives::B256::ZERO,
         block_height: 0,
     };
@@ -155,7 +153,6 @@ async fn pool_drops_votes_from_unknown_signers() {
         let vote = MessageVote {
             chain_key: 2,
             message_id: [7u8; 32],
-            message_hash: hash,
             signer, // not in the allowlist
             signature: [0u8; 65],
         };

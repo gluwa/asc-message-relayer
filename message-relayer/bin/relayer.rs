@@ -150,7 +150,7 @@ struct Cli {
     #[arg(long, env = "RELAYER_ACK_SIGNER_KEY", required = false)]
     ack_signer_key: Option<String>,
 
-    /// Blocks to lag behind the destination tip when scanning for `MessageDelivered` (ack watcher
+    /// Blocks to lag behind the destination tip when scanning for `MessageReceived` (ack watcher
     /// reorg guard). 0 for instant-finality destinations.
     #[arg(long, default_value_t = 0, env = "RELAYER_ACK_CONFIRMATION_DEPTH")]
     ack_confirmation_depth: u64,

@@ -2,8 +2,9 @@
 //!
 //! Shared by the attestor (which decodes `MessagePublished` from the Creditcoin Outbox) and the
 //! `message-relayer` (which additionally calls `Inbox.deliverMessage` / `validateVotes`). Keeping
-//! one definition here means both crates decode the *same* event signature and recompute the
-//! *same* `messageHash` — a mismatch would make every signature verify as invalid on-chain.
+//! one definition here means both crates decode the *same* event signature — since asc-contracts
+//! #54, `validateVotes` takes `messageId` itself as the signed digest, so there is no separate
+//! hash preimage left to keep in sync (see `hash.rs`'s module doc).
 //!
 //! Inline `alloy::sol!` declarations are used while the production contracts are finalized — when
 //! they ship, switch each block to the JSON form (`#[sol(rpc)] interface X, "contracts/x.json"`)
@@ -42,6 +43,7 @@ sol! {
         event MessagePublished(
             bytes32 indexed messageId,
             bytes32 indexed emitterAddress,
+            uint64 sequence,
             bool canAck,
             bytes payload
         );
@@ -128,10 +130,17 @@ sol! {
         /// Post asc-contracts #45 the Inbox takes the source `outbox` (second argument, must be
         /// on its allowlist) and is `payable`: `msg.value` must equal the envelope's
         /// `nativeCoinValue` or the DispatcherRouter reverts `InvalidNativeCoinValue`.
+        /// asc-contracts #54 adds `sequence` (the Outbox's per-emitter sequence `messageId` was
+        /// derived from) and replaces the old messageHash vote digest with a direct check that
+        /// `messageId == OutboxTypes.computeMessageId(outbox, emitterAddress, sequence,
+        /// keccak256(messagePayload), sourceChainId)` — reverting `MessageIdMismatch` otherwise.
+        /// A `DISPATCH_MESSAGE_FAILED` destination outcome no longer consumes the messageId: a
+        /// later `deliverMessage` call (re-validating votes) may retry it.
         function deliverMessage(
             bytes32 messageId,
             address outbox,
             address emitterAddress,
+            uint64 sequence,
             bytes calldata messagePayload,
             bytes calldata votes
         ) external payable;
@@ -144,12 +153,19 @@ sol! {
         /// retryable via `retryPendingMessage`. Mirrors `SimpleInbox.isPending`.
         function isPending(bytes32 messageId) external view returns (bool);
 
-        /// Emitted when `deliverMessage`'s dApp callback succeeds. `processor` is the vote
-        /// validator that authorized delivery; `relayer` is the `msg.sender` that delivered.
-        /// Only `messageId` (topics[1]) is read; the two addresses are ignored. The 3-arg shape
-        /// must match `Inbox.MessageDelivered` exactly or the ack watcher's `SIGNATURE_HASH`
-        /// filter misses every delivery.
-        event MessageDelivered(
+        /// asc-contracts #54: emitted when Inbox accepted a delivery attempt that reached the
+        /// dispatcher destination path (executed OR destination-failed) — always paired with
+        /// either `MessageExecuted` or `DestinationFailed` on the same tx. `processor` is the vote
+        /// validator that authorized delivery; `relayer` is the `msg.sender` that delivered. Only
+        /// `messageId` (topics[1]) is read; the two addresses are ignored. Renamed from
+        /// `MessageDelivered` (3-arg shape unchanged) — unlike its predecessor, this event no
+        /// longer implies the destination call succeeded: a `DestinationFailed`-paired delivery
+        /// still emits it (relay work happened) and the message stays open for another
+        /// `deliverMessage` retry. `EVMDeliveryDecoder`/`claimDelivery` read it alone (relay-fee
+        /// settlement pays for relay work, not destination success); the ack path
+        /// (`AcknowledgmentValidator`) reads `MessageExecuted` instead, specifically to exclude
+        /// destination failures from acknowledgment.
+        event MessageReceived(
             bytes32 indexed messageId,
             address indexed processor,
             address indexed relayer
@@ -166,17 +182,34 @@ sol! {
             address indexed destinationContract,
             address indexed relayer
         );
-        /// asc-contracts #36: emitted **together with** `MessageDelivered` (same successful tx)
-        /// when the dispatcher reported a terminal destination failure (`DISPATCH_MESSAGE_FAILED`
-        /// — the destination call ran with the attested gas and reverted, or the destination has
-        /// no code). The message is consumed (`processedAt` set); `retryPendingMessage` is NOT
-        /// possible and the delivery still counts for `claimDelivery`. Receipt-log classification
-        /// reads it to label the outcome `DestinationFailed` instead of a plain success.
-        /// `dispatcher` is the `IMessageDispatcher` (DispatcherRouter) that ran the message.
-        event MessageExecutionFailed(
+        /// asc-contracts #54: emitted when the destination call succeeded and the message is
+        /// fully completed (`processedAt` set) — always follows `MessageReceived` on the same
+        /// successful attempt. Replaces the old "plain `MessageDelivered` alone" success signal.
+        /// `AcknowledgmentValidator` reads this (not `MessageReceived`) so a retryable destination
+        /// failure can never be mistaken for a completed, acknowledgeable delivery.
+        event MessageExecuted(
             bytes32 indexed messageId,
-            address indexed dispatcher,
-            address indexed relayer
+            address indexed emitterAddress,
+            address indexed destination,
+            address dispatcher,
+            address relayer,
+            bytes messagePayload
+        );
+        /// asc-contracts #54: replaces `MessageExecutionFailed`. Emitted (alongside
+        /// `MessageReceived`, same tx) when the destination call reverted or the destination has
+        /// no code — but UNLIKE `MessageExecutionFailed`, this is **not terminal**: the message
+        /// stays open (`processedAt` is not set) and a later `deliverMessage` call may retry it
+        /// with fresh vote validation. Delivery/retry classification must treat this as
+        /// retryable, not terminal-consumed — treating it as terminal (the old
+        /// `MessageExecutionFailed` semantics) would silently abandon a message the Inbox is
+        /// still willing to retry.
+        event DestinationFailed(
+            bytes32 indexed messageId,
+            address indexed emitterAddress,
+            address indexed destination,
+            address dispatcher,
+            address relayer,
+            bytes messagePayload
         );
 
         /// Revert used to classify duplicate deliveries for metrics + retry logic. NOTE: older
@@ -186,6 +219,11 @@ sol! {
         /// vote errors are mirrored here.) Post-#23 the error carries the messageId — the old
         /// zero-arg selector matched nothing (caught by the abi_surface drift test).
         error MessageAlreadyValidated(bytes32 messageId);
+        /// asc-contracts #54: `deliverMessage`'s submitted `(outbox, emitterAddress, sequence,
+        /// messagePayload, sourceChainId)` does not recompute to `messageId`. A calldata-assembly
+        /// bug on our side (wrong `sequence`, stale payload, …) — never expected in normal
+        /// operation, since we source all of these from the same `MessagePublished` log.
+        error MessageIdMismatch(bytes32 messageId);
         /// asc-contracts #36: `retryPendingMessage` reverts this when the dispatcher answered
         /// deferred/queued again. Pending state is restored, so the retry is not lost — but
         /// re-sending before `retryAfter` is a guaranteed revert. `retryAfter` is a unix timestamp
@@ -263,8 +301,10 @@ sol! {
     contract IAcknowledgmentValidator {
         /// Trust-minimized acknowledgment entrypoint on the *source* (Creditcoin) chain. The relayer
         /// proves — via the chain's native USC proving (block-prover precompile: merkle inclusion +
-        /// continuity) — that a `MessageDelivered` event was emitted in a finalized block on the
-        /// destination chain. This contract verifies the proof, decodes the delivered messageId(s),
+        /// continuity) — that a `MessageExecuted` event was emitted in a finalized block on the
+        /// destination chain (asc-contracts #54 renamed this from `MessageDelivered` and split out
+        /// destination-failure retries, which no longer qualify as acknowledgeable). This contract
+        /// verifies the proof, decodes the delivered messageId(s),
         /// and calls `Outbox.acknowledgeMessage` per log under try/catch (one already-acked or
         /// no-ack log cannot wedge the others). Permissionless AND fee-bearing: each message's
         /// user-set ackFee (held by this validator) pays `msg.sender` of the first successful
@@ -287,11 +327,12 @@ sol! {
         /// Reverts the ack submitter treats as terminal for a given proof. Outbox message-state
         /// errors (`MessageCannotBeAcknowledged` / `MessageNotFound` / `MessageAlreadyAcknowledged`)
         /// no longer bubble up — the validator catches them per log — so a submission only reverts
-        /// when NOTHING was acknowledged (`NoMessageDeliveredLogs`) or the proof itself is bad.
+        /// when NOTHING was acknowledged (`NoMessageExecutedLogs`) or the proof itself is bad.
         /// `ProofInvalid` is raised by the `USCProofVerifier` the validator delegates to.
+        /// asc-contracts #54 renamed both from `NoMessageDeliveredLogs`/`MalformedMessageDeliveredLog`.
         error ProofInvalid(bytes32 chainKey, uint64 blockHeight);
-        error NoMessageDeliveredLogs();
-        error MalformedMessageDeliveredLog();
+        error NoMessageExecutedLogs();
+        error MalformedMessageExecutedLog();
         error EncodedTransactionTooLarge(uint256 size, uint256 maxSize);
         error UnsupportedTxType(uint8 txType);
         error OutboxNotSet();
@@ -325,8 +366,10 @@ sol! {
 
         /// Trust-minimized relay-fee settlement on the *source* (Creditcoin) chain. The relayer
         /// proves — via the block-prover precompile (merkle inclusion + continuity) — that a
-        /// `MessageDelivered` event for `messageId` was emitted in a finalized block on the
-        /// destination chain. The contract verifies the proof, decodes the proven relayer from the
+        /// `MessageReceived` event for `messageId` was emitted in a finalized block on the
+        /// destination chain (asc-contracts #54 renamed this from `MessageDelivered`; it still
+        /// fires — and still counts for relay-fee settlement — on a destination-failure retry, not
+        /// just on outright success). The contract verifies the proof, decodes the proven relayer from the
         /// event, and pays it the relay fee (+ any unexpired tip).
         ///
         /// NOTE: unlike the pre-#23 vault version, this does NOT acknowledge the message — ack

@@ -280,7 +280,7 @@ impl Server {
         drop(indexed_tx);
 
         // Acknowledgment submitters (per route, opt-in). Each watches the destination Inbox for
-        // `MessageDelivered`, fetches a native USC delivery proof, and submits it to the
+        // `MessageReceived`, fetches a native USC delivery proof, and submits it to the
         // source-chain `AcknowledgmentValidator` — and, when the route has a RelayerContract
         // configured, additionally submits `RelayerContract.claimDelivery` for the relay fee (the
         // two settlements are independent since usc-contracts #23; the claim no longer acks).

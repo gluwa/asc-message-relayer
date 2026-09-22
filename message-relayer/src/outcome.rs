@@ -3,7 +3,7 @@
 //! The vote pool answers "how many attestors have signed" while a message is in flight and forgets
 //! it once delivered; nothing answered "what happened to it" afterwards. Operators and the
 //! dashboard had to read the relayer logs to learn that a message was delivered (and in which
-//! destination tx), that the destination call reverted (`MessageExecutionFailed`), or that the
+//! destination tx), that the destination call reverted (`DestinationFailed`), or that the
 //! relayer refused it as undeliverable (a payload the Inbox cannot decode, an envelope over the
 //! route's caps, an under-funded message past its top-up window). This module records that
 //! verdict per `messageId` at the moment the delivery worker reaches it and exposes it as
@@ -28,11 +28,15 @@ pub const DEFAULT_CAP: usize = 10_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutcomeKind {
-    /// `deliverMessage` mined with `MessageDelivered` and the destination call succeeded (or another
-    /// relayer's did — idempotent success).
+    /// `deliverMessage` mined with `MessageReceived` + `MessageExecuted` and the destination call
+    /// succeeded (or another relayer's did — idempotent success).
     Delivered,
-    /// Mined and consumed, but the destination call failed (`MessageExecutionFailed`, #36). No retry
-    /// is possible; the relay fee is still claimable.
+    /// Mined with `MessageReceived` + `DestinationFailed` (asc-contracts #54): the destination call
+    /// failed, but the message is NOT consumed — `deliverMessage` may be resubmitted with the same
+    /// votes. The delivery worker treats this as retryable (`DeliveryResultKind::Retryable`), so in
+    /// practice this kind is only ever recorded from the bounded `retryPendingMessage` bookkeeping
+    /// path, which has no way to resubmit `deliverMessage` itself; the relay fee is claimable
+    /// either way via `MessageReceived`.
     DestinationFailed,
     /// Mined with `MessagePending`: the dispatcher deferred/queued it; bounded `retryPendingMessage`
     /// attempts follow.
@@ -217,12 +221,12 @@ mod tests {
             kind: OutcomeKind::DestinationFailed,
             chain_key: 8,
             tx_hash: None,
-            reason: Some("MessageExecutionFailed".into()),
+            reason: Some("DestinationFailed".into()),
             recorded_at: 1,
         })
         .unwrap();
         assert!(json.contains("\"kind\":\"destination_failed\""));
         assert!(!json.contains("tx_hash"));
-        assert!(json.contains("\"reason\":\"MessageExecutionFailed\""));
+        assert!(json.contains("\"reason\":\"DestinationFailed\""));
     }
 }

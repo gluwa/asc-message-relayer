@@ -3,7 +3,7 @@
 //! For every configured route, this module spawns a poller that watches the Creditcoin L1 EVM
 //! endpoint for `MessagePublished` events on the route's resolved Outbox. New events become
 //! [`IndexedMessage`]s pushed into the shared vote pool — the **chain-first allowlist** of PoC
-//! §6.2: votes for `messageHash`es we have not indexed are dropped on arrival.
+//! §6.2: votes for `messageId`s we have not indexed are dropped on arrival.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,7 +22,6 @@ pub mod finality;
 use crate::abi::IOutbox;
 use crate::checkpoint::CheckpointStore;
 use crate::config::ChainRoute;
-use crate::hash::message_hash;
 use crate::prom::Metrics;
 use write_ability::protocol::chain_key_to_bytes32;
 
@@ -54,20 +53,22 @@ pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 6;
 const MAX_BLOCKS_PER_SCAN: u64 = 2_000;
 
 /// A finalized message that the relayer has discovered on the Creditcoin Outbox. The vote pool
-/// keys on `message_hash`; the rest of the fields are needed to recompute the calldata for
-/// `Inbox.deliverMessage`.
+/// keys on `message_id` (also the digest attestors sign directly since asc-contracts #54); the
+/// rest of the fields are needed to recompute the calldata for `Inbox.deliverMessage`.
 #[derive(Clone, Debug)]
 pub struct IndexedMessage {
     pub chain_key: u64,
     pub message_id: B256,
     pub emitter: Address,
-    /// The Outbox the event was scanned from: part of the signed hash and the second
+    /// The Outbox the event was scanned from: bound into `messageId` and the second
     /// `deliverMessage` argument (asc-contracts #45).
     pub outbox: Address,
+    /// Per-emitter Outbox sequence `messageId` was derived from (asc-contracts #54) — the fourth
+    /// `deliverMessage` argument.
+    pub sequence: u64,
     pub destination_chain_key: B256,
     pub creditcoin_chain_id: u64,
     pub payload: Vec<u8>,
-    pub message_hash: B256,
     /// Transaction + block of the `MessagePublished` emission. Carried so the pool can build a
     /// [`ReobservationRequest`](write_ability::envelope::ReobservationRequest) pointing attestors at
     /// the exact event when a message stalls below quorum.
@@ -421,35 +422,27 @@ async fn poll_once<P: Provider>(
                 };
                 let payload = decoded.data.payload.to_vec();
                 // `emitterAddress` is emitted as `bytes32` (cross-chain consistency); the 20-byte
-                // EVM address sits in the high bytes. Recover the plain `Address` — the signed
-                // `messageHash` and `deliverMessage` both use `address`.
+                // EVM address sits in the high bytes. Recover the plain `Address` — `messageId`'s
+                // preimage and `deliverMessage` both use `address`.
                 let emitter = alloy::primitives::Address::from_slice(
                     &decoded.data.emitterAddress.as_slice()[..20],
-                );
-                let hash = message_hash(
-                    decoded.data.messageId,
-                    emitter,
-                    outbox,
-                    destination_chain_key,
-                    creditcoin_chain_id,
-                    &payload,
                 );
                 let indexed = IndexedMessage {
                     chain_key,
                     message_id: decoded.data.messageId,
                     emitter,
                     outbox,
+                    sequence: decoded.data.sequence,
                     destination_chain_key,
                     creditcoin_chain_id,
                     payload,
-                    message_hash: hash,
                     tx_hash,
                     block_height,
                 };
                 debug!(
                     chain_key,
                     message_id = %indexed.message_id,
-                    message_hash = %indexed.message_hash,
+                    sequence = indexed.sequence,
                     "📨 Indexed MessagePublished"
                 );
                 metrics.inc_messages_indexed(chain_key);

@@ -214,7 +214,7 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
     let inbox = Artifact::load(&contracts, "Inbox.sol/Inbox.json");
     inbox.assert_mirrored(
         "function",
-        "deliverMessage(bytes32,address,address,bytes,bytes)",
+        "deliverMessage(bytes32,address,address,uint64,bytes,bytes)",
         &IInbox::deliverMessageCall::SELECTOR,
     );
     inbox.assert_mirrored(
@@ -227,27 +227,41 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
         "isPending(bytes32)",
         &IInbox::isPendingCall::SELECTOR,
     );
+    // #54 renamed MessageDelivered -> MessageReceived (3-arg shape unchanged): it now fires on
+    // every accepted delivery attempt, success or destination-failure alike.
     inbox.assert_mirrored(
         "event",
-        IInbox::MessageDelivered::SIGNATURE,
-        &IInbox::MessageDelivered::SIGNATURE_HASH.0,
+        IInbox::MessageReceived::SIGNATURE,
+        &IInbox::MessageReceived::SIGNATURE_HASH.0,
     );
     inbox.assert_mirrored(
         "event",
         IInbox::MessagePending::SIGNATURE,
         &IInbox::MessagePending::SIGNATURE_HASH.0,
     );
-    // #36: emitted alongside MessageDelivered for a consumed-but-failed destination call. A moved
-    // topic0 would silently relabel every destination failure as a plain success.
+    // #54 replaced MessageExecutionFailed (terminal) with MessageExecuted (success-only, read by
+    // the ack path) and DestinationFailed (retryable, paired with MessageReceived). A moved topic0
+    // on either would silently relabel a retryable failure as a completed, acknowledgeable delivery
+    // or vice versa.
     inbox.assert_mirrored(
         "event",
-        IInbox::MessageExecutionFailed::SIGNATURE,
-        &IInbox::MessageExecutionFailed::SIGNATURE_HASH.0,
+        IInbox::MessageExecuted::SIGNATURE,
+        &IInbox::MessageExecuted::SIGNATURE_HASH.0,
+    );
+    inbox.assert_mirrored(
+        "event",
+        IInbox::DestinationFailed::SIGNATURE,
+        &IInbox::DestinationFailed::SIGNATURE_HASH.0,
     );
     inbox.assert_mirrored(
         "error",
         "MessageAlreadyValidated(bytes32)",
         &IInbox::MessageAlreadyValidated::SELECTOR,
+    );
+    inbox.assert_mirrored(
+        "error",
+        "MessageIdMismatch(bytes32)",
+        &IInbox::MessageIdMismatch::SELECTOR,
     );
     // #36 reverts the delivery/pending-retry classifiers key on. The selectors are matched from raw
     // revert data (Creditcoin-style nodes decode no names), so a drifted one is dead code that
@@ -341,15 +355,16 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
         IAcknowledgmentValidator::AckFeeClaimed::SIGNATURE,
         &IAcknowledgmentValidator::AckFeeClaimed::SIGNATURE_HASH.0,
     );
+    // #54 renamed both from NoMessageDeliveredLogs/MalformedMessageDeliveredLog.
     ackv.assert_mirrored(
         "error",
-        "NoMessageDeliveredLogs()",
-        &IAcknowledgmentValidator::NoMessageDeliveredLogs::SELECTOR,
+        "NoMessageExecutedLogs()",
+        &IAcknowledgmentValidator::NoMessageExecutedLogs::SELECTOR,
     );
     ackv.assert_mirrored(
         "error",
-        "MalformedMessageDeliveredLog()",
-        &IAcknowledgmentValidator::MalformedMessageDeliveredLog::SELECTOR,
+        "MalformedMessageExecutedLog()",
+        &IAcknowledgmentValidator::MalformedMessageExecutedLog::SELECTOR,
     );
     ackv.assert_mirrored(
         "error",
