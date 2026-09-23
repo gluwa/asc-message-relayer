@@ -12,12 +12,14 @@
 //!     (returned to the pool's bounded retry) — a mere RPC blip must not drop a message.
 //!  3. Send the transaction, watching for receipt (bounded by [`RECEIPT_TIMEOUT`] so a stuck
 //!     underpriced tx cannot wedge the route's serial worker).
-//!  4. Classify the outcome from the receipt logs. `MessagePending` and (#36)
-//!     `MessageExecutionFailed` are **events on a successful tx**: the former means the dispatcher
+//!  4. Classify the outcome from the receipt logs. `MessagePending` and (asc-contracts #54)
+//!     `DestinationFailed` are **events on a successful tx**: the former means the dispatcher
 //!     deferred/queued the message (retryable via `retryPendingMessage`), the latter that the
-//!     destination call failed and the message is consumed for good (no retry; delivery still
-//!     counts and is still paid). A mined-but-reverted tx is replayed to learn why: an
-//!     `InsufficientGasForDestination` revert is retried with 25% more gas up to `max_gas_limit`.
+//!     destination call failed but the message is NOT consumed — `deliverMessage` may be
+//!     resubmitted with the same votes (the Inbox re-validates them fresh each call; delivery
+//!     still counts and is still paid via `MessageReceived` either way). A mined-but-reverted tx
+//!     is replayed to learn why: an `InsufficientGasForDestination` revert is retried with 25%
+//!     more gas up to `max_gas_limit`.
 //!  5. On `MessagePending`, schedule bounded `retryPendingMessage` attempts (permissionless),
 //!     honouring a `RetryDeferred(retryAfter)` hint over the fixed backoff.
 //!  6. On RPC-level failure, retry up to `delivery.max_retries` with backoff.
@@ -147,7 +149,8 @@ const RETRY_DEFERRED_MARGIN: Duration = Duration::from_secs(5);
 /// and exhausts its bounded budget — the message stays retryable on-chain by anyone).
 const MAX_RETRY_DEFERRED_WAIT: Duration = Duration::from_secs(6 * 3600);
 
-/// Job dispatched by the pool when a `messageHash` clears the threshold.
+/// Job dispatched by the pool when a `messageId` (also the signed digest since asc-contracts #54)
+/// clears the threshold.
 #[derive(Clone, Debug)]
 pub struct DeliveryJob {
     pub chain_key: u64,
@@ -155,7 +158,9 @@ pub struct DeliveryJob {
     pub emitter: Address,
     /// Source Outbox the message was scanned from; second `deliverMessage` argument (#45).
     pub outbox: Address,
-    pub message_hash: B256,
+    /// Per-emitter Outbox sequence `messageId` was derived from (asc-contracts #54) — the fourth
+    /// `deliverMessage` argument.
+    pub sequence: u64,
     pub payload: Vec<u8>,
     pub votes_calldata: Vec<u8>,
     pub signer_count: usize,
@@ -165,7 +170,7 @@ pub struct DeliveryJob {
 #[derive(Clone, Debug)]
 pub struct DeliveryResult {
     pub chain_key: u64,
-    pub message_hash: B256,
+    pub message_id: B256,
     pub outcome: DeliveryResultKind,
 }
 
@@ -344,7 +349,7 @@ pub async fn run(
                 if result_tx
                     .send(DeliveryResult {
                         chain_key: job.chain_key,
-                        message_hash: job.message_hash,
+                        message_id: job.message_id,
                         outcome,
                     })
                     .await
@@ -792,13 +797,15 @@ fn revert_duplicate_delivery(err: &impl std::fmt::Display) -> bool {
 }
 
 /// What the logs of a **successful** `deliverMessage` receipt say happened. Precedence matters:
-/// `MessageExecutionFailed` (#36) is emitted *together with* `MessageDelivered`, so the plain
-/// success arm is only reached when neither of the two qualifying events is present.
+/// `DestinationFailed` (asc-contracts #54) is emitted *together with* `MessageReceived`, so the
+/// plain success arm is only reached when neither of the two qualifying events is present.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReceiptClass {
-    /// `MessageDelivered` alone: destination executed.
+    /// `MessageReceived` alone (paired with `MessageExecuted`): destination executed.
     Delivered,
-    /// `MessageExecutionFailed` + `MessageDelivered`: consumed, destination call failed, no retry.
+    /// `DestinationFailed` + `MessageReceived`: NOT consumed — `deliverMessage` may be resubmitted
+    /// with the same votes (asc-contracts #54; the old `MessageExecutionFailed` shape this
+    /// replaces WAS terminal, so this is a genuine retry-semantics change, not just a rename).
     DestinationFailed { dispatcher: Address },
     /// `MessagePending`: dispatcher deferred/queued; `retryPendingMessage` applies.
     Pending,
@@ -814,12 +821,15 @@ fn classify_success_logs<'a>(
             continue;
         }
         match log.topics().first() {
-            Some(t) if *t == IInbox::MessageExecutionFailed::SIGNATURE_HASH => {
-                // topics[2] is the indexed `dispatcher` (left-padded address).
-                let dispatcher = log
-                    .topics()
-                    .get(2)
-                    .map(|t| Address::from_slice(&t[12..]))
+            Some(t) if *t == IInbox::DestinationFailed::SIGNATURE_HASH => {
+                // `dispatcher` is a NON-indexed field on the new 6-field DestinationFailed event
+                // (messageId/emitterAddress/destination are indexed; dispatcher/relayer/
+                // messagePayload are not) — unlike the retired 3-indexed-arg
+                // MessageExecutionFailed, it is NOT at a fixed topic index. A naive
+                // `topics().get(2)` here would silently read `destination` instead (same topic
+                // count, different field) and misattribute the wrong address. Decode properly.
+                let dispatcher = IInbox::DestinationFailed::decode_log(&log.inner)
+                    .map(|decoded| decoded.data.dispatcher)
                     .unwrap_or_default();
                 return ReceiptClass::DestinationFailed { dispatcher };
             }
@@ -1082,6 +1092,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
                 job.message_id,
                 job.outbox,
                 job.emitter,
+                job.sequence,
                 Bytes::from(job.payload.clone()),
                 Bytes::from(job.votes_calldata.clone()),
             )
@@ -1130,6 +1141,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
                     job.message_id,
                     job.outbox,
                     job.emitter,
+                    job.sequence,
                     Bytes::from(job.payload.clone()),
                     Bytes::from(job.votes_calldata.clone()),
                 )
@@ -1238,6 +1250,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
                 job.message_id,
                 job.outbox,
                 job.emitter,
+                job.sequence,
                 Bytes::from(job.payload.clone()),
                 Bytes::from(job.votes_calldata.clone()),
             )
@@ -1288,9 +1301,10 @@ async fn handle_job<P: Provider + Clone + 'static>(
                         if receipt.status() {
                             // `deliverMessage` succeeds even when the destination does not
                             // execute: the Inbox emits `MessagePending` (deferred/queued — stored
-                            // for `retryPendingMessage`) or, since #36, `MessageExecutionFailed`
-                            // alongside `MessageDelivered` (destination call failed, message
-                            // consumed). Both are detected from the receipt logs, not a revert.
+                            // for `retryPendingMessage`) or, since asc-contracts #54,
+                            // `DestinationFailed` alongside `MessageReceived` (destination call
+                            // failed, message NOT consumed — retryable). Both are detected from
+                            // the receipt logs, not a revert.
                             break match classify_success_logs(
                                 route.inbox_address,
                                 receipt.inner.logs(),
@@ -1465,12 +1479,14 @@ async fn handle_job<P: Provider + Clone + 'static>(
             dispatcher,
             tx_hash,
         } => {
-            // Delivered and consumed (processedAt set) — the relayer is paid on claim — but the
-            // destination call failed for good. Nothing to retry: `retryPendingMessage` reverts
-            // `MessageNotPending`. Surfaced distinctly so a misbehaving destination dApp shows up
-            // as its own series instead of inflating `Succeeded`.
+            // asc-contracts #54: unlike the retired MessageExecutionFailed shape, DestinationFailed
+            // does NOT set processedAt — the messageId is not consumed. `deliverMessage` may be
+            // resubmitted with the SAME votes (the Inbox re-validates them fresh each call, and
+            // nothing about them changed), so this is retryable exactly like a transport failure:
+            // return the job to the pool rather than recording a terminal outcome. `MessageReceived`
+            // still fired on this attempt, so relay-fee `claimDelivery` remains payable regardless
+            // of how this retry eventually resolves — nothing to do for that here.
             metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::DestinationFailed);
-            metrics.observe_time_to_deliver(started.elapsed());
             warn!(
                 chain_key = route.chain_key,
                 message_id = %job.message_id,
@@ -1478,18 +1494,10 @@ async fn handle_job<P: Provider + Clone + 'static>(
                 tx = %tx_hash,
                 signer_count = job.signer_count,
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "⚠️ message delivered but the destination call FAILED (MessageExecutionFailed) — \
-                 consumed on-chain, no retry possible; delivery still counts for the fee claim"
+                "⚠️ destination call FAILED (DestinationFailed) — not consumed on-chain; \
+                 returning to pool to retry deliverMessage with the same votes"
             );
-            outcomes.record(
-                job.message_id,
-                DeliveryOutcome::new(OutcomeKind::DestinationFailed, route.chain_key)
-                    .with_tx(tx_hash)
-                    .with_reason(format!(
-                        "MessageExecutionFailed: the destination call reverted (dispatcher {dispatcher})"
-                    )),
-            );
-            Ok(DeliveryResultKind::Delivered)
+            Ok(DeliveryResultKind::Retryable)
         }
         SendOutcome::AlreadyValidated => {
             metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::AlreadyValidated);
@@ -1616,6 +1624,7 @@ async fn replay_revert_reason<P: Provider>(
             job.message_id,
             job.outbox,
             job.emitter,
+            job.sequence,
             Bytes::from(job.payload.clone()),
             Bytes::from(job.votes_calldata.clone()),
         )
@@ -1644,8 +1653,8 @@ enum SendOutcome {
     Pending {
         tx_hash: B256,
     },
-    /// Tx succeeded and the receipt carries `MessageExecutionFailed` (#36): the destination call
-    /// failed, the message is consumed, no retry is possible.
+    /// Tx succeeded and the receipt carries `DestinationFailed` (asc-contracts #54): the
+    /// destination call failed, but the message is NOT consumed — retryable via `deliverMessage`.
     DestinationFailed {
         dispatcher: Address,
         tx_hash: B256,
@@ -1693,9 +1702,10 @@ fn spawn_pending_retry<P: Provider + 'static>(
                     info!(chain_key, %message_id, "♻️ pending message already resolved");
                     // Consumed by someone else's `retryPendingMessage` (or a dApp user's, or our
                     // own retry whose receipt we never saw). `isPending == false` says only that
-                    // it is no longer pending — #36 clears it on `MessageExecutionFailed` too — so
-                    // do NOT claim `Delivered`: keep the `Pending` verdict and its original tx
-                    // hash, and say the final result was not observed.
+                    // it is no longer pending — asc-contracts #54 also clears it on
+                    // `DestinationFailed` (retryable via deliverMessage, not terminal) — so do NOT
+                    // claim `Delivered`: keep the `Pending` verdict and its original tx hash, and
+                    // say the final result was not observed.
                     if let Some(prev) = outcomes.get(&message_id) {
                         outcomes.record(
                             message_id,
@@ -1703,7 +1713,7 @@ fn spawn_pending_retry<P: Provider + 'static>(
                                 reason: Some(
                                     "no longer pending on-chain (resolved by another party or an \
                                      unobserved retry); final destination result not observed — \
-                                     check the Inbox's MessageDelivered / MessageExecutionFailed logs"
+                                     check the Inbox's MessageExecuted / DestinationFailed logs"
                                         .into(),
                                 ),
                                 ..prev
@@ -1743,19 +1753,29 @@ fn spawn_pending_retry<P: Provider + 'static>(
                     .await
                     {
                         Ok(Ok(receipt)) if receipt.status() => {
-                            // Executed — or (#36) consumed as a destination failure: either way
-                            // the message is no longer pending.
+                            // Executed, or (asc-contracts #54) the destination call failed again:
+                            // either way the message is no longer *pending*, so this bounded
+                            // retryPendingMessage loop is done with it. A destination failure here
+                            // does NOT terminate the message on-chain — pending storage is cleared
+                            // and a fresh `deliverMessage` (not `retryPendingMessage`, which would
+                            // now revert) could still retry it — but this detached task only has
+                            // `message_id`, not the original payload/votes/sequence, so it cannot
+                            // trigger that itself. The message stays genuinely retryable on-chain;
+                            // it would need to re-enter the pool (e.g. via reobservation) or be
+                            // picked up by another relayer to actually retry.
                             let tx_hash = receipt.transaction_hash;
                             match classify_success_logs(inbox_address, receipt.inner.logs()) {
                                 ReceiptClass::DestinationFailed { dispatcher } => {
                                     warn!(chain_key, %message_id, %dispatcher, tx = %tx_hash,
-                                        "♻️ retryPendingMessage consumed the message but the destination call FAILED (MessageExecutionFailed)");
+                                        "♻️ retryPendingMessage cleared pending state but the destination call FAILED AGAIN (DestinationFailed) — \
+                                         not terminal on-chain, but this bounded retry loop cannot itself resubmit deliverMessage without the original payload/votes");
                                     outcomes.record(
                                         message_id,
                                         DeliveryOutcome::new(OutcomeKind::DestinationFailed, chain_key)
                                             .with_tx(tx_hash)
                                             .with_reason(format!(
-                                                "MessageExecutionFailed on retryPendingMessage (dispatcher {dispatcher})"
+                                                "DestinationFailed on retryPendingMessage (dispatcher {dispatcher}); \
+                                                 message is retryable on-chain via deliverMessage but not from here"
                                             )),
                                     );
                                 }
@@ -1900,13 +1920,28 @@ mod tests {
         }
     }
 
+    /// Build a log from an actual ABI-encoded event (topics AND data), for shapes like
+    /// `DestinationFailed`/`MessageExecuted` that carry non-indexed fields — unlike `inbox_log`'s
+    /// topics-only fixtures, which only work for fully-indexed events.
+    fn inbox_event_log(inbox: Address, data: LogData) -> Log {
+        Log {
+            inner: alloy::primitives::Log {
+                address: inbox,
+                data,
+            },
+            ..Default::default()
+        }
+    }
+
     fn addr_topic(a: Address) -> B256 {
         B256::left_padding_from(a.as_slice())
     }
 
-    /// Receipt fixtures for the three successful-tx shapes the Inbox can produce. #36's
-    /// `MessageExecutionFailed` arrives *with* `MessageDelivered`, so it must win over the plain
-    /// success arm, and it must carry the dispatcher out of topics[2].
+    /// Receipt fixtures for the three successful-tx shapes the Inbox can produce. asc-contracts
+    /// #54's `DestinationFailed` arrives *with* `MessageReceived`, so it must win over the plain
+    /// success arm, and — unlike the retired 3-indexed-arg `MessageExecutionFailed` — `dispatcher`
+    /// is a non-indexed field this must decode from the log body, not pull from a fixed topic
+    /// index (topics[2] is `destination` now, a different field entirely).
     #[test]
     fn success_receipt_logs_classify_delivered_pending_and_destination_failed() {
         let inbox = Address::repeat_byte(0xaa);
@@ -1915,23 +1950,26 @@ mod tests {
         let relayer = Address::repeat_byte(0xee);
         let id = B256::repeat_byte(0x01);
 
-        let delivered = inbox_log(
+        let received = inbox_log(
             inbox,
             vec![
-                IInbox::MessageDelivered::SIGNATURE_HASH,
+                IInbox::MessageReceived::SIGNATURE_HASH,
                 id,
                 addr_topic(other),
                 addr_topic(relayer),
             ],
         );
-        let failed = inbox_log(
+        let failed = inbox_event_log(
             inbox,
-            vec![
-                IInbox::MessageExecutionFailed::SIGNATURE_HASH,
-                id,
-                addr_topic(dispatcher),
-                addr_topic(relayer),
-            ],
+            IInbox::DestinationFailed {
+                messageId: id,
+                emitterAddress: other,
+                destination: other,
+                dispatcher,
+                relayer,
+                messagePayload: Bytes::new(),
+            }
+            .encode_log_data(),
         );
         let pending = inbox_log(
             inbox,
@@ -1943,27 +1981,30 @@ mod tests {
             ],
         );
         // The same topic0 from a different contract (a dApp re-emitting) must not count.
-        let foreign_failed = inbox_log(
+        let foreign_failed = inbox_event_log(
             other,
-            vec![
-                IInbox::MessageExecutionFailed::SIGNATURE_HASH,
-                id,
-                addr_topic(dispatcher),
-                addr_topic(relayer),
-            ],
+            IInbox::DestinationFailed {
+                messageId: id,
+                emitterAddress: other,
+                destination: other,
+                dispatcher,
+                relayer,
+                messagePayload: Bytes::new(),
+            }
+            .encode_log_data(),
         );
 
         assert_eq!(
-            classify_success_logs(inbox, [&delivered]),
+            classify_success_logs(inbox, [&received]),
             ReceiptClass::Delivered
         );
         assert_eq!(
-            classify_success_logs(inbox, [&failed, &delivered]),
+            classify_success_logs(inbox, [&failed, &received]),
             ReceiptClass::DestinationFailed { dispatcher }
         );
         // Order-independent.
         assert_eq!(
-            classify_success_logs(inbox, [&delivered, &failed]),
+            classify_success_logs(inbox, [&received, &failed]),
             ReceiptClass::DestinationFailed { dispatcher }
         );
         assert_eq!(
@@ -1971,7 +2012,7 @@ mod tests {
             ReceiptClass::Pending
         );
         assert_eq!(
-            classify_success_logs(inbox, [&foreign_failed, &delivered]),
+            classify_success_logs(inbox, [&foreign_failed, &received]),
             ReceiptClass::Delivered
         );
         assert_eq!(
@@ -1983,14 +2024,14 @@ mod tests {
     /// The topic0 values the classifier keys on are the compiled contract's (pinned by the
     /// abi_surface gate); this pins the Rust side so a mirror edit cannot move them unnoticed.
     #[test]
-    fn message_execution_failed_topic0_is_the_36_signature() {
+    fn destination_failed_topic0_is_the_54_signature() {
         assert_eq!(
-            IInbox::MessageExecutionFailed::SIGNATURE,
-            "MessageExecutionFailed(bytes32,address,address)"
+            IInbox::DestinationFailed::SIGNATURE,
+            "DestinationFailed(bytes32,address,address,address,address,bytes)"
         );
         assert_ne!(
-            IInbox::MessageExecutionFailed::SIGNATURE_HASH,
-            IInbox::MessageDelivered::SIGNATURE_HASH
+            IInbox::DestinationFailed::SIGNATURE_HASH,
+            IInbox::MessageReceived::SIGNATURE_HASH
         );
     }
 

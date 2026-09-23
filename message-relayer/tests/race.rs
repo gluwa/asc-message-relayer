@@ -1,7 +1,7 @@
 //! Race test (PoC test T4) — placeholder.
 //!
 //! Documents the contract: when two relayers race to deliver the same message, exactly one
-//! should observe `MessageDelivered`; the other should hit `MessageAlreadyValidated` and
+//! should observe `MessageReceived`; the other should hit `MessageAlreadyValidated` and
 //! treat it as a successful outcome (PoC §6.5).
 //!
 //! Implementing this end-to-end requires:
@@ -24,7 +24,7 @@ async fn two_relayers_one_succeeds_one_already_validated() {
     // 1. Start anvil; deploy dummy Inbox + Outbox (co-located on one node for test simplicity).
     // 2. Spawn relayer A and relayer B with the same configured route + same attestor set.
     // 3. Publish a MessagePublished event; gossip a quorum of votes.
-    // 4. Assert: exactly one MessageDelivered receipt; the other relayer's metrics show
+    // 4. Assert: exactly one MessageReceived receipt; the other relayer's metrics show
     //    DeliveryStatus::AlreadyValidated += 1 and zero Reverted.
     unimplemented!("see module-level docs");
 }

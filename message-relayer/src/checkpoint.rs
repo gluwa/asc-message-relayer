@@ -1,7 +1,7 @@
 //! Persistent per-watcher block cursors.
 //!
 //! Both the Outbox watcher (source chain `MessagePublished`) and the acknowledgment watcher
-//! (destination chain `MessageDelivered`) scan chain logs by block range. Without persistence they
+//! (destination chain `MessageReceived`) scan chain logs by block range. Without persistence they
 //! start from the chain head on every boot, so any event emitted while the relayer was down is
 //! silently skipped. This store records the last block each watcher has fully processed and is
 //! consulted on startup, so a restart resumes from `last_processed + 1` instead of the head — the
