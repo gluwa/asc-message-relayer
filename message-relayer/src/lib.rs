@@ -39,6 +39,7 @@ pub mod checkpoint;
 pub mod claim;
 pub mod config;
 pub mod delivery;
+pub mod dest_revert;
 pub mod events;
 pub mod hash;
 pub mod health;
