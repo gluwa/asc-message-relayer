@@ -330,6 +330,7 @@ impl Server {
                     self.config.creditcoin_eth_rpc_url.clone(),
                     checkpoint.clone(),
                     self.config.scan_lookback_blocks,
+                    metrics.clone(),
                     health.clone(),
                     broadcast_locks.clone(),
                     cancel.clone(),

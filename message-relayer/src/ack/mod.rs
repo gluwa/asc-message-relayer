@@ -377,6 +377,7 @@ pub async fn run(
                                 .oldest_pending_block()
                                 .map_or(last_seen, |b| last_seen.min(b.saturating_sub(1)));
                             if let Err(err) = cp.set(&checkpoint_key, persist) {
+                                metrics.inc_checkpoint_write_failure(chain_key);
                                 warn!(chain_key, %err, "failed to persist ack checkpoint");
                             }
                         }

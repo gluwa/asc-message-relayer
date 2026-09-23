@@ -64,6 +64,17 @@ pub trait MetricsTrait: Send + Sync + Debug {
     /// Native-token balance (in ether units) of the signer funding `role` on `chain_key`. Polled
     /// by `crate::balance`; the low-balance dashboard threshold hangs off this.
     fn set_signer_balance(&self, chain_key: u64, role: &'static str, address: Address, ether: f64);
+    /// A watcher's checkpoint write (`CheckpointStore::set`/`set_with_outbox`) failed for
+    /// `chain_key` (disk full, permissions, …). The checkpoint is what makes a restart resume
+    /// instead of re-scanning from the chain head or losing the cursor holdback on an in-flight
+    /// message, so a write failure degrading silently into "only visible in logs" would hide a
+    /// real durability regression. A rising count with no matching recovery is worth paging on.
+    fn inc_checkpoint_write_failure(&self, chain_key: u64);
+    /// A message's delivery-attempt count crossed `DELIVERY_MAX_DISPATCH_ATTEMPTS` and is still
+    /// being retried (uncapped by design — see `crate::pool`). Previously only a `warn!` log line;
+    /// a message stuck here for a persistently misbehaving destination (bad gas limit, dead
+    /// signer) is now dashboard-visible instead of log-grep-only.
+    fn inc_delivery_retries_exceeded(&self, chain_key: u64);
 }
 
 /// Shared trait object — used to plumb metrics through services without leaking the concrete type.
@@ -102,6 +113,8 @@ impl MetricsTrait for NoopMetrics {
         _ether: f64,
     ) {
     }
+    fn inc_checkpoint_write_failure(&self, _chain_key: u64) {}
+    fn inc_delivery_retries_exceeded(&self, _chain_key: u64) {}
 }
 
 /// Concrete metrics container.
@@ -130,6 +143,10 @@ pub struct RelayerMetrics {
     start_time_seconds: Gauge<f64, AtomicU64>,
     worker_last_success: Family<LabelWorker, Gauge<f64, AtomicU64>>,
     worker_degraded: Family<LabelWorker, Gauge<i64, AtomicI64>>,
+    checkpoint_write_failures: Family<LabelChain, Counter<u64, AtomicU64>>,
+    delivery_retries_exceeded: Family<LabelChain, Counter<u64, AtomicU64>>,
+    outcome_store_size: Gauge<i64, AtomicI64>,
+    outcome_store_evictions: Gauge<i64, AtomicI64>,
 }
 
 impl RelayerMetrics {
@@ -303,6 +320,43 @@ impl RelayerMetrics {
             worker_degraded.clone(),
         );
 
+        let checkpoint_write_failures = Family::default();
+        registry.register(
+            "relayer_checkpoint_write_failures",
+            "Failed CheckpointStore writes per chain_key (disk full, permissions, …). The \
+             checkpoint is what lets a restart resume instead of re-scanning from the chain head \
+             or losing cursor-holdback protection for an in-flight message, so this should stay \
+             at zero.",
+            checkpoint_write_failures.clone(),
+        );
+
+        let delivery_retries_exceeded = Family::default();
+        registry.register(
+            "relayer_delivery_retries_exceeded",
+            "Delivery attempts on a message past DELIVERY_MAX_DISPATCH_ATTEMPTS, per chain_key. \
+             Retries are uncapped by design, so this is not an error budget — it flags a message \
+             stuck retrying against a persistently misbehaving destination (bad gas limit, dead \
+             signer) that was previously visible only via log-grep.",
+            delivery_retries_exceeded.clone(),
+        );
+
+        let outcome_store_size = Gauge::default();
+        registry.register(
+            "relayer_outcome_store_size",
+            "Current number of entries in the bounded per-message outcome store. Synced at \
+             scrape time.",
+            outcome_store_size.clone(),
+        );
+
+        let outcome_store_evictions = Gauge::default();
+        registry.register(
+            "relayer_outcome_store_evictions_total",
+            "Cumulative count of outcomes evicted from the bounded store past its capacity. A \
+             rising count means /outcomes/{id} 404s can no longer be assumed to mean \"never \
+             recorded\" — the id may have aged out. Synced at scrape time.",
+            outcome_store_evictions.clone(),
+        );
+
         registry.register(
             "relayer_server",
             "Relayer information",
@@ -338,6 +392,10 @@ impl RelayerMetrics {
             start_time_seconds,
             worker_last_success,
             worker_degraded,
+            checkpoint_write_failures,
+            delivery_retries_exceeded,
+            outcome_store_size,
+            outcome_store_evictions,
         }
     }
 
@@ -361,6 +419,19 @@ impl RelayerMetrics {
                 .get_or_create(&LabelWorker { worker })
                 .set(degraded);
         }
+    }
+
+    /// Publish the outcome store's size and cumulative eviction count. Called at scrape time,
+    /// mirroring [`Self::sync_worker_progress`]: the store is the single source of truth and stays
+    /// free of a metrics-crate dependency, rather than threading a `Metrics` handle into it just to
+    /// push two numbers.
+    pub fn sync_outcome_store(&self, outcomes: &crate::outcome::OutcomeStore) {
+        #[allow(clippy::cast_possible_wrap)]
+        // bounded by OutcomeStore's cap, nowhere near i64::MAX
+        self.outcome_store_size.set(outcomes.len() as i64);
+        #[allow(clippy::cast_possible_wrap)]
+        self.outcome_store_evictions
+            .set(outcomes.evictions() as i64);
     }
 
     pub fn encode(&self) -> String {
@@ -522,6 +593,18 @@ impl MetricsTrait for RelayerMetrics {
             })
             .set(ether);
     }
+
+    fn inc_checkpoint_write_failure(&self, chain_key: u64) {
+        self.checkpoint_write_failures
+            .get_or_create(&LabelChain { chain_key })
+            .inc();
+    }
+
+    fn inc_delivery_retries_exceeded(&self, chain_key: u64) {
+        self.delivery_retries_exceeded
+            .get_or_create(&LabelChain { chain_key })
+            .inc();
+    }
 }
 
 /// Build the HTTP surface (`/metrics` + `/health` + `/votes/{message_hash}` + `/outcomes`).
@@ -544,8 +627,10 @@ pub fn build_router(
             "/metrics",
             get(
                 |Extension(m): Extension<Arc<RelayerMetrics>>,
-                 Extension(health): Extension<Arc<crate::health::Health>>| async move {
+                 Extension(health): Extension<Arc<crate::health::Health>>,
+                 Extension(outcomes): Extension<Arc<crate::outcome::OutcomeStore>>| async move {
                     m.sync_worker_progress(&health);
+                    m.sync_outcome_store(&outcomes);
                     m.build_metrics_response()
                 },
             ),
@@ -745,6 +830,14 @@ pub enum DeliveryStatus {
     /// `deliverMessage` reverted `InvalidMessageDispatcher`: the Inbox's dispatcher has no code
     /// and value was attached. Terminal until the Inbox is reconfigured.
     InvalidDispatcher,
+    /// `deliverMessage` reverted with a shape `classify_delivery_revert` does not recognize —
+    /// distinct from the generic `Reverted` bucket (which also covers non-revert failures and
+    /// `InsufficientGasForDestination`) on purpose: the classifier's string/selector matching is
+    /// known to be fragile across node-client dialects (see the `MessageAlreadyProcessed` incident
+    /// documented on `revert_duplicate_delivery`), so a rising count here — as opposed to a rising
+    /// `Reverted` count — is the signal that a revert shape needs a new classifier arm, not just a
+    /// misbehaving publisher.
+    Unclassified,
 }
 
 /// Outcome of one settlement attempt (`submitAcknowledgment` or `claimDelivery`) — shared shape
@@ -1008,5 +1101,71 @@ mod tests {
         m.inc_ack_submission(1, SettlementOutcome::Terminal);
         m.inc_ack_proof_fetch(1, ProofFetchOutcome::Ready);
         m.inc_claim_submission(1, SettlementOutcome::Confirmed);
+        m.inc_checkpoint_write_failure(1);
+        m.inc_delivery_retries_exceeded(1);
+    }
+
+    /// A checkpoint write failure must be attributable to a chain_key, not just a log line — the
+    /// checkpoint is load-bearing for restart safety (see `crate::checkpoint`).
+    #[test]
+    fn checkpoint_write_failure_is_labeled_by_chain() {
+        let m = RelayerMetrics::new(&[8]);
+        m.inc_checkpoint_write_failure(8);
+        m.inc_checkpoint_write_failure(8);
+        let body = m.encode();
+        assert!(
+            body.contains("relayer_checkpoint_write_failures_total{chain_key=\"8\"} 2"),
+            "{body}"
+        );
+    }
+
+    /// A message stuck past the retry-exceeded threshold must be a countable series, not just a
+    /// `warn!` line — see `pool::State::note_delivery_result`.
+    #[test]
+    fn delivery_retries_exceeded_is_labeled_by_chain() {
+        let m = RelayerMetrics::new(&[8]);
+        m.inc_delivery_retries_exceeded(8);
+        let body = m.encode();
+        assert!(
+            body.contains("relayer_delivery_retries_exceeded_total{chain_key=\"8\"} 1"),
+            "{body}"
+        );
+    }
+
+    /// The outcome store's size and cumulative evictions must reach the scrape body, synced from
+    /// the store rather than pushed on every record/evict — mirrors `sync_worker_progress`.
+    #[test]
+    fn outcome_store_stats_reach_the_scrape_body() {
+        let m = RelayerMetrics::new(&[8]);
+        let store = crate::outcome::OutcomeStore::new(2);
+        for n in 1..=3u8 {
+            store.record(
+                alloy::primitives::B256::repeat_byte(n),
+                crate::outcome::DeliveryOutcome::new(crate::outcome::OutcomeKind::Delivered, 8),
+            );
+        }
+        m.sync_outcome_store(&store);
+        let body = m.encode();
+        assert!(
+            body.contains("relayer_outcome_store_size 2"),
+            "store is capped at 2:\n{body}"
+        );
+        assert!(
+            body.contains("relayer_outcome_store_evictions_total 1"),
+            "one of the three records must have evicted the oldest:\n{body}"
+        );
+    }
+
+    /// `Unclassified` must be its own label value on the existing `relayer_deliver_tx` family, not
+    /// folded into the generic `Reverted` bucket — see the `DeliveryStatus::Unclassified` doc.
+    #[test]
+    fn unclassified_revert_is_a_distinct_label() {
+        let m = RelayerMetrics::new(&[8]);
+        m.inc_deliver_tx(8, DeliveryStatus::Unclassified);
+        let body = m.encode();
+        assert!(
+            body.contains("relayer_deliver_tx_total{chain_key=\"8\",status=\"Unclassified\"} 1"),
+            "{body}"
+        );
     }
 }
