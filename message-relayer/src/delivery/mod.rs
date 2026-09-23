@@ -2475,10 +2475,7 @@ mod tests {
     /// idle again and the ticker resumes heartbeating on its own.
     #[test]
     fn idle_ticker_resumes_once_a_full_interval_has_passed_since_the_last_job() {
-        assert!(idle_ticker_should_heartbeat(
-            Some(HEALTH_TICK),
-            HEALTH_TICK
-        ));
+        assert!(idle_ticker_should_heartbeat(Some(HEALTH_TICK), HEALTH_TICK));
         assert!(idle_ticker_should_heartbeat(
             Some(HEALTH_TICK + Duration::from_secs(1)),
             HEALTH_TICK
