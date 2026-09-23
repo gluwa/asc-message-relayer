@@ -275,10 +275,16 @@ pub async fn run(
 
     // Liveness tick. This worker is idle-driven: it blocks on `job_rx.recv()`, so a route with no
     // traffic would otherwise never heartbeat and would be reported stale purely for being quiet.
-    // Beating on this interval means "the select loop is still turning", which is the property we
-    // actually want to assert; per-job progress is reported separately below.
+    // Beating on this interval means "the select loop is still turning" — but only when a job
+    // hasn't reported that same signal more recently: once traffic is flowing, per-job
+    // success/failure (below) is the authoritative signal, and this ticker must stand down. If it
+    // heartbeat unconditionally on every tick, a route whose every job hits the `Err` arm would
+    // still look perfectly healthy — `Health::status` only ever consults `last_err` once
+    // `last_ok` is stale, so a heartbeat every `HEALTH_TICK` keeps a permanently failing worker
+    // green forever (see `idle_ticker_should_heartbeat`).
     let mut liveness = tokio::time::interval(HEALTH_TICK);
     liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_job_at: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -287,7 +293,9 @@ pub async fn run(
                 return Ok(());
             }
             _ = liveness.tick() => {
-                health.heartbeat(&health_key);
+                if idle_ticker_should_heartbeat(last_job_at.map(|t| t.elapsed()), HEALTH_TICK) {
+                    health.heartbeat(&health_key);
+                }
             }
             maybe = job_rx.recv() => {
                 let Some(job) = maybe else {
@@ -333,14 +341,23 @@ pub async fn run(
                     top_up.as_mut(),
                     &outcomes,
                 ).await {
-                    Ok(outcome) => outcome,
+                    Ok(outcome) => {
+                        // The job ran to a classified business outcome (delivered, terminal, or a
+                        // deliberate retryable — e.g. a transport blip `handle_job` already caught
+                        // and mapped to `Ok`) — real forward progress for this worker.
+                        health.heartbeat(&health_key);
+                        outcome
+                    }
                     Err(err) => {
+                        // `handle_job` itself failed unexpectedly, outside the outcomes it already
+                        // classifies internally — the same "the iteration ran and failed" signal
+                        // `ack`/`claim`/`events` report via `health.error`, not progress.
                         error!(chain_key, message_id = %job.message_id, %err, "❌ delivery job failed");
+                        health.error(&health_key);
                         DeliveryResultKind::Retryable
                     }
                 };
-                // Job finished (delivered, terminal, or retryable) — real forward progress.
-                health.heartbeat(&health_key);
+                last_job_at = Some(Instant::now());
                 if result_tx
                     .send(DeliveryResult {
                         chain_key: job.chain_key,
@@ -356,6 +373,19 @@ pub async fn run(
             }
         }
     }
+}
+
+/// Whether the idle-liveness ticker should heartbeat this tick. `elapsed_since_last_job` is `None`
+/// when no job has been processed yet this run (registration-time silence — the ticker must
+/// heartbeat so an idle route is never mistaken for wedged); otherwise it heartbeats only once a
+/// full `tick_interval` has passed without job activity, so a busy route lets its own per-job
+/// heartbeat/error calls (above) be the authoritative signal instead of being masked by this
+/// timer.
+fn idle_ticker_should_heartbeat(
+    elapsed_since_last_job: Option<Duration>,
+    tick_interval: Duration,
+) -> bool {
+    elapsed_since_last_job.is_none_or(|elapsed| elapsed >= tick_interval)
 }
 
 /// Read a message's funded `gasLimit` from the source `RelayerContract` ledger. `Ok(None)` when the
@@ -2420,6 +2450,38 @@ mod tests {
         // An unrelated revert is not a duplicate either.
         assert!(!revert_duplicate_delivery(
             &"execution reverted: VotesBelowThreshold"
+        ));
+    }
+
+    /// No job has run yet this worker's lifetime (registration-time silence) — the ticker must
+    /// heartbeat so an idle-from-the-start route is never mistaken for wedged.
+    #[test]
+    fn idle_ticker_heartbeats_before_any_job_has_run() {
+        assert!(idle_ticker_should_heartbeat(None, HEALTH_TICK));
+    }
+
+    /// A job just ran (success or failure — both update `last_job_at`): the per-job heartbeat/error
+    /// call already reported the accurate signal for this period, so the ticker must stand down
+    /// rather than paper over a run of failures with an unconditional heartbeat.
+    #[test]
+    fn idle_ticker_stands_down_right_after_job_activity() {
+        assert!(!idle_ticker_should_heartbeat(
+            Some(Duration::from_secs(1)),
+            HEALTH_TICK
+        ));
+    }
+
+    /// Once a full tick interval has passed with no further job activity, the route is genuinely
+    /// idle again and the ticker resumes heartbeating on its own.
+    #[test]
+    fn idle_ticker_resumes_once_a_full_interval_has_passed_since_the_last_job() {
+        assert!(idle_ticker_should_heartbeat(
+            Some(HEALTH_TICK),
+            HEALTH_TICK
+        ));
+        assert!(idle_ticker_should_heartbeat(
+            Some(HEALTH_TICK + Duration::from_secs(1)),
+            HEALTH_TICK
         ));
     }
 }
