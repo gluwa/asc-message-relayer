@@ -288,6 +288,10 @@ pub async fn run(
     // Set on every `Err` from `handle_job`, cleared on the next success. Gates how long the ticker
     // stands down for; see `idle_ticker_should_heartbeat`.
     let mut last_error_at: Option<Instant> = None;
+    // A retryable job isn't redispatched the instant its backoff elapses — the pool only scans for
+    // ready retries on its own `PRUNE_TICK_INTERVAL` — so the true worst-case gap between attempts
+    // is the backoff cap plus that scan period, not `DELIVERY_RETRY_MAX` alone.
+    let error_grace_period = crate::pool::DELIVERY_RETRY_MAX + crate::pool::PRUNE_TICK_INTERVAL;
 
     loop {
         tokio::select! {
@@ -300,7 +304,7 @@ pub async fn run(
                     last_job_at.map(|t| t.elapsed()),
                     last_error_at.map(|t| t.elapsed()),
                     HEALTH_TICK,
-                    crate::health::PROGRESS_DEADLINE,
+                    error_grace_period,
                 ) {
                     health.heartbeat(&health_key);
                 }
@@ -395,15 +399,16 @@ pub async fn run(
 ///
 /// `elapsed_since_last_error` is `None` once the worker has never failed, or a job has since
 /// succeeded (which clears it directly via its own `health.heartbeat` call); otherwise the ticker
-/// keeps standing down until `error_grace_period` has passed with no further failure. A short
-/// grace period would let the ticker resume mid-backoff and refresh `last_ok` while the worker is
-/// still actively retrying-and-failing — exactly the masking this gate exists to prevent — so the
-/// caller passes `crate::health::PROGRESS_DEADLINE` itself: the pool's own delivery backoff
-/// (`DELIVERY_RETRY_MAX`, pool/mod.rs) tops out at the same five minutes, so nothing this worker
-/// legitimately still has queued can produce a gap wider than that. Once genuinely nothing has
-/// failed *or* succeeded for that long — the backlog cleared, or the failing message was evicted —
-/// the ticker resumes and reports the route healthy-but-idle rather than leaving it permanently
-/// wedged in `degraded` (or, worse, tripping `stale` and a pod restart) over a failure that no
+/// keeps standing down until `error_grace_period` has passed with no further failure. A grace
+/// period too short would let the ticker resume mid-backoff and refresh `last_ok` while the worker
+/// is still actively retrying-and-failing — exactly the masking this gate exists to prevent — so
+/// the caller must pass an upper bound on how long a legitimate retry gap can be. That is *not*
+/// `pool::DELIVERY_RETRY_MAX` alone: a message only gets redispatched once its backoff has elapsed
+/// **and** the pool's own `collect_ready_deliveries` next runs, which happens solely on
+/// `pool::PRUNE_TICK_INTERVAL` (not the instant the backoff expires) — so the true worst-case gap is
+/// the sum of both. Once genuinely nothing has failed *or* succeeded for that long — the backlog
+/// cleared, or the failing message was evicted — the ticker resumes and reports the route
+/// healthy-but-idle rather than leaving it permanently wedged in `degraded` over a failure that no
 /// longer has anything left to retry.
 fn idle_ticker_should_heartbeat(
     elapsed_since_last_job: Option<Duration>,
@@ -1871,8 +1876,12 @@ fn spawn_pending_retry<P: Provider + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::health::PROGRESS_DEADLINE;
+    use crate::pool::{DELIVERY_RETRY_MAX, PRUNE_TICK_INTERVAL};
     use alloy::primitives::LogData;
+
+    /// Matches the grace period `run` actually computes: see the comment above its `error_grace_period` binding.
+    const ERROR_GRACE_PERIOD: Duration =
+        Duration::from_secs(DELIVERY_RETRY_MAX.as_secs() + PRUNE_TICK_INTERVAL.as_secs());
 
     fn envelope(native_value: u64, gas_limit: u64) -> Vec<u8> {
         (
@@ -2493,7 +2502,7 @@ mod tests {
             None,
             None,
             HEALTH_TICK,
-            PROGRESS_DEADLINE
+            ERROR_GRACE_PERIOD
         ));
     }
 
@@ -2505,7 +2514,7 @@ mod tests {
             Some(Duration::from_secs(1)),
             None,
             HEALTH_TICK,
-            PROGRESS_DEADLINE
+            ERROR_GRACE_PERIOD
         ));
     }
 
@@ -2517,13 +2526,13 @@ mod tests {
             Some(HEALTH_TICK),
             None,
             HEALTH_TICK,
-            PROGRESS_DEADLINE
+            ERROR_GRACE_PERIOD
         ));
         assert!(idle_ticker_should_heartbeat(
             Some(HEALTH_TICK + Duration::from_secs(1)),
             None,
             HEALTH_TICK,
-            PROGRESS_DEADLINE
+            ERROR_GRACE_PERIOD
         ));
     }
 
@@ -2536,7 +2545,7 @@ mod tests {
             Some(Duration::from_secs(1)),
             Some(Duration::from_secs(1)),
             HEALTH_TICK,
-            PROGRESS_DEADLINE
+            ERROR_GRACE_PERIOD
         ));
     }
 
@@ -2551,13 +2560,34 @@ mod tests {
             Some(HEALTH_TICK),
             Some(HEALTH_TICK),
             HEALTH_TICK,
-            PROGRESS_DEADLINE
+            ERROR_GRACE_PERIOD
         ));
         assert!(!idle_ticker_should_heartbeat(
-            Some(PROGRESS_DEADLINE - Duration::from_secs(1)),
-            Some(PROGRESS_DEADLINE - Duration::from_secs(1)),
+            Some(ERROR_GRACE_PERIOD - Duration::from_secs(1)),
+            Some(ERROR_GRACE_PERIOD - Duration::from_secs(1)),
             HEALTH_TICK,
-            PROGRESS_DEADLINE
+            ERROR_GRACE_PERIOD
+        ));
+    }
+
+    /// The exact scenario Bugbot flagged: a retry becoming *eligible* at `DELIVERY_RETRY_MAX` isn't
+    /// the same as it being *dispatched* then — `collect_ready_deliveries` only runs on the pool's
+    /// own `PRUNE_TICK_INTERVAL`, so an eligible retry can still be sitting queued, undispatched, at
+    /// that instant. The ticker must not resume in that window: doing so would refresh `last_ok`
+    /// while a retryable message is still waiting to go out, papering over an active failure loop.
+    #[test]
+    fn idle_ticker_does_not_resume_merely_because_the_backoff_cap_has_elapsed() {
+        assert!(!idle_ticker_should_heartbeat(
+            Some(DELIVERY_RETRY_MAX),
+            Some(DELIVERY_RETRY_MAX),
+            HEALTH_TICK,
+            ERROR_GRACE_PERIOD
+        ));
+        assert!(!idle_ticker_should_heartbeat(
+            Some(DELIVERY_RETRY_MAX + PRUNE_TICK_INTERVAL - Duration::from_secs(1)),
+            Some(DELIVERY_RETRY_MAX + PRUNE_TICK_INTERVAL - Duration::from_secs(1)),
+            HEALTH_TICK,
+            ERROR_GRACE_PERIOD
         ));
     }
 
@@ -2568,16 +2598,16 @@ mod tests {
     #[test]
     fn idle_ticker_resumes_once_the_error_grace_period_has_fully_elapsed() {
         assert!(idle_ticker_should_heartbeat(
-            Some(PROGRESS_DEADLINE),
-            Some(PROGRESS_DEADLINE),
+            Some(ERROR_GRACE_PERIOD),
+            Some(ERROR_GRACE_PERIOD),
             HEALTH_TICK,
-            PROGRESS_DEADLINE
+            ERROR_GRACE_PERIOD
         ));
         assert!(idle_ticker_should_heartbeat(
             Some(Duration::from_secs(3600)),
             Some(Duration::from_secs(3600)),
             HEALTH_TICK,
-            PROGRESS_DEADLINE
+            ERROR_GRACE_PERIOD
         ));
     }
 }

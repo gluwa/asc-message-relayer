@@ -40,12 +40,20 @@ const REOBS_STALL_AFTER: Duration = Duration::from_secs(60);
 /// Minimum gap between successive reobservation requests for the same stalled message.
 const REOBS_REPEAT_EVERY: Duration = Duration::from_secs(60);
 const DELIVERY_RETRY_BASE: Duration = Duration::from_secs(30);
-const DELIVERY_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
+/// Upper bound on the backoff between delivery re-attempts for a persistently failing message.
+/// Read by the delivery worker's idle-liveness ticker (`delivery::idle_ticker_should_heartbeat`) to
+/// size its own error-grace window, since a retry can legitimately be delayed by this much.
+pub(crate) const DELIVERY_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
 const DELIVERY_MAX_DISPATCH_ATTEMPTS: u32 = 5;
 /// Short delay before re-dispatching a job whose per-route delivery channel was full (backpressure).
 /// Long enough for the worker to drain an in-flight job, short enough that delivery isn't needlessly
 /// delayed once the channel clears.
 const DELIVERY_CHANNEL_FULL_REQUEUE_DELAY: Duration = Duration::from_secs(2);
+/// Cadence of the pool's prune/retry-dispatch tick. `collect_ready_deliveries` — which redispatches
+/// a message once its backoff (capped by [`DELIVERY_RETRY_MAX`]) elapses — only runs on this tick,
+/// so an eligible retry can sit ready for up to this long before it actually goes out. Read by the
+/// delivery worker's idle-liveness ticker to size its error-grace window accordingly.
+pub(crate) const PRUNE_TICK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Snapshot of the votes accumulated for one message, answered by the pool over [`PoolQuery`] and
 /// served read-only at `GET /votes/{message_hash}`. Lets a relayer act as a queryable "spy node":
@@ -132,7 +140,7 @@ pub async fn run(
     // Same guard for the query channel (sender held by the HTTP layer until shutdown).
     let mut query_open = true;
 
-    let mut prune_tick = tokio::time::interval(Duration::from_secs(30));
+    let mut prune_tick = tokio::time::interval(PRUNE_TICK_INTERVAL);
     prune_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // Register at startup so a pool that wedges before its first prune tick still goes stale (C2r).
