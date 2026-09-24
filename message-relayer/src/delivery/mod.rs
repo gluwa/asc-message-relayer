@@ -285,8 +285,9 @@ pub async fn run(
     let mut liveness = tokio::time::interval(HEALTH_TICK);
     liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_job_at: Option<Instant> = None;
-    // Only meaningful once `last_job_at` is `Some`; see `idle_ticker_should_heartbeat`.
-    let mut last_job_ok = true;
+    // Set on every `Err` from `handle_job`, cleared on the next success. Gates how long the ticker
+    // stands down for; see `idle_ticker_should_heartbeat`.
+    let mut last_error_at: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -297,8 +298,9 @@ pub async fn run(
             _ = liveness.tick() => {
                 if idle_ticker_should_heartbeat(
                     last_job_at.map(|t| t.elapsed()),
-                    last_job_ok,
+                    last_error_at.map(|t| t.elapsed()),
                     HEALTH_TICK,
+                    crate::health::PROGRESS_DEADLINE,
                 ) {
                     health.heartbeat(&health_key);
                 }
@@ -352,7 +354,7 @@ pub async fn run(
                         // deliberate retryable — e.g. a transport blip `handle_job` already caught
                         // and mapped to `Ok`) — real forward progress for this worker.
                         health.heartbeat(&health_key);
-                        last_job_ok = true;
+                        last_error_at = None;
                         outcome
                     }
                     Err(err) => {
@@ -361,7 +363,7 @@ pub async fn run(
                         // `ack`/`claim`/`events` report via `health.error`, not progress.
                         error!(chain_key, message_id = %job.message_id, %err, "❌ delivery job failed");
                         health.error(&health_key);
-                        last_job_ok = false;
+                        last_error_at = Some(Instant::now());
                         DeliveryResultKind::Retryable
                     }
                 };
@@ -383,26 +385,37 @@ pub async fn run(
     }
 }
 
-/// Whether the idle-liveness ticker should heartbeat this tick. `elapsed_since_last_job` is `None`
-/// when no job has been processed yet this run (registration-time silence — the ticker must
-/// heartbeat so an idle route is never mistaken for wedged).
+/// Whether the idle-liveness ticker should heartbeat this tick.
 ///
-/// Otherwise, `last_job_ok` — the outcome of that most recent job — decides whether the ticker may
-/// resume at all: once a job fails, the ticker stands down for good (regardless of how long it's
-/// been) and stays down until a *later successful* job heartbeats directly and flips it back, so a
-/// route retried slower than `tick_interval` (pool retries and the prune tick both run on a 30s
-/// cadence, slower than the 15s `HEALTH_TICK`) can never have its run of failures papered over by
-/// this timer. Only when the last job succeeded does the ticker resume — and even then only once a
-/// full `tick_interval` has passed without further activity, so a busy healthy route still lets its
-/// own per-job heartbeats be the authoritative signal.
+/// `elapsed_since_last_job` is `None` when no job has been processed yet this run
+/// (registration-time silence — the ticker must heartbeat so an idle route is never mistaken for
+/// wedged); otherwise the ticker stands down for one `tick_interval` right after *any* job so a
+/// busy route lets its own per-job heartbeat/error calls be the authoritative signal instead of
+/// being doubled up by this timer.
+///
+/// `elapsed_since_last_error` is `None` once the worker has never failed, or a job has since
+/// succeeded (which clears it directly via its own `health.heartbeat` call); otherwise the ticker
+/// keeps standing down until `error_grace_period` has passed with no further failure. A short
+/// grace period would let the ticker resume mid-backoff and refresh `last_ok` while the worker is
+/// still actively retrying-and-failing — exactly the masking this gate exists to prevent — so the
+/// caller passes `crate::health::PROGRESS_DEADLINE` itself: the pool's own delivery backoff
+/// (`DELIVERY_RETRY_MAX`, pool/mod.rs) tops out at the same five minutes, so nothing this worker
+/// legitimately still has queued can produce a gap wider than that. Once genuinely nothing has
+/// failed *or* succeeded for that long — the backlog cleared, or the failing message was evicted —
+/// the ticker resumes and reports the route healthy-but-idle rather than leaving it permanently
+/// wedged in `degraded` (or, worse, tripping `stale` and a pod restart) over a failure that no
+/// longer has anything left to retry.
 fn idle_ticker_should_heartbeat(
     elapsed_since_last_job: Option<Duration>,
-    last_job_ok: bool,
+    elapsed_since_last_error: Option<Duration>,
     tick_interval: Duration,
+    error_grace_period: Duration,
 ) -> bool {
+    let past_error_grace =
+        elapsed_since_last_error.is_none_or(|elapsed| elapsed >= error_grace_period);
     match elapsed_since_last_job {
         None => true,
-        Some(elapsed) => last_job_ok && elapsed >= tick_interval,
+        Some(elapsed) => past_error_grace && elapsed >= tick_interval,
     }
 }
 
@@ -1858,6 +1871,7 @@ fn spawn_pending_retry<P: Provider + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::health::PROGRESS_DEADLINE;
     use alloy::primitives::LogData;
 
     fn envelope(native_value: u64, gas_limit: u64) -> Vec<u8> {
@@ -2475,33 +2489,41 @@ mod tests {
     /// heartbeat so an idle-from-the-start route is never mistaken for wedged.
     #[test]
     fn idle_ticker_heartbeats_before_any_job_has_run() {
-        assert!(idle_ticker_should_heartbeat(None, true, HEALTH_TICK));
+        assert!(idle_ticker_should_heartbeat(
+            None,
+            None,
+            HEALTH_TICK,
+            PROGRESS_DEADLINE
+        ));
     }
 
-    /// A job just succeeded: the per-job heartbeat call already reported progress for this period,
-    /// so the ticker must stand down rather than double-report.
+    /// A job just succeeded (no error outstanding): the per-job heartbeat call already reported
+    /// progress for this period, so the ticker must stand down rather than double-report.
     #[test]
     fn idle_ticker_stands_down_right_after_a_successful_job() {
         assert!(!idle_ticker_should_heartbeat(
             Some(Duration::from_secs(1)),
-            true,
-            HEALTH_TICK
+            None,
+            HEALTH_TICK,
+            PROGRESS_DEADLINE
         ));
     }
 
-    /// Once a full tick interval has passed with no further job activity after a success, the route
-    /// is genuinely idle again and the ticker resumes heartbeating on its own.
+    /// Once a full tick interval has passed with no further job activity and no outstanding error,
+    /// the route is genuinely idle again and the ticker resumes heartbeating on its own.
     #[test]
     fn idle_ticker_resumes_once_a_full_interval_has_passed_since_a_successful_job() {
         assert!(idle_ticker_should_heartbeat(
             Some(HEALTH_TICK),
-            true,
-            HEALTH_TICK
+            None,
+            HEALTH_TICK,
+            PROGRESS_DEADLINE
         ));
         assert!(idle_ticker_should_heartbeat(
             Some(HEALTH_TICK + Duration::from_secs(1)),
-            true,
-            HEALTH_TICK
+            None,
+            HEALTH_TICK,
+            PROGRESS_DEADLINE
         ));
     }
 
@@ -2512,27 +2534,50 @@ mod tests {
     fn idle_ticker_stands_down_right_after_a_failed_job() {
         assert!(!idle_ticker_should_heartbeat(
             Some(Duration::from_secs(1)),
-            false,
-            HEALTH_TICK
+            Some(Duration::from_secs(1)),
+            HEALTH_TICK,
+            PROGRESS_DEADLINE
         ));
     }
 
-    /// The core regression this gate exists to prevent: pool retries (and the prune tick) run on a
-    /// 30s cadence, slower than the 15s `HEALTH_TICK`, so a persistently failing route sits idle for
-    /// longer than one tick interval between retries. The ticker must keep standing down for as long
-    /// as the last job was a failure, no matter how much time has elapsed — only a later success
-    /// (via its own direct `health.heartbeat` call) may resume it.
+    /// The core regression this gate exists to prevent: the pool's own delivery backoff
+    /// (`DELIVERY_RETRY_MAX`) can space retries up to five minutes apart, far slower than the 15s
+    /// `HEALTH_TICK`. The ticker must keep standing down for the whole error-grace period no matter
+    /// how long a single gap between job activity runs, so a still-retrying route can never have its
+    /// run of failures papered over by this timer.
     #[test]
-    fn idle_ticker_never_resumes_on_its_own_while_the_last_job_failed() {
+    fn idle_ticker_stands_down_through_a_full_retry_backoff_window() {
         assert!(!idle_ticker_should_heartbeat(
             Some(HEALTH_TICK),
-            false,
-            HEALTH_TICK
+            Some(HEALTH_TICK),
+            HEALTH_TICK,
+            PROGRESS_DEADLINE
         ));
         assert!(!idle_ticker_should_heartbeat(
+            Some(PROGRESS_DEADLINE - Duration::from_secs(1)),
+            Some(PROGRESS_DEADLINE - Duration::from_secs(1)),
+            HEALTH_TICK,
+            PROGRESS_DEADLINE
+        ));
+    }
+
+    /// Once the error-grace period has fully elapsed with no further failure — the backlog cleared,
+    /// or the failing message was evicted from the pool and nothing remains to retry — the ticker
+    /// resumes on its own rather than leaving the route wedged in `degraded`, or worse `stale`, over
+    /// a failure with nothing left behind it.
+    #[test]
+    fn idle_ticker_resumes_once_the_error_grace_period_has_fully_elapsed() {
+        assert!(idle_ticker_should_heartbeat(
+            Some(PROGRESS_DEADLINE),
+            Some(PROGRESS_DEADLINE),
+            HEALTH_TICK,
+            PROGRESS_DEADLINE
+        ));
+        assert!(idle_ticker_should_heartbeat(
             Some(Duration::from_secs(3600)),
-            false,
-            HEALTH_TICK
+            Some(Duration::from_secs(3600)),
+            HEALTH_TICK,
+            PROGRESS_DEADLINE
         ));
     }
 }
