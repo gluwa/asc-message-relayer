@@ -40,7 +40,15 @@ use tracing::{info, warn};
 /// process unhealthy. Generous versus every worker's poll cadence (outbox/ack/claim scan ~6s, pool
 /// prune 30s) so a quiet relayer is never killed; short enough that a genuinely wedged worker (dead
 /// provider → no successful poll ever again) trips a restart within a few minutes.
-pub const PROGRESS_DEADLINE: Duration = Duration::from_secs(5 * 60);
+///
+/// Must also clear the delivery worker's own worst-case *legitimate* gap between retry attempts on
+/// a persistently failing message: `pool::DELIVERY_RETRY_MAX` (5 min) plus `pool::PRUNE_TICK_INTERVAL`
+/// (30s, since a retry only actually goes out on the pool's own prune tick, not the instant its
+/// backoff elapses) — 5.5 min, with a further 30s of margin here. Undershooting this makes a
+/// still-retrying route misread as `stale` instead of `degraded` right at the tail of a max backoff
+/// (see `delivery::idle_ticker_should_heartbeat`'s `error_grace_period`, which is `debug_assert`ed
+/// against this constant).
+pub const PROGRESS_DEADLINE: Duration = Duration::from_secs(6 * 60);
 
 fn now_unix_ms() -> u64 {
     SystemTime::now()
