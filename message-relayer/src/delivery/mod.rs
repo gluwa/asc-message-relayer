@@ -285,6 +285,8 @@ pub async fn run(
     let mut liveness = tokio::time::interval(HEALTH_TICK);
     liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_job_at: Option<Instant> = None;
+    // Only meaningful once `last_job_at` is `Some`; see `idle_ticker_should_heartbeat`.
+    let mut last_job_ok = true;
 
     loop {
         tokio::select! {
@@ -293,7 +295,11 @@ pub async fn run(
                 return Ok(());
             }
             _ = liveness.tick() => {
-                if idle_ticker_should_heartbeat(last_job_at.map(|t| t.elapsed()), HEALTH_TICK) {
+                if idle_ticker_should_heartbeat(
+                    last_job_at.map(|t| t.elapsed()),
+                    last_job_ok,
+                    HEALTH_TICK,
+                ) {
                     health.heartbeat(&health_key);
                 }
             }
@@ -346,6 +352,7 @@ pub async fn run(
                         // deliberate retryable — e.g. a transport blip `handle_job` already caught
                         // and mapped to `Ok`) — real forward progress for this worker.
                         health.heartbeat(&health_key);
+                        last_job_ok = true;
                         outcome
                     }
                     Err(err) => {
@@ -354,6 +361,7 @@ pub async fn run(
                         // `ack`/`claim`/`events` report via `health.error`, not progress.
                         error!(chain_key, message_id = %job.message_id, %err, "❌ delivery job failed");
                         health.error(&health_key);
+                        last_job_ok = false;
                         DeliveryResultKind::Retryable
                     }
                 };
@@ -377,15 +385,25 @@ pub async fn run(
 
 /// Whether the idle-liveness ticker should heartbeat this tick. `elapsed_since_last_job` is `None`
 /// when no job has been processed yet this run (registration-time silence — the ticker must
-/// heartbeat so an idle route is never mistaken for wedged); otherwise it heartbeats only once a
-/// full `tick_interval` has passed without job activity, so a busy route lets its own per-job
-/// heartbeat/error calls (above) be the authoritative signal instead of being masked by this
-/// timer.
+/// heartbeat so an idle route is never mistaken for wedged).
+///
+/// Otherwise, `last_job_ok` — the outcome of that most recent job — decides whether the ticker may
+/// resume at all: once a job fails, the ticker stands down for good (regardless of how long it's
+/// been) and stays down until a *later successful* job heartbeats directly and flips it back, so a
+/// route retried slower than `tick_interval` (pool retries and the prune tick both run on a 30s
+/// cadence, slower than the 15s `HEALTH_TICK`) can never have its run of failures papered over by
+/// this timer. Only when the last job succeeded does the ticker resume — and even then only once a
+/// full `tick_interval` has passed without further activity, so a busy healthy route still lets its
+/// own per-job heartbeats be the authoritative signal.
 fn idle_ticker_should_heartbeat(
     elapsed_since_last_job: Option<Duration>,
+    last_job_ok: bool,
     tick_interval: Duration,
 ) -> bool {
-    elapsed_since_last_job.is_none_or(|elapsed| elapsed >= tick_interval)
+    match elapsed_since_last_job {
+        None => true,
+        Some(elapsed) => last_job_ok && elapsed >= tick_interval,
+    }
 }
 
 /// Read a message's funded `gasLimit` from the source `RelayerContract` ledger. `Ok(None)` when the
@@ -2457,27 +2475,63 @@ mod tests {
     /// heartbeat so an idle-from-the-start route is never mistaken for wedged.
     #[test]
     fn idle_ticker_heartbeats_before_any_job_has_run() {
-        assert!(idle_ticker_should_heartbeat(None, HEALTH_TICK));
+        assert!(idle_ticker_should_heartbeat(None, true, HEALTH_TICK));
     }
 
-    /// A job just ran (success or failure — both update `last_job_at`): the per-job heartbeat/error
-    /// call already reported the accurate signal for this period, so the ticker must stand down
-    /// rather than paper over a run of failures with an unconditional heartbeat.
+    /// A job just succeeded: the per-job heartbeat call already reported progress for this period,
+    /// so the ticker must stand down rather than double-report.
     #[test]
-    fn idle_ticker_stands_down_right_after_job_activity() {
+    fn idle_ticker_stands_down_right_after_a_successful_job() {
         assert!(!idle_ticker_should_heartbeat(
             Some(Duration::from_secs(1)),
+            true,
             HEALTH_TICK
         ));
     }
 
-    /// Once a full tick interval has passed with no further job activity, the route is genuinely
-    /// idle again and the ticker resumes heartbeating on its own.
+    /// Once a full tick interval has passed with no further job activity after a success, the route
+    /// is genuinely idle again and the ticker resumes heartbeating on its own.
     #[test]
-    fn idle_ticker_resumes_once_a_full_interval_has_passed_since_the_last_job() {
-        assert!(idle_ticker_should_heartbeat(Some(HEALTH_TICK), HEALTH_TICK));
+    fn idle_ticker_resumes_once_a_full_interval_has_passed_since_a_successful_job() {
+        assert!(idle_ticker_should_heartbeat(
+            Some(HEALTH_TICK),
+            true,
+            HEALTH_TICK
+        ));
         assert!(idle_ticker_should_heartbeat(
             Some(HEALTH_TICK + Duration::from_secs(1)),
+            true,
+            HEALTH_TICK
+        ));
+    }
+
+    /// A job just failed: the per-job `health.error` call already reported the accurate signal, so
+    /// the ticker must stand down rather than paper over the failure with an unconditional
+    /// heartbeat.
+    #[test]
+    fn idle_ticker_stands_down_right_after_a_failed_job() {
+        assert!(!idle_ticker_should_heartbeat(
+            Some(Duration::from_secs(1)),
+            false,
+            HEALTH_TICK
+        ));
+    }
+
+    /// The core regression this gate exists to prevent: pool retries (and the prune tick) run on a
+    /// 30s cadence, slower than the 15s `HEALTH_TICK`, so a persistently failing route sits idle for
+    /// longer than one tick interval between retries. The ticker must keep standing down for as long
+    /// as the last job was a failure, no matter how much time has elapsed — only a later success
+    /// (via its own direct `health.heartbeat` call) may resume it.
+    #[test]
+    fn idle_ticker_never_resumes_on_its_own_while_the_last_job_failed() {
+        assert!(!idle_ticker_should_heartbeat(
+            Some(HEALTH_TICK),
+            false,
+            HEALTH_TICK
+        ));
+        assert!(!idle_ticker_should_heartbeat(
+            Some(Duration::from_secs(3600)),
+            false,
             HEALTH_TICK
         ));
     }
