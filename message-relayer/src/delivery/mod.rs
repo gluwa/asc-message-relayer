@@ -292,6 +292,16 @@ pub async fn run(
     // ready retries on its own `PRUNE_TICK_INTERVAL` — so the true worst-case gap between attempts
     // is the backoff cap plus that scan period, not `DELIVERY_RETRY_MAX` alone.
     let error_grace_period = crate::pool::DELIVERY_RETRY_MAX + crate::pool::PRUNE_TICK_INTERVAL;
+    // `Health::status` ages `last_err` out on its own `PROGRESS_DEADLINE`, independently of this
+    // ticker. If that deadline were shorter than our own grace period, a still-retrying route would
+    // read `stale` instead of `degraded` right at the tail of a max backoff — catch that drift here
+    // rather than let the two constants silently fall out of sync again.
+    debug_assert!(
+        error_grace_period <= crate::health::PROGRESS_DEADLINE,
+        "delivery's worst-case retry gap ({error_grace_period:?}) exceeds the health watchdog's \
+         PROGRESS_DEADLINE ({:?}); a still-retrying route can misreport as stale",
+        crate::health::PROGRESS_DEADLINE,
+    );
 
     loop {
         tokio::select! {
