@@ -385,7 +385,7 @@ impl State {
             },
         );
         route.order.push_back(hash);
-        route.evict_overflow();
+        route.evict_overflow(chain_key);
 
         // Adopt any votes that arrived before this message was indexed. Doing it here rather than
         // waiting for re-gossip is the whole point of the buffer: it is what removes the
@@ -911,12 +911,46 @@ impl RouteState {
         }
     }
 
-    fn evict_overflow(&mut self) {
+    /// Evict once the route is over `cache_max`, preferring an already-resolved slot (`delivered`
+    /// or `terminal`) over the oldest slot outright. `prune_expired` already reaps `delivered`
+    /// slots eagerly and `terminal` ones past TTL on its own ~30s tick, so in the common case there
+    /// is nothing left here for this scan to find — this exists for the gap between prune ticks,
+    /// and for the sustained-backlog case prune can't help with.
+    ///
+    /// Falling back to the strict-oldest slot (today's only behavior) means evicting a message that
+    /// is still gathering votes or awaiting delivery. That is a real capacity-pressure signal, not
+    /// routine housekeeping: the evicted hash drops out of `oldest_unfinished_blocks` (the
+    /// checkpoint holdback's input), so a restart can rescan straight past it, and any votes
+    /// collected for it so far are gone outright — if it is later re-observed, vote collection
+    /// starts over from zero. Logged loudly so an operator sees capacity pressure before it turns
+    /// into a silently dropped message.
+    fn evict_overflow(&mut self, chain_key: u64) {
         while self.by_message.len() > self.cache_max {
-            let Some(oldest) = self.order.pop_front() else {
+            let mut resolved = None;
+            for hash in &self.order {
+                if let Some(slot) = self.by_message.get(hash) {
+                    if slot.delivered || slot.terminal {
+                        resolved = Some(*hash);
+                        break;
+                    }
+                }
+            }
+            let forced_undelivered = resolved.is_none();
+            let Some(victim) = resolved.or_else(|| self.order.front().copied()) else {
                 break;
             };
-            self.by_message.remove(&oldest);
+            if forced_undelivered {
+                warn!(
+                    chain_key,
+                    message_hash = %victim,
+                    cache_max = self.cache_max,
+                    "pool at capacity with no delivered/terminal slot to evict; forcibly dropping \
+                     the oldest still-undelivered message — its collected votes are lost and it \
+                     loses checkpoint-holdback protection until re-observed"
+                );
+            }
+            self.order.retain(|h| *h != victim);
+            self.by_message.remove(&victim);
         }
     }
 
@@ -1356,6 +1390,93 @@ mod tests {
             state.note_indexed(indexed_for(2, B256::from(h)), metrics.as_ref());
         }
         assert_eq!(state.total_pending(), 2);
+    }
+
+    #[test]
+    fn evict_overflow_prefers_delivered_slot_over_undelivered() {
+        let signer = test_signer(0x61);
+        let addr = signer.address();
+        let route = route_for(2, vec![addr]);
+        let cache = VoteCacheConfig {
+            ttl_seconds: 600,
+            max_messages: 2,
+        };
+        let mut state = State::new(vec![route], cache);
+        let metrics = NoopMetrics::new();
+
+        // A: indexed, then gathers a vote — still undelivered, with a collected signer.
+        let hash_a = B256::from([0xA1u8; 32]);
+        state.note_indexed(indexed_for(2, hash_a), metrics.as_ref());
+        state.note_vote(vote_for(2, hash_a, &signer, None), metrics.as_ref());
+        assert_eq!(state.by_route[&2].by_message[&hash_a].signers.len(), 1);
+
+        // B: indexed, then resolved as delivered.
+        let hash_b = B256::from([0xB2u8; 32]);
+        state.note_indexed(indexed_for(2, hash_b), metrics.as_ref());
+        state.note_delivery_result(
+            DeliveryResult {
+                chain_key: 2,
+                message_hash: hash_b,
+                outcome: DeliveryResultKind::Delivered,
+            },
+            metrics.as_ref(),
+        );
+        assert_eq!(state.total_pending(), 2, "at cap, nothing evicted yet");
+
+        // C pushes the route over cache_max: the delivered B must be evicted, not the
+        // still-in-progress A.
+        let hash_c = B256::from([0xC3u8; 32]);
+        state.note_indexed(indexed_for(2, hash_c), metrics.as_ref());
+
+        assert_eq!(state.total_pending(), 2);
+        let route = &state.by_route[&2];
+        assert!(
+            route.by_message.contains_key(&hash_a),
+            "the undelivered slot with collected votes must survive"
+        );
+        assert_eq!(
+            route.by_message[&hash_a].signers.len(),
+            1,
+            "its collected votes must not be lost"
+        );
+        assert!(
+            !route.by_message.contains_key(&hash_b),
+            "the delivered slot should be evicted first"
+        );
+        assert!(route.by_message.contains_key(&hash_c));
+    }
+
+    #[test]
+    fn evict_overflow_falls_back_to_oldest_when_nothing_is_resolved() {
+        let route = route_for(
+            2,
+            vec![address!("000000000000000000000000000000000000000a")],
+        );
+        let cache = VoteCacheConfig {
+            ttl_seconds: 600,
+            max_messages: 2,
+        };
+        let mut state = State::new(vec![route], cache);
+        let metrics = NoopMetrics::new();
+        let hashes: Vec<B256> = (1u8..=3)
+            .map(|byte| {
+                let mut h = [0u8; 32];
+                h[0] = byte;
+                B256::from(h)
+            })
+            .collect();
+        for hash in &hashes {
+            state.note_indexed(indexed_for(2, *hash), metrics.as_ref());
+        }
+
+        assert_eq!(state.total_pending(), 2);
+        let route = &state.by_route[&2];
+        assert!(
+            !route.by_message.contains_key(&hashes[0]),
+            "with nothing delivered/terminal, the strict-oldest slot is still the one evicted"
+        );
+        assert!(route.by_message.contains_key(&hashes[1]));
+        assert!(route.by_message.contains_key(&hashes[2]));
     }
 
     #[test]
