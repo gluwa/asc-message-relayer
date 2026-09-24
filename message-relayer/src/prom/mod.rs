@@ -350,10 +350,13 @@ impl RelayerMetrics {
 
         let outcome_store_evictions = Gauge::default();
         registry.register(
-            "relayer_outcome_store_evictions_total",
+            "relayer_outcome_store_evictions",
             "Cumulative count of outcomes evicted from the bounded store past its capacity. A \
              rising count means /outcomes/{id} 404s can no longer be assumed to mean \"never \
-             recorded\" — the id may have aged out. Synced at scrape time.",
+             recorded\" — the id may have aged out. This is a scrape-time gauge synced from the \
+             store's own counter (mirrors `outcome_store_size`), not a `Counter` metric, so it \
+             deliberately carries no `_total` suffix — that suffix is Prometheus/OpenMetrics' \
+             reserved marker for the `Counter` type.",
             outcome_store_evictions.clone(),
         );
 
@@ -1151,7 +1154,7 @@ mod tests {
             "store is capped at 2:\n{body}"
         );
         assert!(
-            body.contains("relayer_outcome_store_evictions_total 1"),
+            body.contains("relayer_outcome_store_evictions 1"),
             "one of the three records must have evicted the oldest:\n{body}"
         );
     }
