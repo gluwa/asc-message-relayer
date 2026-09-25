@@ -1021,7 +1021,7 @@ fn settle_pre_send_revert(
             Stage::Proceed
         }
         DeliveryRevert::Other => {
-            metrics.inc_deliver_tx(chain_key, DeliveryStatus::Reverted);
+            metrics.inc_deliver_tx(chain_key, DeliveryStatus::Unclassified);
             let detail = describe_unknown_revert(err, &job.payload);
             warn!(chain_key, %message_id, %err, %detail,
                 "{stage}(deliverMessage) reverted; treating as terminal (undeliverable as published)");
@@ -1658,9 +1658,12 @@ async fn handle_job<P: Provider + Clone + 'static>(
 }
 
 /// The `relayer_deliver_tx` label for a terminal revert, whichever stage surfaced it (simulate,
-/// estimate, send, or the mined-revert replay). The #36 hard failures get their own series;
-/// everything else is the generic `Reverted`. Single source of truth so the send-time path cannot
-/// drift from the pre-send one (Bugbot, PR #63).
+/// estimate, send, or the mined-revert replay). The #36 hard failures get their own series; a
+/// revert `classify_delivery_revert` could not recognize gets `Unclassified` (distinct from the
+/// generic `Reverted`, which also covers `InsufficientGasForDestination` and non-revert failures —
+/// see the label's doc) so a new node-dialect revert shape is visible as its own series rather than
+/// hiding inside `Reverted`. Single source of truth so the send-time path cannot drift from the
+/// pre-send one (Bugbot, PR #63).
 fn revert_status(revert: Option<DeliveryRevert>) -> DeliveryStatus {
     match revert {
         Some(DeliveryRevert::ValidationFailedWithNativeValue) => {
@@ -1668,9 +1671,8 @@ fn revert_status(revert: Option<DeliveryRevert>) -> DeliveryStatus {
         }
         Some(DeliveryRevert::InvalidMessageDispatcher) => DeliveryStatus::InvalidDispatcher,
         Some(DeliveryRevert::Duplicate) => DeliveryStatus::AlreadyValidated,
-        Some(DeliveryRevert::InsufficientGasForDestination | DeliveryRevert::Other) | None => {
-            DeliveryStatus::Reverted
-        }
+        Some(DeliveryRevert::Other) => DeliveryStatus::Unclassified,
+        Some(DeliveryRevert::InsufficientGasForDestination) | None => DeliveryStatus::Reverted,
     }
 }
 
@@ -2234,7 +2236,9 @@ mod tests {
 
     /// Every stage that ends in a terminal revert maps the classification to the same label: the
     /// #36 hard failures get their own series whether they surfaced at simulate, send, or in the
-    /// mined-revert replay; everything else is the generic `Reverted`.
+    /// mined-revert replay; an unrecognized revert shape gets its own `Unclassified` series
+    /// (distinct from the generic `Reverted`, which still covers `InsufficientGasForDestination`
+    /// and non-revert failures).
     #[test]
     fn revert_status_gives_36_errors_their_own_labels_at_every_stage() {
         assert_eq!(
@@ -2255,7 +2259,7 @@ mod tests {
         );
         assert_eq!(
             revert_status(Some(DeliveryRevert::Other)),
-            DeliveryStatus::Reverted
+            DeliveryStatus::Unclassified
         );
         assert_eq!(revert_status(None), DeliveryStatus::Reverted);
     }

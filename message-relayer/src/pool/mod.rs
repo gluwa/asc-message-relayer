@@ -575,6 +575,7 @@ impl State {
                 if slot.delivery_attempts >= DELIVERY_MAX_DISPATCH_ATTEMPTS {
                     // Past the old give-up point: escalate so a persistently failing destination is
                     // alertable, but keep trying rather than dropping.
+                    metrics.inc_delivery_retries_exceeded(result.chain_key);
                     warn!(
                         chain_key = result.chain_key,
                         message_hash = %result.message_hash,

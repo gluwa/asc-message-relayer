@@ -329,6 +329,7 @@ pub async fn watch_outbox(
                             if let Err(err) =
                                 cp.set_with_outbox(&checkpoint_key, persist, &outbox.to_string())
                             {
+                                metrics.inc_checkpoint_write_failure(chain_key);
                                 warn!(chain_key, %err, "failed to persist Outbox checkpoint");
                             }
                         }

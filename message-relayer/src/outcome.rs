@@ -14,6 +14,7 @@
 //! the two from the vote pool.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -91,6 +92,11 @@ impl DeliveryOutcome {
 pub struct OutcomeStore {
     inner: Mutex<Inner>,
     cap: usize,
+    /// Cumulative count of entries evicted past `cap`. Plain atomic rather than a `Metrics` handle
+    /// so this stays a pure data structure — `crate::prom::RelayerMetrics::sync_outcome_store`
+    /// reads it at scrape time, the same pattern `crate::health::Health` already uses for
+    /// per-worker progress.
+    evictions: AtomicU64,
 }
 
 struct Inner {
@@ -107,6 +113,7 @@ impl OutcomeStore {
                 order: VecDeque::new(),
             }),
             cap: cap.max(1),
+            evictions: AtomicU64::new(0),
         }
     }
 
@@ -117,9 +124,17 @@ impl OutcomeStore {
             while inner.order.len() > self.cap {
                 if let Some(old) = inner.order.pop_front() {
                     inner.by_id.remove(&old);
+                    self.evictions.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
+    }
+
+    /// Cumulative count of entries evicted past capacity. An `/outcomes/{id}` 404 for an id
+    /// recorded before this counter started climbing may mean "evicted", not "never seen".
+    #[must_use]
+    pub fn evictions(&self) -> u64 {
+        self.evictions.load(Ordering::Relaxed)
     }
 
     #[must_use]
@@ -198,6 +213,15 @@ mod tests {
         assert_eq!(store.len(), 2);
         assert!(store.get(&id(1)).is_none(), "oldest evicted");
         assert!(store.get(&id(3)).is_some());
+        assert_eq!(store.evictions(), 1, "one insert past cap, one eviction");
+    }
+
+    #[test]
+    fn replacing_an_existing_id_does_not_count_as_an_eviction() {
+        let store = OutcomeStore::new(10);
+        store.record(id(1), DeliveryOutcome::new(OutcomeKind::Pending, 8));
+        store.record(id(1), DeliveryOutcome::new(OutcomeKind::Delivered, 8));
+        assert_eq!(store.evictions(), 0);
     }
 
     #[test]

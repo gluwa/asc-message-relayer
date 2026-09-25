@@ -45,6 +45,7 @@ use tracing::{debug, info, warn};
 use crate::checkpoint::CheckpointStore;
 use crate::config::{ChainRoute, ClaimConfig};
 use crate::pending::{BoundedSeen, PendingTxs};
+use crate::prom::Metrics;
 use crate::proofgen::{ProofFetch, ProofGenClient};
 
 /// Poll cadence for the client-chain intent watcher and the pending-proof retry queue.
@@ -167,11 +168,13 @@ fn claim_key(
 /// Spawn the claim submitter for one route. Returns immediately when the route has no `claim`
 /// config; otherwise loops until `cancel` fires. `scan_lookback_blocks` rewinds the persisted
 /// cursor on startup so claims in flight when the process died are re-discovered.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     route: ChainRoute,
     creditcoin_eth_rpc_url: String,
     checkpoint: Option<Arc<CheckpointStore>>,
     scan_lookback_blocks: u64,
+    metrics: Metrics,
     health: Arc<crate::health::Health>,
     broadcast_locks: Arc<crate::broadcast::BroadcastLocks>,
     cancel: CancellationToken,
@@ -326,6 +329,7 @@ pub async fn run(
                                 .oldest_pending_block()
                                 .map_or(last_seen, |b| last_seen.min(b.saturating_sub(1)));
                             if let Err(err) = cp.set(&checkpoint_key, persist) {
+                                metrics.inc_checkpoint_write_failure(chain_key);
                                 warn!(chain_key, %err, "failed to persist claim checkpoint");
                             }
                         }

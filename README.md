@@ -122,7 +122,11 @@ retry silently forever:
   forwarded) is resent with 25 % more gas per attempt up to `max_gas_limit`, within
   `delivery.max_retries`. `retryPendingMessage` honours a `RetryDeferred(retryAfter)` hint
   (plus a 5 s margin, capped at 6 h) instead of the fixed 15 s / 60 s / 240 s schedule, still
-  within the same three-attempt budget.
+  within the same three-attempt budget. A mined-and-reverted delivery whose revert shape
+  `classify_delivery_revert` doesn't recognize now gets its own
+  `relayer_deliver_tx{status="Unclassified"}` label, split out of the generic `Reverted` bucket it
+  used to fall into — **behavior change for dashboards/alerts**: anything keyed on
+  `status="Reverted"` will see that count drop correspondingly once this rolls out.
 - **Under-funded deliveries** — when the estimate exceeds the funded `gasLimit` the job waits
   for a `topUpGasLimit` (bounded by the delivery deadline / settlement). With
   `auto_request_top_up: true` the route additionally emits
@@ -227,12 +231,14 @@ Outbox rotation, default 60 s).
 
 Key metrics: `relayer_messages_indexed`, `relayer_votes_received` (by outcome),
 `relayer_votes_per_message`, `relayer_deliver_tx` (by status: submitted / succeeded /
-already-validated / pending / reverted), `relayer_time_to_threshold_seconds`,
-`relayer_time_to_deliver_seconds`, `relayer_pool_messages_pending`, `relayer_attestor_set_size` /
-`relayer_attestor_set_reloads`, `relayer_p2p_peer_count`, `relayer_ack_submissions` /
-`relayer_claim_submissions` (by outcome: confirmed / terminal / failed — `submitAcknowledgment` and
-`claimDelivery` respectively; watch `failed` for a stuck settlement path, since delivery keeps
-working independently of either), plus process gauges.
+already-validated / pending / reverted / unclassified / …, see the #36 outcome classification
+bullet above), `relayer_time_to_threshold_seconds`, `relayer_time_to_deliver_seconds`,
+`relayer_pool_messages_pending`, `relayer_attestor_set_size` / `relayer_attestor_set_reloads`,
+`relayer_p2p_peer_count`, `relayer_ack_submissions` / `relayer_claim_submissions` (by outcome:
+confirmed / terminal / failed — `submitAcknowledgment` and `claimDelivery` respectively; watch
+`failed` for a stuck settlement path, since delivery keeps working independently of either),
+`relayer_checkpoint_write_failures`, `relayer_delivery_retries_exceeded`,
+`relayer_outcome_store_size` / `relayer_outcome_store_evictions`, plus process gauges.
 
 ## Build, test, run
 
