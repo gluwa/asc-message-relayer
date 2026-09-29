@@ -123,7 +123,7 @@ pub struct ChainRoute {
     pub attestor_set: AttestorSet,
     pub threshold_override: Option<u32>,
     /// Opt-in trust-minimized acknowledgment. When set, the relayer watches the destination
-    /// Inbox for `MessageDelivered`, fetches a native USC delivery proof from the proof-gen API,
+    /// Inbox for `MessageReceived`, fetches a native USC delivery proof from the proof-gen API,
     /// and submits it to the source-chain `AcknowledgmentValidator`. `None` disables ack for the
     /// route (the default).
     pub ack: Option<AckConfig>,
@@ -216,7 +216,7 @@ pub struct AckConfig {
     /// EVM key used to sign `submitAcknowledgment` txs on the Creditcoin chain. Submission is
     /// permissionless (the proof is self-validating), so this only needs gas, not authority.
     pub signer_key: String,
-    /// Blocks to lag behind the destination chain tip when scanning for `MessageDelivered`, so the
+    /// Blocks to lag behind the destination chain tip when scanning for `MessageReceived`, so the
     /// ack watcher does not act on the unsafe head (a destination reorg could otherwise enqueue an
     /// ack for a delivery that later disappears). 0 for instant-finality destinations.
     pub confirmation_depth: u64,

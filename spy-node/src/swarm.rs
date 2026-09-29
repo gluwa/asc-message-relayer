@@ -397,7 +397,7 @@ fn observe_vote(
     // Annotate, don't gate: recovery failure streams as `signature_valid: false` (module docs).
     let advertised = alloy::primitives::Address::from(vote.signer);
     let (signer, signature_valid) = match recover_signer(
-        &alloy::primitives::B256::from(vote.message_hash),
+        &alloy::primitives::B256::from(vote.message_id),
         &vote.signature,
     ) {
         Ok(recovered) => (recovered, recovered == advertised),
@@ -407,7 +407,6 @@ fn observe_vote(
     hub.publish(SpyEvent::message_vote(
         chain_key,
         vote.message_id,
-        vote.message_hash,
         signer,
         signature_valid,
         &vote.signature,
@@ -584,8 +583,7 @@ mod tests {
 
         let vote = MessageVote {
             chain_key: 102,
-            message_id: [1u8; 32],
-            message_hash: hash.0,
+            message_id: hash.0,
             signer: signer.address().into_array(),
             signature: raw,
         };
@@ -628,8 +626,7 @@ mod tests {
         let impostor = alloy::primitives::Address::repeat_byte(0x66);
         let vote = MessageVote {
             chain_key: 102,
-            message_id: [1u8; 32],
-            message_hash: hash.0,
+            message_id: hash.0,
             signer: impostor.into_array(),
             signature: raw,
         };
@@ -662,7 +659,6 @@ mod tests {
         let vote = MessageVote {
             chain_key: 7, // disagrees with topic chain 102
             message_id: [1u8; 32],
-            message_hash: [2u8; 32],
             signer: [3u8; 20],
             signature: [0u8; 65],
         };

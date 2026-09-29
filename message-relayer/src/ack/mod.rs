@@ -3,31 +3,50 @@
 //! Trust-minimized acknowledgment is **proof-based, not vote-based**. For each route that opts in
 //! (`route.ack = Some(..)`), this worker:
 //!
-//!  1. Watches the **destination** Inbox for `MessageDelivered(bytes32 indexed messageId)` —
-//!     evidence that a message was delivered to the destination dApp.
+//!  1. Watches the **destination** Inbox for `MessageReceived(bytes32 indexed messageId)` —
+//!     evidence that a relay attempt reached the destination dApp (asc-contracts #54: this fires
+//!     on every accepted delivery attempt, success or destination-failure alike — see below for
+//!     why the watcher discovers on it in ADDITION to, not instead of, the success-only
+//!     `MessageExecuted`).
 //!  2. For the transaction that emitted it, fetches a native USC delivery proof from the proof-gen
 //!     API (`GET {proof_gen_url}/api/v1/proof-by-tx/{chain_key}/{tx_hash}`): the prover `txBytes`
 //!     plus the merkle-inclusion and continuity proofs.
 //!  3. Submits that proof to the source-chain `AcknowledgmentValidator.submitAcknowledgment(..)`.
 //!     The contract verifies the proof against the block-prover precompile, decodes the
-//!     `MessageDelivered` logs, and calls `Outbox.acknowledgeMessage` for each — so the relayer
-//!     never needs acknowledge authority; the proof is self-validating.
+//!     `MessageExecuted` logs, and calls `Outbox.acknowledgeMessage` for each — so the relayer
+//!     never needs acknowledge authority; the proof is self-validating. `MessageExecuted` only
+//!     fires on a successful destination call, so a proof built from a destination-failure-only
+//!     tx correctly reverts `NoMessageExecutedLogs` here (handled the same way a
+//!     `MessageQueued`/`MessageDeferred` tx already is — see below) without ever falsely
+//!     acknowledging a retryable failure. Conversely, a message that failed at the destination and
+//!     later succeeded via `retryFailedMessage`/`retryPendingMessage` emits `MessageExecuted`
+//!     ALONE on that later tx — no `MessageReceived` — so the watcher discovers `MessageExecuted`
+//!     directly too; without it, a retried-then-succeeded message's ack (and ack-fee bounty) would
+//!     never be submitted, since the only tx that could ever prove `MessageExecuted` is the one no
+//!     filter ever surfaced.
 //!
 //! ## Relay-fee claiming (`AckAndClaim` mode)
 //!
 //! When the route has a `RelayerContract` configured (`route.relayer_contract_address = Some(..)`),
 //! this same watcher ALSO settles the relay fee: from the same delivery proof it calls
 //! `RelayerContract.claimDelivery(messageId, ..)` per delivered message, which pays the relay fee
-//! (+ any unexpired tip) to the relayer proven in the destination `MessageDelivered` event.
+//! (+ any unexpired tip) to the relayer proven in the destination `MessageReceived` event — this
+//! is *why* the watcher discovers on `MessageReceived` as well as `MessageExecuted`: relay-fee
+//! settlement is for relay work done, not destination success, so a destination-failure retry
+//! must still be discoverable for the claim even though it is not ack-eligible. `MessageExecuted`
+//! from a retry has no `MessageReceived` on its own tx and offers no fee-claim proof of its own —
+//! the fee was already claimable from the original `MessageReceived` tx, discovered separately.
 //!
-//! The discovery scan also watches `MessagePending` (dApp callback reverted; message stored for
-//! `retryPendingMessage`): `EVMDeliveryDecoder` accepts a proof over a `MessagePending`-emitting
-//! tx as payable, but only from the *original* `deliverMessage` tx — a later `retryPendingMessage`
-//! tx carries the wrong call selector and the decoder rejects it. Without this, a message that
-//! ever goes pending strands its relay fee forever: the originating tx is never enqueued, and a
-//! successful retry's tx is unusable as a claim proof. A `MessagePending` tx has no
-//! `submitAcknowledgment` proof to offer — `acknowledge_tx`'s existing terminal classification
-//! already handles that, skipping straight to the claim.
+//! The discovery scan also watches `MessageQueued`/`MessageDeferred` (dApp callback reverted or
+//! dispatcher queued it; message stored for `retryPendingMessage`): `EVMDeliveryDecoder` accepts a
+//! proof over a `MessageQueued`/`MessageDeferred`-emitting tx as payable, but only from the
+//! *original* `deliverMessage` tx — a later `retryPendingMessage` tx carries the wrong call
+//! selector and the decoder rejects it. Without this, a message that ever goes pending strands its
+//! relay fee forever: the originating tx is never enqueued, and a successful retry's tx is unusable
+//! as a claim proof. Like a destination-failure-only tx (see above), a
+//! `MessageQueued`/`MessageDeferred` tx has no `submitAcknowledgment` proof to offer —
+//! `acknowledge_tx`'s existing terminal classification already handles that, skipping straight to
+//! the claim.
 //!
 //! Since usc-contracts #23 the claim does NOT acknowledge — ack settlement lives solely on the
 //! `AcknowledgmentValidator` — so the two submissions are independent and BOTH run here, ack first:
@@ -38,7 +57,7 @@
 //! fetch, checkpointing, dedup, and backoff — is shared verbatim between the two settlements.
 //!
 //! Submission is keyed (and deduped) by destination **transaction hash**: one transaction may
-//! contain several `MessageDelivered` logs and the validator acknowledges all of them in a single
+//! contain several `MessageExecuted` logs and the validator acknowledges all of them in a single
 //! call. A transaction whose proof is not available *yet* — HTTP 422 (`BlockNotReady`: block not
 //! attested) or 404 (proof-gen's own view of the destination chain has not caught up with the tx)
 //! from the proof-gen API — is re-polled on a flat, short cadence for a bounded window and only
@@ -68,7 +87,7 @@ use crate::pending::{BoundedSeen, PendingTxs};
 use crate::prom::{Metrics, ProofFetchOutcome, SettlementOutcome};
 use crate::proofgen::{ProofFetch, ProofGenClient, ProofNotReady};
 
-/// Poll cadence for the destination `MessageDelivered` watcher and the pending-proof retry queue.
+/// Poll cadence for the destination `MessageReceived` watcher and the pending-proof retry queue.
 pub const ACK_POLL_INTERVAL_SECS: u64 = 6;
 
 /// Maximum `encodedTransaction` size accepted on-chain by
@@ -174,7 +193,7 @@ pub async fn run(
     // report on, and registering one would make it go stale forever.
     health.heartbeat(&health_key);
 
-    // Read-only provider on the destination chain (where MessageDelivered is emitted). Held in a
+    // Read-only provider on the destination chain (where MessageReceived is emitted). Held in a
     // rebuilding slot: after `rpc::REBUILD_AFTER_FAILURES` failed scans it is re-dialed, so a dead
     // transport heals in-process rather than through a liveness restart (see `crate::health`).
     let mut dest_rpc = crate::rpc::Reconnecting::new(
@@ -256,7 +275,7 @@ pub async fn run(
         ),
     }
 
-    // Resume from the persisted cursor so MessageDelivered events emitted while we were down are
+    // Resume from the persisted cursor so MessageReceived events emitted while we were down are
     // not skipped; fall back to the current head on first run / when persistence is disabled.
     // The cursor is rewound by `scan_lookback_blocks`: the pending-ack queue is memory-only, so a
     // delivery discovered-but-not-acknowledged before a crash would otherwise be skipped forever.
@@ -428,9 +447,11 @@ pub async fn run(
     }
 }
 
-/// Poll the destination Inbox for new `MessageDelivered` AND `MessagePending` events and enqueue
-/// their tx hashes (see the module docs' "Relay-fee claiming" section for why `MessagePending`
-/// matters here too).
+/// Poll the destination Inbox for new `MessageReceived`, `MessageQueued`, `MessageDeferred` AND
+/// `MessageExecuted` events and enqueue their tx hashes (see the module docs' "Relay-fee claiming"
+/// section for why `MessageQueued`/`MessageDeferred`, and a destination-failure-only
+/// `MessageReceived`, still matter here even though neither is ack-eligible by itself — and why
+/// `MessageExecuted` is watched directly, not just discovered as a side effect of `MessageReceived`).
 ///
 /// Scans only up to `tip - confirmation_depth` so a destination reorg on the unsafe head cannot
 /// enqueue an ack for a delivery that later disappears.
@@ -461,15 +482,18 @@ async fn discover_delivered<P: Provider>(
     let filter = Filter::new()
         .address(inbox)
         .event_signature(vec![
-            IInbox::MessageDelivered::SIGNATURE_HASH,
-            IInbox::MessagePending::SIGNATURE_HASH,
+            IInbox::MessageReceived::SIGNATURE_HASH,
+            IInbox::MessageQueued::SIGNATURE_HASH,
+            IInbox::MessageDeferred::SIGNATURE_HASH,
+            IInbox::MessageExecuted::SIGNATURE_HASH,
         ])
         .from_block(from_block)
         .to_block(to_block);
 
     let logs = provider.get_logs(&filter).await.with_context(|| {
         format!(
-            "eth_getLogs MessageDelivered/MessagePending from {from_block} to {to_block} failed"
+            "eth_getLogs MessageReceived/MessageQueued/MessageDeferred/MessageExecuted from \
+             {from_block} to {to_block} failed"
         )
     })?;
 
@@ -528,20 +552,32 @@ async fn discover_delivered<P: Provider>(
 }
 
 /// Classify and decode one destination log by topic0: `Ok(Some((name, messageId)))` for a
-/// recognized `MessageDelivered`/`MessagePending` log, `Ok(None)` for anything else, `Err` if the
-/// topic0 matched but the log body failed to decode. Split out from [`discover_delivered`] so
-/// this dispatch is unit-testable without a live provider.
+/// recognized `MessageReceived`/`MessageQueued`/`MessageDeferred`/`MessageExecuted` log,
+/// `Ok(None)` for anything else, `Err` if the topic0 matched but the log body failed to decode.
+/// Split out from [`discover_delivered`] so this dispatch is unit-testable without a live provider.
 fn decode_delivery_log(
     log: &alloy::rpc::types::Log,
 ) -> Result<Option<(&'static str, B256)>, alloy::sol_types::Error> {
     match log.topics().first().copied() {
-        Some(sig) if sig == IInbox::MessageDelivered::SIGNATURE_HASH => {
-            IInbox::MessageDelivered::decode_log(&log.inner)
-                .map(|decoded| Some(("MessageDelivered", decoded.data.messageId)))
+        Some(sig) if sig == IInbox::MessageReceived::SIGNATURE_HASH => {
+            IInbox::MessageReceived::decode_log(&log.inner)
+                .map(|decoded| Some(("MessageReceived", decoded.data.messageId)))
         }
-        Some(sig) if sig == IInbox::MessagePending::SIGNATURE_HASH => {
-            IInbox::MessagePending::decode_log(&log.inner)
-                .map(|decoded| Some(("MessagePending", decoded.data.messageId)))
+        Some(sig) if sig == IInbox::MessageQueued::SIGNATURE_HASH => {
+            IInbox::MessageQueued::decode_log(&log.inner)
+                .map(|decoded| Some(("MessageQueued", decoded.data.messageId)))
+        }
+        Some(sig) if sig == IInbox::MessageDeferred::SIGNATURE_HASH => {
+            IInbox::MessageDeferred::decode_log(&log.inner)
+                .map(|decoded| Some(("MessageDeferred", decoded.data.messageId)))
+        }
+        // #54: a successful retryFailedMessage/retryPendingMessage emits MessageExecuted ALONE —
+        // no MessageReceived on that tx — so without watching this directly, a message that ever
+        // went DestinationFailed (or pending) and later succeeded on retry would never be
+        // discovered, and its ack (and ack fee) would never be submitted.
+        Some(sig) if sig == IInbox::MessageExecuted::SIGNATURE_HASH => {
+            IInbox::MessageExecuted::decode_log(&log.inner)
+                .map(|decoded| Some(("MessageExecuted", decoded.data.messageId)))
         }
         _ => Ok(None),
     }
@@ -691,7 +727,7 @@ async fn process_pending<P: Provider>(
 #[derive(Clone, Copy, Debug)]
 enum SettlementMode {
     /// No RelayerContract on the route: prove delivery to the `AcknowledgmentValidator` only
-    /// (`submitAcknowledgment`, one call per tx — the validator acks every `MessageDelivered` log
+    /// (`submitAcknowledgment`, one call per tx — the validator acks every `MessageExecuted` log
     /// under try/catch). The validator address comes from `ack.validator_address`.
     Ack,
     /// The route has a `RelayerContract` (fee ledger): submit BOTH settlements from one proof —
@@ -952,9 +988,11 @@ async fn acknowledge_tx<P: Provider>(
                     "submitAcknowledgment confirmed (ack fee, if any, paid to this submitter)",
                 );
             }
-            // Terminal here (e.g. NoMessageDeliveredLogs because another submitter front-ran the
-            // bounty and every log is now already-acked) must not block the relay-fee claim below —
-            // the claim pays the proven relayer regardless of who acknowledged.
+            // Terminal here (e.g. NoMessageExecutedLogs because another submitter front-ran the
+            // bounty and every log is now already-acked, or because this tx has no MessageExecuted
+            // log at all — a destination-failure-only or MessageQueued/MessageDeferred tx) must
+            // not block the relay-fee claim below — the claim pays the proven relayer regardless of
+            // destination outcome or who acknowledged.
             Ok(SubmitOutcome::Terminal(reason)) => {
                 metrics.inc_ack_submission(chain_key, SettlementOutcome::Terminal);
                 info!(chain_key, %tx_hash, %reason, "submitAcknowledgment terminal; continuing to claim");
@@ -1074,7 +1112,7 @@ fn ack_revert_name(sel: [u8; 4]) -> Option<&'static str> {
         s if s == O::MessageAlreadyAcknowledged::SELECTOR => "MessageAlreadyAcknowledged",
         s if s == O::MessageNotFound::SELECTOR => "MessageNotFound",
         s if s == V::ProofInvalid::SELECTOR => "ProofInvalid",
-        s if s == V::NoMessageDeliveredLogs::SELECTOR => "NoMessageDeliveredLogs",
+        s if s == V::NoMessageExecutedLogs::SELECTOR => "NoMessageExecutedLogs",
         s if s == RC::RelayAlreadySettled::SELECTOR => "RelayAlreadySettled",
         s if s == RC::UnknownOperation::SELECTOR => "UnknownOperation",
         _ => return None,
@@ -1117,7 +1155,7 @@ fn is_terminal_revert(err: &impl std::fmt::Display) -> bool {
         || s.contains("DoesNotRequireAck")
         || s.contains("MessageNotFound")
         || s.contains("ProofInvalid")
-        || s.contains("NoMessageDeliveredLogs")
+        || s.contains("NoMessageExecutedLogs")
         || s.contains("RelayAlreadySettled")
         || s.contains("UnknownOperation")
 }
@@ -1220,35 +1258,62 @@ mod tests {
         let message_id = B256::from([7u8; 32]);
         let addr = Address::from([1u8; 20]);
 
-        let delivered = IInbox::MessageDelivered {
+        let received = IInbox::MessageReceived {
             messageId: message_id,
             processor: addr,
             relayer: addr,
         };
-        let (name, id) = decode_delivery_log(&rpc_log(addr, delivered.encode_log_data()))
+        let (name, id) = decode_delivery_log(&rpc_log(addr, received.encode_log_data()))
             .expect("decodes")
             .expect("recognized");
-        assert_eq!(name, "MessageDelivered");
+        assert_eq!(name, "MessageReceived");
         assert_eq!(id, message_id);
 
-        let pending = IInbox::MessagePending {
+        let queued = IInbox::MessageQueued {
             messageId: message_id,
             destinationContract: addr,
             relayer: addr,
         };
-        let (name, id) = decode_delivery_log(&rpc_log(addr, pending.encode_log_data()))
+        let (name, id) = decode_delivery_log(&rpc_log(addr, queued.encode_log_data()))
             .expect("decodes")
             .expect("recognized");
-        assert_eq!(name, "MessagePending");
+        assert_eq!(name, "MessageQueued");
+        assert_eq!(id, message_id);
+
+        let deferred = IInbox::MessageDeferred {
+            messageId: message_id,
+            destinationContract: addr,
+            relayer: addr,
+        };
+        let (name, id) = decode_delivery_log(&rpc_log(addr, deferred.encode_log_data()))
+            .expect("decodes")
+            .expect("recognized");
+        assert_eq!(name, "MessageDeferred");
+        assert_eq!(id, message_id);
+
+        // #54: a retry-only success (no MessageReceived on that tx) must still be discoverable, or
+        // its ack (and ack-fee bounty) is never submitted.
+        let executed = IInbox::MessageExecuted {
+            messageId: message_id,
+            emitterAddress: addr,
+            destination: addr,
+            dispatcher: addr,
+            relayer: addr,
+            messagePayload: alloy::primitives::Bytes::new(),
+        };
+        let (name, id) = decode_delivery_log(&rpc_log(addr, executed.encode_log_data()))
+            .expect("decodes")
+            .expect("recognized");
+        assert_eq!(name, "MessageExecuted");
         assert_eq!(id, message_id);
     }
 
     #[test]
     fn decode_delivery_log_ignores_unrelated_topic0() {
-        // The discovery filter only requests these two topic0s, but an RPC is not trusted to
+        // The discovery filter only requests these four topic0s, but an RPC is not trusted to
         // honor that — an unrelated event on the same Inbox (e.g. the ack validator's
         // Acknowledged, a completely different contract in practice but same shape of concern)
-        // must be skipped, not mis-decoded as one of the two we expect.
+        // must be skipped, not mis-decoded as one of the four we expect.
         let unrelated = crate::abi::IAcknowledgmentValidator::Acknowledged {
             messageId: B256::from([9u8; 32]),
         };
@@ -1264,7 +1329,7 @@ mod tests {
         // processor, relayer) — a malformed/truncated log must error, not silently drop the
         // relay-fee claim by falling through as "unrecognized".
         let malformed = alloy::primitives::LogData::new(
-            vec![IInbox::MessageDelivered::SIGNATURE_HASH],
+            vec![IInbox::MessageReceived::SIGNATURE_HASH],
             Default::default(),
         )
         .expect("valid LogData");

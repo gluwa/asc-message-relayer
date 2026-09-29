@@ -3,7 +3,7 @@
 //! The vote pool answers "how many attestors have signed" while a message is in flight and forgets
 //! it once delivered; nothing answered "what happened to it" afterwards. Operators and the
 //! dashboard had to read the relayer logs to learn that a message was delivered (and in which
-//! destination tx), that the destination call reverted (`MessageExecutionFailed`), or that the
+//! destination tx), that the destination call reverted (`DestinationFailed`), or that the
 //! relayer refused it as undeliverable (a payload the Inbox cannot decode, an envelope over the
 //! route's caps, an under-funded message past its top-up window). This module records that
 //! verdict per `messageId` at the moment the delivery worker reaches it and exposes it as
@@ -29,14 +29,20 @@ pub const DEFAULT_CAP: usize = 10_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutcomeKind {
-    /// `deliverMessage` mined with `MessageDelivered` and the destination call succeeded (or another
-    /// relayer's did — idempotent success).
+    /// `deliverMessage` mined with `MessageReceived` + `MessageExecuted` and the destination call
+    /// succeeded (or another relayer's did — idempotent success).
     Delivered,
-    /// Mined and consumed, but the destination call failed (`MessageExecutionFailed`, #36). No retry
-    /// is possible; the relay fee is still claimable.
+    /// Mined with `MessageReceived` + `DestinationFailed` (asc-contracts #54): the destination call
+    /// failed, but the message is NOT consumed. Not re-deliverable via `deliverMessage` (Inbox
+    /// marks it `isRetryable`, so a second `deliverMessage` for the same id reverts
+    /// `MessageAlreadyValidated`) — the delivery worker hands it to a bounded, detached
+    /// `retryFailedMessage` loop and reports `DeliveryResultKind::Delivered` from the pool's
+    /// perspective (votes are already consumed). This kind is recorded both when that loop is
+    /// first scheduled and, informationally, each time a `retryFailedMessage` attempt fails again.
+    /// The relay fee is claimable either way via `MessageReceived`.
     DestinationFailed,
-    /// Mined with `MessagePending`: the dispatcher deferred/queued it; bounded `retryPendingMessage`
-    /// attempts follow.
+    /// Mined with `MessageQueued` or `MessageDeferred`: the dispatcher queued/deferred it; bounded
+    /// `retryPendingMessage` attempts follow.
     Pending,
     /// The relayer refused to send because the message can never be delivered as published: the
     /// Inbox reverts before dispatch (typically a payload that is not an
@@ -241,12 +247,12 @@ mod tests {
             kind: OutcomeKind::DestinationFailed,
             chain_key: 8,
             tx_hash: None,
-            reason: Some("MessageExecutionFailed".into()),
+            reason: Some("DestinationFailed".into()),
             recorded_at: 1,
         })
         .unwrap();
         assert!(json.contains("\"kind\":\"destination_failed\""));
         assert!(!json.contains("tx_hash"));
-        assert!(json.contains("\"reason\":\"MessageExecutionFailed\""));
+        assert!(json.contains("\"reason\":\"DestinationFailed\""));
     }
 }

@@ -2,7 +2,8 @@
 //!
 //! Deliberately dumb, like Wormhole's Spy: events are *verified observations* (decoded envelope
 //! plus ECDSA recovery), never aggregation or quorum judgment. Consumers count signers themselves.
-//! `signature_valid` asserts only that the signature recovers to `signer` over `message_hash`;
+//! `signature_valid` asserts only that the signature recovers to `signer` over `message_id` (also
+//! the vote's `message_hash` field, kept for wire compatibility — see that field's doc);
 //! active-set membership is the consumer's problem (checking it would give the spy a chain-RPC
 //! dependency, and the mesh's real validators enforce it anyway).
 
@@ -24,14 +25,17 @@ pub enum SpyEvent {
     /// An attestor's ECDSA vote for a published message, seen on `{chain_key}/message-votes/v1`.
     MessageVote {
         chain_key: u64,
-        /// `0x`-prefixed 32-byte hex.
+        /// `0x`-prefixed 32-byte hex — also the digest the signature covers (raw, no EIP-191)
+        /// since asc-contracts #54.
         message_id: String,
-        /// `0x`-prefixed 32-byte hex — the digest the signature covers (raw, no EIP-191).
+        /// Equal to `message_id` — kept as a separate field for wire compatibility with existing
+        /// consumers of this API; asc-contracts #54 removed the distinct six-field hash this used
+        /// to carry (`Inbox.validateVotes` now takes `messageId` itself as the signed digest).
         message_hash: String,
         /// Recovered signer when recovery succeeds; the envelope's advertised signer (with
         /// `signature_valid: false`) when it does not.
         signer: String,
-        /// Whether the 65-byte signature recovers to `signer` over `message_hash`.
+        /// Whether the 65-byte signature recovers to `signer` over `message_id`.
         signature_valid: bool,
         /// `0x`-prefixed 65-byte hex — carried so consumers can re-verify independently.
         signature: String,
@@ -83,7 +87,6 @@ impl SpyEvent {
     pub fn message_vote(
         chain_key: u64,
         message_id: [u8; 32],
-        message_hash: [u8; 32],
         signer: alloy::primitives::Address,
         signature_valid: bool,
         signature: &[u8; 65],
@@ -92,7 +95,9 @@ impl SpyEvent {
         Self::MessageVote {
             chain_key,
             message_id: format!("0x{}", hex::encode(message_id)),
-            message_hash: format!("0x{}", hex::encode(message_hash)),
+            // Equal to `message_id` (see that field's doc) — asc-contracts #54 removed the
+            // distinct hash this used to carry.
+            message_hash: format!("0x{}", hex::encode(message_id)),
             signer: format!("{signer:?}"),
             signature_valid,
             signature: format!("0x{}", hex::encode(signature)),
@@ -248,7 +253,6 @@ mod tests {
         SpyEvent::message_vote(
             chain_key,
             [id_byte; 32],
-            [0xAB; 32],
             alloy::primitives::Address::repeat_byte(0x11),
             true,
             &[0u8; 65],
