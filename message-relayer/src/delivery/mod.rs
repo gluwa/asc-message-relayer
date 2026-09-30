@@ -1067,9 +1067,12 @@ fn settle_pre_send_revert(
 ///
 /// Returns `Some(Delivered)` when this was actually a stuck retryable message (outcome recorded,
 /// `retryFailedMessage` scheduled) — the caller should treat the job as done for the pool without
-/// its own "idempotent success" bookkeeping. Returns `None` when it is genuinely already-executed
-/// (or the `isRetryable` read itself failed — best-effort, so this falls back to the old
-/// idempotent-success behaviour rather than block on it).
+/// its own "idempotent success" bookkeeping. Returns `None` only when `isRetryable` positively
+/// confirmed `false` (genuinely already-executed). A failed or timed-out read is NOT treated as
+/// `false`: on the exact restart / lost-race path this helper exists for, a destination RPC blip
+/// must not silently drop a message that might still be stuck — schedule `retryFailedMessage`
+/// defensively instead, since its own first `isRetryable` check cheaply self-resolves and returns
+/// if the message turns out not to need it (Bugbot, PR #70).
 #[allow(clippy::too_many_arguments)]
 async fn settle_duplicate_revert<P: Provider + Clone + 'static>(
     inbox: &IInbox::IInboxInstance<&P>,
@@ -1081,28 +1084,45 @@ async fn settle_duplicate_revert<P: Provider + Clone + 'static>(
     outcomes: &Arc<OutcomeStore>,
     stage: &str,
 ) -> Option<DeliveryResultKind> {
-    let retryable = tokio::time::timeout(
+    match tokio::time::timeout(
         FUNDED_GAS_READ_TIMEOUT,
         inbox.isRetryable(message_id).call(),
     )
     .await
-    .ok()
-    .and_then(|r| r.ok())
-    .unwrap_or(false);
-    if !retryable {
-        return None;
+    {
+        Ok(Ok(false)) => return None,
+        Ok(Ok(true)) => {
+            warn!(
+                chain_key = route.chain_key,
+                %message_id,
+                "⚠️ {stage} detected MessageAlreadyValidated but the message is isRetryable — a \
+                 prior attempt's destination call failed; scheduling bounded retryFailedMessage \
+                 attempts"
+            );
+        }
+        Ok(Err(err)) => {
+            warn!(
+                chain_key = route.chain_key,
+                %message_id,
+                %err,
+                "isRetryable read failed after {stage} detected MessageAlreadyValidated; \
+                 assuming it may still be stuck and scheduling retryFailedMessage as a precaution"
+            );
+        }
+        Err(_elapsed) => {
+            warn!(
+                chain_key = route.chain_key,
+                %message_id,
+                "isRetryable read timed out after {stage} detected MessageAlreadyValidated; \
+                 assuming it may still be stuck and scheduling retryFailedMessage as a precaution"
+            );
+        }
     }
-    warn!(
-        chain_key = route.chain_key,
-        %message_id,
-        "⚠️ {stage} detected MessageAlreadyValidated but the message is isRetryable — a prior \
-         attempt's destination call failed; scheduling bounded retryFailedMessage attempts"
-    );
     outcomes.record(
         message_id,
         DeliveryOutcome::new(OutcomeKind::DestinationFailed, route.chain_key).with_reason(format!(
-            "{stage} detected MessageAlreadyValidated + isRetryable: a prior attempt's \
-             destination call failed; retryFailedMessage scheduled"
+            "{stage} detected MessageAlreadyValidated: a prior attempt's destination call may \
+             have failed; retryFailedMessage scheduled"
         )),
     );
     spawn_failed_retry(
@@ -1970,49 +1990,62 @@ fn spawn_pending_retry<P: Provider + Clone + 'static>(
                     // `deliverMessage`) — so check `isRetryable` before giving up: an unobserved
                     // or third-party `retryPendingMessage` can land it there just as our own
                     // receipt-based handoff below does, and without this check it would strand.
-                    match inbox.isRetryable(message_id).call().await {
-                        Ok(true) => {
-                            info!(chain_key, %message_id, "♻️ pending message resolved to \
-                                DestinationFailed (unobserved) — handing off to retryFailedMessage");
+                    // A failed/timed-out read is NOT treated as `Ok(false)`: on this exact
+                    // unobserved-resolution path, a destination RPC blip must not silently drop a
+                    // message that might still be stuck — hand off defensively instead, since
+                    // `spawn_failed_retry`'s own first `isRetryable` check cheaply self-resolves
+                    // if it turns out not to be needed (Bugbot, PR #70).
+                    let handoff = match inbox.isRetryable(message_id).call().await {
+                        Ok(true) => true,
+                        Ok(false) => false,
+                        Err(err) => {
+                            warn!(chain_key, %message_id, %err,
+                                "isRetryable check failed after isPending resolved to false; \
+                                 assuming it may still be stuck and handing off to \
+                                 retryFailedMessage as a precaution");
+                            true
+                        }
+                    };
+                    if handoff {
+                        info!(chain_key, %message_id, "♻️ pending message resolved to \
+                            DestinationFailed (unobserved) — handing off to retryFailedMessage");
+                        outcomes.record(
+                            message_id,
+                            DeliveryOutcome::new(OutcomeKind::DestinationFailed, chain_key)
+                                .with_reason(
+                                    "no longer pending on-chain and possibly isRetryable \
+                                     (resolved by another party or an unobserved \
+                                     retryPendingMessage attempt); retryFailedMessage \
+                                     scheduled",
+                                ),
+                        );
+                        spawn_failed_retry(
+                            provider.clone(),
+                            signer_address,
+                            broadcast_locks.clone(),
+                            inbox_address,
+                            message_id,
+                            chain_key,
+                            outcomes.clone(),
+                        );
+                    } else {
+                        info!(chain_key, %message_id, "♻️ pending message already resolved");
+                        // Confirmed not retryable either — keep the `Pending` verdict and its
+                        // original tx hash, and say the final result was not observed.
+                        if let Some(prev) = outcomes.get(&message_id) {
                             outcomes.record(
                                 message_id,
-                                DeliveryOutcome::new(OutcomeKind::DestinationFailed, chain_key)
-                                    .with_reason(
-                                        "no longer pending on-chain but isRetryable=true \
-                                         (resolved by another party or an unobserved \
-                                         retryPendingMessage attempt); retryFailedMessage \
-                                         scheduled",
+                                DeliveryOutcome {
+                                    reason: Some(
+                                        "no longer pending on-chain (resolved by another \
+                                         party or an unobserved retry); final destination \
+                                         result not observed — check the Inbox's \
+                                         MessageExecuted / DestinationFailed logs"
+                                            .into(),
                                     ),
+                                    ..prev
+                                },
                             );
-                            spawn_failed_retry(
-                                provider.clone(),
-                                signer_address,
-                                broadcast_locks.clone(),
-                                inbox_address,
-                                message_id,
-                                chain_key,
-                                outcomes.clone(),
-                            );
-                        }
-                        _ => {
-                            info!(chain_key, %message_id, "♻️ pending message already resolved");
-                            // Not retryable either — keep the `Pending` verdict and its original
-                            // tx hash, and say the final result was not observed.
-                            if let Some(prev) = outcomes.get(&message_id) {
-                                outcomes.record(
-                                    message_id,
-                                    DeliveryOutcome {
-                                        reason: Some(
-                                            "no longer pending on-chain (resolved by another \
-                                             party or an unobserved retry); final destination \
-                                             result not observed — check the Inbox's \
-                                             MessageExecuted / DestinationFailed logs"
-                                                .into(),
-                                        ),
-                                        ..prev
-                                    },
-                                );
-                            }
                         }
                     }
                     return;
