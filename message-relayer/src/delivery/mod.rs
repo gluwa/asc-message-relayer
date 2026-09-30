@@ -1057,6 +1057,66 @@ fn settle_pre_send_revert(
     }
 }
 
+/// A `Duplicate` revert (`MessageAlreadyValidated`) used to mean only "someone already delivered
+/// this successfully" — safe to report `Delivered` outright. Since asc-contracts #54 it can ALSO
+/// mean the message was already validated by an earlier `deliverMessage` whose destination call
+/// then failed, leaving it `isRetryable`: a second `deliverMessage` for that id reverts the same
+/// way. Without this check, a checkpoint-lookback resend after a restart, or losing a race to
+/// another relayer, would report `Delivered` and never schedule `retryFailedMessage`, silently
+/// stranding a message that is still stuck on-chain (Bugbot, PR #70).
+///
+/// Returns `Some(Delivered)` when this was actually a stuck retryable message (outcome recorded,
+/// `retryFailedMessage` scheduled) — the caller should treat the job as done for the pool without
+/// its own "idempotent success" bookkeeping. Returns `None` when it is genuinely already-executed
+/// (or the `isRetryable` read itself failed — best-effort, so this falls back to the old
+/// idempotent-success behaviour rather than block on it).
+#[allow(clippy::too_many_arguments)]
+async fn settle_duplicate_revert<P: Provider + Clone + 'static>(
+    inbox: &IInbox::IInboxInstance<&P>,
+    provider: &P,
+    signer_address: Address,
+    broadcast_locks: &Arc<crate::broadcast::BroadcastLocks>,
+    route: &ChainRoute,
+    message_id: B256,
+    outcomes: &Arc<OutcomeStore>,
+    stage: &str,
+) -> Option<DeliveryResultKind> {
+    let retryable = tokio::time::timeout(
+        FUNDED_GAS_READ_TIMEOUT,
+        inbox.isRetryable(message_id).call(),
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .unwrap_or(false);
+    if !retryable {
+        return None;
+    }
+    warn!(
+        chain_key = route.chain_key,
+        %message_id,
+        "⚠️ {stage} detected MessageAlreadyValidated but the message is isRetryable — a prior \
+         attempt's destination call failed; scheduling bounded retryFailedMessage attempts"
+    );
+    outcomes.record(
+        message_id,
+        DeliveryOutcome::new(OutcomeKind::DestinationFailed, route.chain_key).with_reason(format!(
+            "{stage} detected MessageAlreadyValidated + isRetryable: a prior attempt's \
+             destination call failed; retryFailedMessage scheduled"
+        )),
+    );
+    spawn_failed_retry(
+        (*provider).clone(),
+        signer_address,
+        broadcast_locks.clone(),
+        *inbox.address(),
+        message_id,
+        route.chain_key,
+        outcomes.clone(),
+    );
+    Some(DeliveryResultKind::Delivered)
+}
+
 /// Make an unclassified pre-send revert readable. The RPC's error string carries the revert data
 /// when there is any; a `data`-less "execution reverted" from `deliverMessage` means the Inbox
 /// reverted before reaching the dispatcher, which since asc-contracts #36 is almost always the
@@ -1191,6 +1251,33 @@ async fn handle_job<P: Provider + Clone + 'static>(
             // failure (RPC blip, timeout) is neither — the pool retries it with backoff; treating
             // it as terminal would silently drop a deliverable message.
             match classify_delivery_revert(&err) {
+                Some(DeliveryRevert::Duplicate) => {
+                    if let Some(kind) = settle_duplicate_revert(
+                        &inbox,
+                        provider,
+                        signer_address,
+                        broadcast_locks,
+                        route,
+                        job.message_id,
+                        outcomes,
+                        "simulate",
+                    )
+                    .await
+                    {
+                        return Ok(kind);
+                    }
+                    if let Stage::Done(kind) = settle_pre_send_revert(
+                        route,
+                        job,
+                        metrics,
+                        outcomes,
+                        "simulate",
+                        DeliveryRevert::Duplicate,
+                        &err,
+                    ) {
+                        return Ok(kind);
+                    }
+                }
                 Some(revert) => {
                     if let Stage::Done(kind) = settle_pre_send_revert(
                         route, job, metrics, outcomes, "simulate", revert, &err,
@@ -1289,6 +1376,33 @@ async fn handle_job<P: Provider + Clone + 'static>(
             // errors are retryable (we must not send unverified: an under-funded message would
             // OOG and be dropped as terminal — the exact failure this guard exists to prevent).
             Ok(Err(err)) => match classify_delivery_revert(&err) {
+                Some(DeliveryRevert::Duplicate) => {
+                    if let Some(kind) = settle_duplicate_revert(
+                        &inbox,
+                        provider,
+                        signer_address,
+                        broadcast_locks,
+                        route,
+                        job.message_id,
+                        outcomes,
+                        "estimate",
+                    )
+                    .await
+                    {
+                        return Ok(kind);
+                    }
+                    if let Stage::Done(kind) = settle_pre_send_revert(
+                        route,
+                        job,
+                        metrics,
+                        outcomes,
+                        "estimate",
+                        DeliveryRevert::Duplicate,
+                        &err,
+                    ) {
+                        return Ok(kind);
+                    }
+                }
                 Some(revert) => {
                     if let Stage::Done(kind) = settle_pre_send_revert(
                         route, job, metrics, outcomes, "estimate", revert, &err,
@@ -1628,17 +1742,33 @@ async fn handle_job<P: Provider + Clone + 'static>(
         }
         SendOutcome::AlreadyValidated => {
             metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::AlreadyValidated);
-            info!(
-                chain_key = route.chain_key,
-                message_id = %job.message_id,
-                "↩️ another relayer already delivered — idempotent success"
-            );
-            outcomes.record(
+            match settle_duplicate_revert(
+                &inbox,
+                provider,
+                signer_address,
+                broadcast_locks,
+                route,
                 job.message_id,
-                DeliveryOutcome::new(OutcomeKind::Delivered, route.chain_key)
-                    .with_reason("delivered by another relayer (AlreadyValidated)"),
-            );
-            Ok(DeliveryResultKind::Delivered)
+                outcomes,
+                "post-send replay",
+            )
+            .await
+            {
+                Some(kind) => Ok(kind),
+                None => {
+                    info!(
+                        chain_key = route.chain_key,
+                        message_id = %job.message_id,
+                        "↩️ another relayer already delivered — idempotent success"
+                    );
+                    outcomes.record(
+                        job.message_id,
+                        DeliveryOutcome::new(OutcomeKind::Delivered, route.chain_key)
+                            .with_reason("delivered by another relayer (AlreadyValidated)"),
+                    );
+                    Ok(DeliveryResultKind::Delivered)
+                }
+            }
         }
         SendOutcome::Pending { tx_hash } => {
             metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::Pending);
@@ -1833,26 +1963,57 @@ fn spawn_pending_retry<P: Provider + Clone + 'static>(
             // Someone (a dApp user, another relayer) may have completed the retry meanwhile.
             match inbox.isPending(message_id).call().await {
                 Ok(ret) if !ret => {
-                    info!(chain_key, %message_id, "♻️ pending message already resolved");
                     // Consumed by someone else's `retryPendingMessage` (or a dApp user's, or our
                     // own retry whose receipt we never saw). `isPending == false` says only that
                     // it is no longer pending — asc-contracts #54 also clears it on
-                    // `DestinationFailed` (retryable via deliverMessage, not terminal) — so do NOT
-                    // claim `Delivered`: keep the `Pending` verdict and its original tx hash, and
-                    // say the final result was not observed.
-                    if let Some(prev) = outcomes.get(&message_id) {
-                        outcomes.record(
-                            message_id,
-                            DeliveryOutcome {
-                                reason: Some(
-                                    "no longer pending on-chain (resolved by another party or an \
-                                     unobserved retry); final destination result not observed — \
-                                     check the Inbox's MessageExecuted / DestinationFailed logs"
-                                        .into(),
-                                ),
-                                ..prev
-                            },
-                        );
+                    // `DestinationFailed` (retryable via `retryFailedMessage`, not
+                    // `deliverMessage`) — so check `isRetryable` before giving up: an unobserved
+                    // or third-party `retryPendingMessage` can land it there just as our own
+                    // receipt-based handoff below does, and without this check it would strand.
+                    match inbox.isRetryable(message_id).call().await {
+                        Ok(true) => {
+                            info!(chain_key, %message_id, "♻️ pending message resolved to \
+                                DestinationFailed (unobserved) — handing off to retryFailedMessage");
+                            outcomes.record(
+                                message_id,
+                                DeliveryOutcome::new(OutcomeKind::DestinationFailed, chain_key)
+                                    .with_reason(
+                                        "no longer pending on-chain but isRetryable=true \
+                                         (resolved by another party or an unobserved \
+                                         retryPendingMessage attempt); retryFailedMessage \
+                                         scheduled",
+                                    ),
+                            );
+                            spawn_failed_retry(
+                                provider.clone(),
+                                signer_address,
+                                broadcast_locks.clone(),
+                                inbox_address,
+                                message_id,
+                                chain_key,
+                                outcomes.clone(),
+                            );
+                        }
+                        _ => {
+                            info!(chain_key, %message_id, "♻️ pending message already resolved");
+                            // Not retryable either — keep the `Pending` verdict and its original
+                            // tx hash, and say the final result was not observed.
+                            if let Some(prev) = outcomes.get(&message_id) {
+                                outcomes.record(
+                                    message_id,
+                                    DeliveryOutcome {
+                                        reason: Some(
+                                            "no longer pending on-chain (resolved by another \
+                                             party or an unobserved retry); final destination \
+                                             result not observed — check the Inbox's \
+                                             MessageExecuted / DestinationFailed logs"
+                                                .into(),
+                                        ),
+                                        ..prev
+                                    },
+                                );
+                            }
+                        }
                     }
                     return;
                 }
