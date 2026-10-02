@@ -19,7 +19,7 @@
 # forward-compatible direction — an older build glibc links fine against a newer runtime glibc.
 
 # Matches rust-toolchain.toml.
-FROM rust:1.97-bookworm AS builder
+FROM rust:1.98-bookworm AS builder
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         clang libclang-dev cmake pkg-config libssl-dev protobuf-compiler && \
