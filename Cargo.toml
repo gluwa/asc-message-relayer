@@ -8,7 +8,7 @@ edition = "2021"
 license = "Unlicense"
 publish = false
 repository = "https://github.com/gluwa/asc-message-relayer/"
-version = "0.8.0"
+version = "0.9.0"
 
 # Versions are kept aligned with the creditcoin3 workspace the attestor builds from —
 # `alloy`, `libp2p`, `parity-scale-codec`, and `sha3` in particular sit on the wire path
