@@ -76,7 +76,7 @@ libp2p = { workspace = true, features = [
 ] }
 
 # Identity / secret handling
-bip39 = { version = "2.2.0", features = ["rand", "serde", "zeroize"] }
+bip39 = { version = "3.0.0", features = ["rand", "serde", "zeroize"] }
 tokio-tungstenite = "0.30.0"
 zeroize = { workspace = true }
 
