@@ -39,6 +39,9 @@ pub fn calculate_threshold(n: usize) -> usize {
 const REOBS_STALL_AFTER: Duration = Duration::from_secs(60);
 /// Minimum gap between successive reobservation requests for the same stalled message.
 const REOBS_REPEAT_EVERY: Duration = Duration::from_secs(60);
+/// Give each admitted publication several reobservation rounds before rotating non-inflight work
+/// back to disk. A stuck destination must not monopolize the bounded working set indefinitely.
+const WORKING_SET_RESIDENCE: Duration = Duration::from_secs(5 * 60);
 const DELIVERY_RETRY_BASE: Duration = Duration::from_secs(30);
 /// Upper bound on the backoff between delivery re-attempts for a persistently failing message.
 /// Read by the delivery worker's idle-liveness ticker (`delivery::idle_ticker_should_heartbeat`) to
@@ -354,6 +357,10 @@ struct MessageSlot {
     delivered: bool,
     terminal: bool,
     in_flight: bool,
+    /// Reconstruct acceptance after loading durable work, then periodically while below quorum
+    /// to notice execution by another relayer. This also covers a crash before receipt handling.
+    last_reconciled_at: Option<Instant>,
+    execution_accepted: bool,
     delivery_attempts: u32,
     next_delivery_attempt_at: Option<Instant>,
     inserted_at: Instant,
@@ -420,6 +427,8 @@ impl State {
                 delivered: false,
                 terminal: false,
                 in_flight: false,
+                last_reconciled_at: None,
+                execution_accepted: false,
                 delivery_attempts: 0,
                 next_delivery_attempt_at: None,
                 inserted_at: Instant::now(),
@@ -472,7 +481,7 @@ impl State {
             // meant "how long after *we* index a message do we reach quorum", and a buffered
             // quorum legitimately reaches it instantly. Expect that histogram to collapse toward
             // zero once this ships, and read attestation latency off the attestor side instead.
-            Self::dispatch_if_ready(chain_key, hash, route, metrics, true, Instant::now())
+            Self::dispatch_if_ready(chain_key, hash, route, metrics, true, Instant::now(), false)
         };
 
         metrics.set_pool_messages_pending(self.total_pending() as i64);
@@ -562,7 +571,7 @@ impl State {
             "✅ threshold reached — dispatching delivery"
         );
 
-        Self::dispatch_if_ready(chain_key, hash, route, metrics, true, Instant::now())
+        Self::dispatch_if_ready(chain_key, hash, route, metrics, true, Instant::now(), false)
     }
 
     fn prune_expired(&mut self) {
@@ -591,6 +600,25 @@ impl State {
                 slot.terminal = true;
                 metrics.set_pool_messages_pending(self.total_pending() as i64);
                 return None;
+            }
+            DeliveryResultKind::AwaitingVotes => {
+                slot.last_reconciled_at = Some(Instant::now());
+                slot.execution_accepted = false;
+                slot.next_delivery_attempt_at = None;
+            }
+            DeliveryResultKind::AwaitingExecution { retry_after } => {
+                slot.last_reconciled_at = Some(Instant::now());
+                slot.execution_accepted = true;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_secs());
+                let delay = crate::delivery::pending_retry_delay(
+                    slot.delivery_attempts.saturating_sub(1) as usize,
+                    retry_after,
+                    now,
+                );
+                slot.next_delivery_attempt_at = Some(Instant::now() + delay);
             }
             DeliveryResultKind::Retryable => {
                 // Do NOT give up after a fixed budget. The message has reached quorum and is
@@ -640,7 +668,7 @@ impl State {
             let hashes: Vec<B256> = route.by_message.keys().copied().collect();
             for hash in hashes {
                 if let Some(job) =
-                    Self::dispatch_if_ready(*chain_key, hash, route, metrics, false, now)
+                    Self::dispatch_if_ready(*chain_key, hash, route, metrics, false, now, true)
                 {
                     jobs.push(job);
                 }
@@ -670,19 +698,41 @@ impl State {
         metrics: &dyn crate::prom::MetricsTrait,
     ) -> Result<Vec<DeliveryJob>> {
         let mut jobs = Vec::new();
-        let capacities: Vec<_> = self
-            .by_route
-            .iter()
-            .map(|(&chain_key, route)| {
-                (
-                    chain_key,
-                    route.by_message.keys().copied().collect(),
-                    route.cache_max.saturating_sub(route.by_message.len()),
-                )
-            })
-            .collect();
-        for (chain_key, loaded, capacity) in capacities {
-            for indexed in work.pending(chain_key, loaded, capacity).await? {
+        let now = Instant::now();
+        let chain_keys: Vec<_> = self.by_route.keys().copied().collect();
+        for chain_key in chain_keys {
+            let route = &self.by_route[&chain_key];
+            let capacity = route.cache_max.saturating_sub(route.by_message.len());
+            let candidates: Vec<_> = route
+                .order
+                .iter()
+                .filter(|id| {
+                    let slot = &route.by_message[*id];
+                    !slot.in_flight
+                        && !slot.delivered
+                        && !slot.terminal
+                        && now.duration_since(slot.inserted_at) >= WORKING_SET_RESIDENCE
+                })
+                .take((route.cache_max / 4).max(1))
+                .copied()
+                .collect();
+            let loaded = route.by_message.keys().copied().collect();
+            let pending = work
+                .pending(chain_key, loaded, capacity + candidates.len())
+                .await?;
+            let replace = pending.len().saturating_sub(capacity);
+            // Re-affirm each retained record before releasing RAM, including callers which fed
+            // indexed_rx directly. A write failure leaves the complete working set untouched.
+            for id in candidates.iter().take(replace) {
+                work.record(self.by_route[&chain_key].by_message[id].indexed.clone())
+                    .await?;
+            }
+            let route = self.by_route.get_mut(&chain_key).expect("configured route");
+            for id in candidates.into_iter().take(replace) {
+                route.by_message.remove(&id);
+                route.order.retain(|stored| *stored != id);
+            }
+            for indexed in pending {
                 if let Some(job) = self.note_indexed(indexed, metrics) {
                     jobs.push(job);
                 }
@@ -777,9 +827,15 @@ impl State {
                 signer_count,
                 "✅ threshold reached after set reload — dispatching delivery"
             );
-            if let Some(job) =
-                Self::dispatch_if_ready(chain_key, hash, route, metrics, true, Instant::now())
-            {
+            if let Some(job) = Self::dispatch_if_ready(
+                chain_key,
+                hash,
+                route,
+                metrics,
+                true,
+                Instant::now(),
+                false,
+            ) {
                 jobs.push(job);
             }
         }
@@ -797,6 +853,7 @@ impl State {
                 if slot.delivered
                     || slot.terminal
                     || slot.in_flight
+                    || slot.execution_accepted
                     || slot.signers.len() >= threshold
                 {
                     continue;
@@ -857,10 +914,16 @@ impl State {
         metrics: &dyn crate::prom::MetricsTrait,
         observe_threshold: bool,
         now: Instant,
+        allow_probe: bool,
     ) -> Option<DeliveryJob> {
         let slot = route.by_message.get_mut(&hash)?;
-        if slot.delivered || slot.terminal || slot.in_flight || slot.signers.len() < route.threshold
-        {
+        let has_quorum = route.threshold > 0 && slot.signers.len() >= route.threshold;
+        let can_reconcile = slot.execution_accepted
+            || (allow_probe
+                && slot
+                    .last_reconciled_at
+                    .is_none_or(|last| now.duration_since(last) >= DELIVERY_RETRY_MAX));
+        if slot.delivered || slot.terminal || slot.in_flight || (!has_quorum && !can_reconcile) {
             return None;
         }
         if slot.next_delivery_attempt_at.is_some_and(|next| now < next) {
@@ -887,6 +950,7 @@ impl State {
             votes_calldata,
             signer_count,
             indexed_at: slot.inserted_at,
+            reconcile_only: slot.execution_accepted || !has_quorum,
         })
     }
 }
@@ -1086,6 +1150,160 @@ mod tests {
             tx_hash: B256::from([0xab; 32]),
             block_height: 99,
         }
+    }
+
+    #[tokio::test]
+    async fn restored_accepted_work_reconciles_without_quorum_and_is_not_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = crate::work::WorkStore::for_checkpoint(&dir.path().join("cp"));
+        let metrics = NoopMetrics::new();
+        let id = B256::repeat_byte(1);
+        work.record(indexed_for(2, id)).await.unwrap();
+        for _restart in 0..2 {
+            let mut state = State::new(vec![route_for(2, vec![])], VoteCacheConfig::default());
+            state.refill(&work, metrics.as_ref()).await.unwrap();
+            let jobs = state.collect_ready_deliveries(metrics.as_ref());
+            assert_eq!(jobs.len(), 1);
+            assert!(jobs[0].reconcile_only);
+            assert!(jobs[0].votes_calldata.is_empty() || jobs[0].signer_count == 0);
+            state.note_delivery_result(
+                DeliveryResult {
+                    chain_key: 2,
+                    message_id: id,
+                    outcome: DeliveryResultKind::AwaitingExecution { retry_after: None },
+                },
+                metrics.as_ref(),
+            );
+            assert!(!state.query_bundle(&id).unwrap().delivered);
+            assert!(
+                state.collect_ready_deliveries(metrics.as_ref()).is_empty(),
+                "backoff must apply"
+            );
+            for _attempt in 0..7 {
+                state
+                    .by_route
+                    .get_mut(&2)
+                    .unwrap()
+                    .by_message
+                    .get_mut(&id)
+                    .unwrap()
+                    .next_delivery_attempt_at = None;
+                let jobs = state.collect_ready_deliveries(metrics.as_ref());
+                assert_eq!(jobs.len(), 1);
+                assert!(jobs[0].reconcile_only);
+                state.note_delivery_result(
+                    DeliveryResult {
+                        chain_key: 2,
+                        message_id: id,
+                        outcome: DeliveryResultKind::AwaitingExecution { retry_after: None },
+                    },
+                    metrics.as_ref(),
+                );
+            }
+            assert_eq!(
+                work.pending(2, Default::default(), 10).await.unwrap().len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn absent_acceptance_waits_for_votes_after_one_probe() {
+        let metrics = NoopMetrics::new();
+        let mut state = State::new(
+            vec![route_for(2, vec![Address::repeat_byte(9)])],
+            VoteCacheConfig::default(),
+        );
+        let id = B256::repeat_byte(1);
+        state.note_indexed(indexed_for(2, id), metrics.as_ref());
+        assert!(state.collect_ready_deliveries(metrics.as_ref())[0].reconcile_only);
+        state.note_delivery_result(
+            DeliveryResult {
+                chain_key: 2,
+                message_id: id,
+                outcome: DeliveryResultKind::AwaitingVotes,
+            },
+            metrics.as_ref(),
+        );
+        for _ in 0..5 {
+            assert!(state.collect_ready_deliveries(metrics.as_ref()).is_empty());
+        }
+        let slot = state
+            .by_route
+            .get_mut(&2)
+            .unwrap()
+            .by_message
+            .get_mut(&id)
+            .unwrap();
+        slot.signers.insert(Address::repeat_byte(9), [1; 65]);
+        let jobs = state.collect_ready_deliveries(metrics.as_ref());
+        assert_eq!(jobs.len(), 1);
+        assert!(!jobs[0].reconcile_only);
+    }
+
+    #[tokio::test]
+    async fn stalled_work_rotates_fairly_without_losing_records_or_inflight_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = crate::work::WorkStore::for_checkpoint(&dir.path().join("cp"));
+        let metrics = NoopMetrics::new();
+        let cache = VoteCacheConfig {
+            ttl_seconds: 600,
+            max_messages: 2,
+        };
+        for id in 1..=7 {
+            work.record(indexed_for(2, B256::repeat_byte(id)))
+                .await
+                .unwrap();
+        }
+        let mut state = State::new(vec![route_for(2, vec![])], cache);
+        let mut attempted = std::collections::HashSet::new();
+        for _ in 0..20 {
+            state.refill(&work, metrics.as_ref()).await.unwrap();
+            for job in state.collect_ready_deliveries(metrics.as_ref()) {
+                attempted.insert(job.message_id);
+                state.note_delivery_result(
+                    DeliveryResult {
+                        chain_key: 2,
+                        message_id: job.message_id,
+                        outcome: DeliveryResultKind::AwaitingExecution { retry_after: None },
+                    },
+                    metrics.as_ref(),
+                );
+            }
+            for slot in state.by_route.get_mut(&2).unwrap().by_message.values_mut() {
+                slot.inserted_at = Instant::now() - WORKING_SET_RESIDENCE;
+                slot.next_delivery_attempt_at = None;
+            }
+        }
+        assert_eq!(
+            attempted.len(),
+            7,
+            "later publications were starved by stalled execution"
+        );
+        assert_eq!(
+            work.pending(2, Default::default(), 10).await.unwrap().len(),
+            7
+        );
+        let inflight = *state.by_route[&2].by_message.keys().next().unwrap();
+        state
+            .by_route
+            .get_mut(&2)
+            .unwrap()
+            .by_message
+            .get_mut(&inflight)
+            .unwrap()
+            .in_flight = true;
+        for _ in 0..10 {
+            state.refill(&work, metrics.as_ref()).await.unwrap();
+            assert!(state.by_route[&2].by_message.contains_key(&inflight));
+            for slot in state.by_route.get_mut(&2).unwrap().by_message.values_mut() {
+                slot.inserted_at = Instant::now() - WORKING_SET_RESIDENCE;
+            }
+        }
+        assert_eq!(
+            work.pending(2, Default::default(), 10).await.unwrap().len(),
+            7
+        );
     }
 
     #[test]

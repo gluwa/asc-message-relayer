@@ -3,8 +3,9 @@
 //! immutable and keyed by route and message ID (which binds the source Outbox), so rotations do
 //! not change their identity. Keeping separate files avoids rewriting or loading the backlog.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use alloy::primitives::B256;
 use anyhow::{Context, Result};
@@ -14,6 +15,9 @@ use crate::events::IndexedMessage;
 #[derive(Debug)]
 pub struct WorkStore {
     path: PathBuf,
+    /// A bounded cursor per configured route; reopening from the first filename on every read
+    /// would repeatedly reload the same stalled messages and starve the rest of the backlog.
+    readers: Arc<Mutex<HashMap<u64, std::fs::ReadDir>>>,
 }
 
 impl WorkStore {
@@ -21,7 +25,10 @@ impl WorkStore {
     pub fn for_checkpoint(checkpoint: &Path) -> Self {
         let mut path = checkpoint.as_os_str().to_os_string();
         path.push(".messages");
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            readers: Arc::default(),
+        }
     }
 
     /// A marked checkpoint must have its corresponding work directory. Missing storage is not
@@ -66,21 +73,43 @@ impl WorkStore {
     pub async fn pending(
         &self,
         chain_key: u64,
-        loaded: HashSet<B256>,
+        mut loaded: HashSet<B256>,
         limit: usize,
     ) -> Result<Vec<IndexedMessage>> {
         let route = self.path.join(chain_key.to_string());
+        let readers = self.readers.clone();
         tokio::task::spawn_blocking(move || {
             let mut messages = Vec::new();
             if limit == 0 {
                 return Ok(messages);
             }
-            let entries = match std::fs::read_dir(&route) {
-                Ok(entries) => entries,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(messages),
-                Err(err) => return Err(err).context("reading pending-message directory"),
-            };
-            for entry in entries {
+            let mut readers = readers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("work cursor poisoned"))?;
+            let mut wrapped = false;
+            // Bound directory IO even if a route has millions of records or temporary files.
+            // The next call resumes this iterator; memory stays bounded by the working-set limit.
+            for _ in 0..4096 {
+                if let std::collections::hash_map::Entry::Vacant(entry) = readers.entry(chain_key) {
+                    match std::fs::read_dir(&route) {
+                        Ok(entries) => {
+                            entry.insert(entries);
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                            return Ok(messages)
+                        }
+                        Err(err) => return Err(err).context("reading pending-message directory"),
+                    }
+                }
+                let Some(entry) = readers.get_mut(&chain_key).expect("reader inserted").next()
+                else {
+                    readers.remove(&chain_key);
+                    if wrapped {
+                        break;
+                    }
+                    wrapped = true;
+                    continue;
+                };
                 let path = entry?.path();
                 if path.extension().and_then(|s| s.to_str()) != Some("json") {
                     continue; // Ignore an interrupted atomic write's temporary file.
@@ -106,6 +135,7 @@ impl WorkStore {
                     "pending message identity disagrees with its storage key: {}",
                     path.display()
                 );
+                loaded.insert(id);
                 messages.push(message);
                 if messages.len() == limit {
                     break;

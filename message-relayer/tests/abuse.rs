@@ -6,7 +6,8 @@
 //!  * votes by signers not in the attestor allowlist,
 //!  * grossly more messages than `vote_cache.max_messages` permits.
 //!
-//! Asserts no [`DeliveryJob`] is emitted and the pool process keeps running.
+//! Asserts no vote-authorized [`DeliveryJob`] is emitted and the pool process keeps running.
+//! A known source message may emit a reconciliation-only probe without using the junk votes.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -162,7 +163,11 @@ async fn pool_drops_votes_from_unknown_signers() {
     if let Ok(Some(job)) =
         tokio::time::timeout(Duration::from_millis(150), delivery_rx.recv()).await
     {
-        panic!("unexpected delivery from unknown signers: {job:?}");
+        assert!(
+            job.reconcile_only,
+            "unknown signers authorized a new delivery: {job:?}"
+        );
+        assert_eq!(job.signer_count, 0);
     }
 
     cancel.cancel();
