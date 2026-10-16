@@ -793,14 +793,14 @@ enum DeliveryRevert {
     /// The Inbox or the receiver already processed this message — idempotent success (lost a race
     /// to another relayer, or a previous stuck attempt mined).
     Duplicate,
-    /// #36: votes failed validation while native value was attached. Terminal for these votes.
+    /// Votes failed validation while native value was attached. Retry with the current committee.
     ValidationFailedWithNativeValue,
-    /// #36: the Inbox's dispatcher has no code (value attached). Terminal until reconfigured.
+    /// The Inbox's dispatcher has no code (value attached). Retry after reconfiguration.
     InvalidMessageDispatcher,
     /// #36: the destination call failed with too little gas to prove the attested `gasLimit` was
     /// forwarded. Retryable with a higher tx gas limit.
     InsufficientGasForDestination,
-    /// Any other deterministic revert: retrying would revert identically.
+    /// An unrecognized revert may depend on mutable contract state (pause, allowlists, votes).
     Other,
 }
 
@@ -985,7 +985,7 @@ enum Stage {
     Proceed,
 }
 
-/// Log + count a deterministic revert seen before the send (simulate / estimate) and decide the
+/// Log + count a revert seen before the send (simulate / estimate) and decide the
 /// job's fate. `InsufficientGasForDestination` is not terminal — the send loop bumps gas — so it
 /// proceeds; everything else that reverts is settled here.
 fn settle_pre_send_revert(
@@ -1012,49 +1012,39 @@ fn settle_pre_send_revert(
             );
             Stage::Done(DeliveryResultKind::Delivered)
         }
-        DeliveryRevert::ValidationFailedWithNativeValue => {
-            metrics.inc_deliver_tx(chain_key, revert_status(Some(revert)));
-            error!(chain_key, %message_id, %err,
-                "❌ {stage}(deliverMessage) reverted ValidationFailedWithNativeValue — the votes fail \
-                 validation and native value was attached; terminal for this vote bundle");
-            outcomes.record(
-                message_id,
-                DeliveryOutcome::new(OutcomeKind::Terminal, chain_key)
-                    .with_reason("ValidationFailedWithNativeValue: votes failed validation"),
-            );
-            Stage::Done(DeliveryResultKind::Terminal)
-        }
-        DeliveryRevert::InvalidMessageDispatcher => {
-            metrics.inc_deliver_tx(chain_key, revert_status(Some(revert)));
-            error!(chain_key, %message_id, inbox = %route.inbox_address, %err,
-                "❌ {stage}(deliverMessage) reverted InvalidMessageDispatcher — the Inbox's dispatcher \
-                 has no code; terminal until the Inbox is reconfigured");
-            outcomes.record(
-                message_id,
-                DeliveryOutcome::new(OutcomeKind::Terminal, chain_key)
-                    .with_reason("InvalidMessageDispatcher: the Inbox's dispatcher has no code"),
-            );
-            Stage::Done(DeliveryResultKind::Terminal)
-        }
         DeliveryRevert::InsufficientGasForDestination => {
             warn!(chain_key, %message_id, %err,
                 "{stage}(deliverMessage) reverted InsufficientGasForDestination; proceeding to send \
                  with a higher gas limit");
             Stage::Proceed
         }
-        DeliveryRevert::Other => {
-            metrics.inc_deliver_tx(chain_key, DeliveryStatus::Unclassified);
-            let detail = describe_unknown_revert(err, &job.payload);
-            warn!(chain_key, %message_id, %err, %detail,
-                "{stage}(deliverMessage) reverted; treating as terminal (undeliverable as published)");
-            outcomes.record(
-                message_id,
-                DeliveryOutcome::new(OutcomeKind::Undeliverable, chain_key)
-                    .with_reason(format!("{stage}(deliverMessage) reverted: {detail}")),
-            );
-            Stage::Done(DeliveryResultKind::Terminal)
-        }
+        _ => Stage::Done(retry_delivery_revert(
+            route,
+            job.message_id,
+            metrics,
+            Some(revert),
+            &format!("{stage}: {}", describe_unknown_revert(err, &job.payload)),
+        )),
     }
+}
+
+/// A revert proves only that this attempt failed against the current state. Pauses, dispatcher
+/// configuration and validator membership can change without changing the publication. Even a
+/// seemingly permanent error can be bubbled up by a configurable validator/dispatcher; a selector
+/// alone does not prove a bad publication. Keep the work in the pool for capped backoff and fresh
+/// votes. Known local policy/funding limits are checked separately before sending.
+fn retry_delivery_revert(
+    route: &ChainRoute,
+    message_id: B256,
+    metrics: &dyn crate::prom::MetricsTrait,
+    revert: Option<DeliveryRevert>,
+    reason: &str,
+) -> DeliveryResultKind {
+    let chain_key = route.chain_key;
+    metrics.inc_deliver_tx(chain_key, revert_status(revert));
+    warn!(chain_key, %message_id, ?revert, %reason,
+        "delivery reverted; returning to pool for retry after contract state or votes change");
+    DeliveryResultKind::Retryable
 }
 
 /// A `Duplicate` revert (`MessageAlreadyValidated`) used to mean only "someone already delivered
@@ -1267,9 +1257,9 @@ async fn handle_job<P: Provider + Clone + 'static>(
             .await
         {
             // If the inbox already accepted this message we treat it as success (idempotent —
-            // PoC §6.5). Any other *revert* is deterministic, so we don't burn gas. A transport
-            // failure (RPC blip, timeout) is neither — the pool retries it with backoff; treating
-            // it as terminal would silently drop a deliverable message.
+            // PoC §6.5). Other reverts may be state-dependent; return to the pool
+            // without burning gas while the destination is paused or its configuration/committee
+            // is changing. Transport failures likewise preserve the message for retry.
             match classify_delivery_revert(&err) {
                 Some(DeliveryRevert::Duplicate) => {
                     if let Some(kind) = settle_duplicate_revert(
@@ -1391,10 +1381,9 @@ async fn handle_job<P: Provider + Clone + 'static>(
             // Funded gas covers the estimate — proceed to send pinned at the funded gas.
             Ok(Ok(_)) => {}
             // The estimate itself failed. Classify like the simulate does: when
-            // `simulate_before_send` is off, this is where a deterministic revert first surfaces,
-            // and blanket-retrying a permanent revert would loop forever. Only genuine transport
-            // errors are retryable (we must not send unverified: an under-funded message would
-            // OOG and be dropped as terminal — the exact failure this guard exists to prevent).
+            // `simulate_before_send` is off, this is where a state-dependent revert first surfaces.
+            // Return recoverable failures to the pool rather than sending an unverified attempt
+            // or permanently discarding a publication during a temporary contract-state change.
             Ok(Err(err)) => match classify_delivery_revert(&err) {
                 Some(DeliveryRevert::Duplicate) => {
                     if let Some(kind) = settle_duplicate_revert(
@@ -1548,7 +1537,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
                         // Mined but reverted. Replay the exact call at that block to learn why: an
                         // `InsufficientGasForDestination` is ours to fix by resending with more gas;
                         // a duplicate means another relayer's tx landed in the same block (success);
-                        // anything else is a deterministic revert and terminal.
+                        // other reverts return to the pool because contract state may change.
                         let (class, reason) = replay_revert_reason(
                             &inbox,
                             job,
@@ -1652,9 +1641,9 @@ async fn handle_job<P: Provider + Clone + 'static>(
                         }
                     }
                 }
-                // Deterministic contract revert at send / gas-estimation time — retrying would
-                // revert identically, so don't burn the retry budget on it. The class travels with
-                // the outcome so the #36 errors get their own metric label, not `Reverted`.
+                // Contract revert at send / gas-estimation time. Hand it back to the pool
+                // instead of burning worker retries against unchanged contract state. The class
+                // also preserves specific metric labels for configuration and validation errors.
                 Some(revert) => {
                     break SendOutcome::Reverted {
                         revert: Some(revert),
@@ -1820,22 +1809,13 @@ async fn handle_job<P: Provider + Clone + 'static>(
             );
             Ok(DeliveryResultKind::Delivered)
         }
-        SendOutcome::Reverted { revert, reason } => {
-            metrics.inc_deliver_tx(route.chain_key, revert_status(revert));
-            error!(
-                chain_key = route.chain_key,
-                message_id = %job.message_id,
-                revert = ?revert,
-                %reason,
-                "❌ delivery reverted; no further retries"
-            );
-            outcomes.record(
-                job.message_id,
-                DeliveryOutcome::new(OutcomeKind::Terminal, route.chain_key)
-                    .with_reason(format!("delivery reverted ({revert:?}): {reason}")),
-            );
-            Ok(DeliveryResultKind::Terminal)
-        }
+        SendOutcome::Reverted { revert, reason } => Ok(retry_delivery_revert(
+            route,
+            job.message_id,
+            metrics,
+            revert,
+            &reason,
+        )),
         SendOutcome::Failed(err_str) => {
             metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::Reverted);
             warn!(
@@ -1849,7 +1829,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
     }
 }
 
-/// The `relayer_deliver_tx` label for a terminal revert, whichever stage surfaced it (simulate,
+/// The `relayer_deliver_tx` label for a revert, whichever stage surfaced it (simulate,
 /// estimate, send, or the mined-revert replay). The #36 hard failures get their own series; a
 /// revert `classify_delivery_revert` could not recognize gets `Unclassified` (distinct from the
 /// generic `Reverted`, which also covers `InsufficientGasForDestination` and non-revert failures —
@@ -1868,7 +1848,7 @@ fn revert_status(revert: Option<DeliveryRevert>) -> DeliveryStatus {
     }
 }
 
-/// Human-readable reason for a terminal send-time revert, naming the #36 errors that would
+/// Human-readable reason for a send-time revert, naming the #36 errors that would
 /// otherwise only show as a selector on Creditcoin-style nodes.
 fn revert_summary(revert: DeliveryRevert, err: &alloy::contract::Error) -> String {
     match revert {
@@ -1891,8 +1871,8 @@ fn revert_summary(revert: DeliveryRevert, err: &alloy::contract::Error) -> Strin
 /// string dialects second — geth-style nodes put the selector only in the JSON-RPC error `data`,
 /// which a plain `to_string()` does not reliably carry; Bugbot, PR #63) plus the printable reason.
 /// Best-effort and bounded: `None` when the replay succeeds (state moved on) or cannot be made in
-/// time — the caller then falls back to a generic terminal revert, which is what it did before
-/// this existed.
+/// time — the caller keeps the message retryable rather than treating missing evidence as a
+/// permanent publication failure.
 async fn replay_revert_reason<P: Provider>(
     inbox: &IInbox::IInboxInstance<P>,
     job: &DeliveryJob,
@@ -2308,7 +2288,226 @@ fn spawn_failed_retry<P: Provider + Clone + 'static>(
 mod tests {
     use super::*;
     use crate::pool::{DELIVERY_RETRY_MAX, PRUNE_TICK_INTERVAL};
+    use crate::{config::AttestorSet, prom::NoopMetrics};
     use alloy::primitives::LogData;
+    use alloy::transports::mock::Asserter;
+
+    fn delivery_fixture() -> (ChainRoute, DeliveryJob) {
+        let route = ChainRoute {
+            chain_key: 2,
+            creditcoin_chain_id: 42,
+            destination_rpc_url: "http://unused.invalid".into(),
+            inbox_address: Address::repeat_byte(0x11),
+            signer_key: None,
+            outbox_address: None,
+            relayer_contract_address: None,
+            block_confirmation_depth: 0,
+            start_block: None,
+            attestor_set: AttestorSet::Static(vec![Address::repeat_byte(0x22)]),
+            threshold_override: None,
+            ack: None,
+            claim: None,
+            max_native_coin_value_wei: U256::ZERO,
+            max_gas_limit: 5_000_000,
+            auto_request_top_up: false,
+        };
+        let job = DeliveryJob {
+            chain_key: route.chain_key,
+            message_id: B256::repeat_byte(1),
+            emitter: Address::repeat_byte(2),
+            outbox: Address::repeat_byte(3),
+            sequence: 1,
+            payload: envelope(0, 100_000),
+            votes_calldata: vec![],
+            signer_count: 1,
+            indexed_at: Instant::now(),
+        };
+        (route, job)
+    }
+
+    /// Exercise the worker's simulate, funded estimate, send and mined-replay paths. A pause is
+    /// reversible even though every one of those RPC responses is a deterministic EVM revert.
+    #[tokio::test]
+    async fn paused_inbox_is_retryable_at_every_delivery_stage() {
+        for stage in ["simulate", "estimate", "send", "mined"] {
+            let rpc = Asserter::new();
+            let (route, job) = delivery_fixture();
+            let config = DeliveryConfig {
+                simulate_before_send: stage == "simulate",
+                max_retries: 0,
+                ..Default::default()
+            };
+            let funding = if stage == "estimate" {
+                MessageFunding {
+                    gas: Some(200_000),
+                    ..MessageFunding::unknown()
+                }
+            } else {
+                MessageFunding::unknown()
+            };
+            if stage == "mined" {
+                let hash = B256::repeat_byte(0x44);
+                rpc.push_success(&hash);
+                rpc.push_success(&serde_json::json!({
+                    "status": "0x0", "cumulativeGasUsed": "0x1",
+                    "logsBloom": format!("0x{}", "00".repeat(256)), "logs": [],
+                    "transactionHash": hash, "transactionIndex": "0x0",
+                    "blockHash": B256::repeat_byte(0x55), "blockNumber": "0x1",
+                    "gasUsed": "0x1", "effectiveGasPrice": "0x1",
+                    "from": Address::repeat_byte(4), "to": route.inbox_address, "type": "0x2",
+                }));
+            }
+            rpc.push_failure_msg("execution reverted: EnforcedPause()");
+            let provider = ProviderBuilder::new()
+                .disable_recommended_fillers()
+                .connect_mocked_client(rpc.clone());
+            let outcomes = Arc::new(OutcomeStore::new(8));
+            let result = handle_job(
+                &route,
+                &config,
+                &provider,
+                Address::repeat_byte(4),
+                &crate::broadcast::BroadcastLocks::new(),
+                &job,
+                funding,
+                NoopMetrics::new().as_ref(),
+                None,
+                &outcomes,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, DeliveryResultKind::Retryable, "{stage}");
+            assert!(
+                outcomes.get(&job.message_id).is_none(),
+                "{stage} recorded a final outcome"
+            );
+            assert!(
+                rpc.read_q().is_empty(),
+                "{stage} did not exercise the intended RPC path"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn locally_verified_publication_limits_remain_terminal_without_sending() {
+        let (route, mut job) = delivery_fixture();
+        for payload in [envelope(1, 100_000), envelope(0, route.max_gas_limit + 1)] {
+            job.payload = payload;
+            let rpc = Asserter::new();
+            let provider = ProviderBuilder::new().connect_mocked_client(rpc);
+            let outcomes = Arc::new(OutcomeStore::new(8));
+            assert_eq!(
+                handle_job(
+                    &route,
+                    &DeliveryConfig::default(),
+                    &provider,
+                    Address::repeat_byte(4),
+                    &crate::broadcast::BroadcastLocks::new(),
+                    &job,
+                    MessageFunding::unknown(),
+                    NoopMetrics::new().as_ref(),
+                    None,
+                    &outcomes,
+                )
+                .await
+                .unwrap(),
+                DeliveryResultKind::Terminal,
+            );
+            assert_eq!(
+                outcomes.get(&job.message_id).unwrap().kind,
+                OutcomeKind::Undeliverable
+            );
+        }
+    }
+
+    #[test]
+    fn state_dependent_and_unknown_reverts_keep_work() {
+        let (route, job) = delivery_fixture();
+        let metrics = NoopMetrics::new();
+        let outcomes = OutcomeStore::new(8);
+        for error in [
+            structured_revert(
+                "execution reverted: InvalidAttestor",
+                &[0x12, 0x34, 0x56, 0x78],
+            ),
+            structured_revert("execution reverted: ThresholdNotMet", &[]),
+            structured_revert(
+                "execution reverted",
+                &IInbox::InvalidMessageDispatcher {
+                    dispatcher: Address::ZERO,
+                }
+                .abi_encode(),
+            ),
+            structured_revert(
+                "execution reverted",
+                &IInbox::ValidationFailedWithNativeValue {
+                    messageId: job.message_id,
+                    value: U256::from(1),
+                }
+                .abi_encode(),
+            ),
+        ] {
+            let class = classify_delivery_revert(&error).unwrap();
+            assert!(matches!(
+                settle_pre_send_revert(
+                    &route,
+                    &job,
+                    metrics.as_ref(),
+                    &outcomes,
+                    "simulate",
+                    class,
+                    &error,
+                ),
+                Stage::Done(DeliveryResultKind::Retryable)
+            ));
+            assert_eq!(
+                retry_delivery_revert(
+                    &route,
+                    job.message_id,
+                    metrics.as_ref(),
+                    Some(class),
+                    "send or mined",
+                ),
+                DeliveryResultKind::Retryable
+            );
+        }
+        assert_eq!(
+            retry_delivery_revert(
+                &route,
+                job.message_id,
+                metrics.as_ref(),
+                None,
+                "replay unavailable",
+            ),
+            DeliveryResultKind::Retryable
+        );
+        assert!(outcomes.get(&job.message_id).is_none());
+
+        let error = structured_revert(
+            "execution reverted",
+            &IInbox::MessageIdMismatch {
+                messageId: job.message_id,
+            }
+            .abi_encode(),
+        );
+        let class = classify_delivery_revert(&error).unwrap();
+        // Inbox bubbles dispatcher/validator errors, so even this selector cannot prove a bad
+        // publication independently of the mutable contracts that emitted it.
+        assert_eq!(class, DeliveryRevert::Other);
+        assert!(matches!(
+            settle_pre_send_revert(
+                &route,
+                &job,
+                metrics.as_ref(),
+                &outcomes,
+                "simulate",
+                class,
+                &error,
+            ),
+            Stage::Done(DeliveryResultKind::Retryable)
+        ));
+        assert!(outcomes.get(&job.message_id).is_none());
+    }
 
     /// Matches the grace period `run` actually computes: see the comment above its `error_grace_period` binding.
     const ERROR_GRACE_PERIOD: Duration =
@@ -2596,7 +2795,7 @@ mod tests {
             classify_revert_str("execution reverted: VotesBelowThreshold", None),
             Some(DeliveryRevert::Other)
         );
-        // Unknown selector, no phrasing: still a revert (data present), so Other — not a retry.
+        // Unknown selector, no phrasing: still a revert, but not evidence of permanent failure.
         assert_eq!(
             classify_revert_str(&cc_style(&[0x12, 0x34, 0x56, 0x78]), None),
             Some(DeliveryRevert::Other)
@@ -2668,7 +2867,7 @@ mod tests {
         );
     }
 
-    /// Every stage that ends in a terminal revert maps the classification to the same label: the
+    /// Every stage that ends in a revert maps the classification to the same label: the
     /// #36 hard failures get their own series whether they surfaced at simulate, send, or in the
     /// mined-revert replay; an unrecognized revert shape gets its own `Unclassified` series
     /// (distinct from the generic `Reverted`, which still covers `InsufficientGasForDestination`

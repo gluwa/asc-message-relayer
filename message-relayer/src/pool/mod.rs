@@ -567,8 +567,8 @@ impl State {
                 // because the budget outlives the scan lookback (C1r). Keep retrying at the capped
                 // backoff instead (delivery_retry_delay tops out at DELIVERY_RETRY_MAX); re-attempts
                 // are safe via on-chain idempotency (AlreadyValidated), and the slot is still bounded
-                // by the count-based LRU (evict_overflow). Genuine permanent failures (reverts) are
-                // classified `Terminal`, not `Retryable`, so they are unaffected.
+                // by the count-based LRU (evict_overflow). Only known permanent publication or
+                // policy failures are `Terminal`: a contract revert can depend on mutable state.
                 let delay = delivery_retry_delay(slot.delivery_attempts);
                 slot.next_delivery_attempt_at = Some(Instant::now() + delay);
                 if slot.delivery_attempts >= DELIVERY_MAX_DISPATCH_ATTEMPTS {
@@ -705,11 +705,14 @@ impl State {
         let threshold = route.threshold;
         let mut ready = Vec::new();
         for (hash, slot) in route.by_message.iter_mut() {
-            if slot.delivered || slot.terminal || slot.in_flight {
+            if slot.delivered || slot.terminal {
                 continue;
             }
+            // A set change can race a delivery already using the old bundle. Prune its stored
+            // votes too, so a retry cannot keep resubmitting a removed signer's signature after
+            // the update has already been consumed. The in-flight job owns its separate copy.
             slot.signers.retain(|addr, _| attestors.contains(addr));
-            if slot.signers.len() < threshold {
+            if slot.in_flight || slot.signers.len() < threshold {
                 continue;
             }
             let signer_count = slot.signers.len();
@@ -1620,6 +1623,71 @@ mod tests {
             .get(&hash)
             .unwrap();
         assert!(!slot.delivered);
+    }
+
+    #[test]
+    fn set_reload_during_delivery_prunes_the_bundle_before_retry() {
+        let (a, b, c) = (
+            Address::repeat_byte(0xa),
+            Address::repeat_byte(0xb),
+            Address::repeat_byte(0xc),
+        );
+        let metrics = NoopMetrics::new();
+        let mut state = State::new(
+            vec![RouteAttestors {
+                chain_key: 2,
+                attestors: vec![a, b],
+                threshold: 2,
+            }],
+            VoteCacheConfig::default(),
+        );
+        let hash = B256::repeat_byte(1);
+        seed_slot(&mut state, 2, hash, &[a, b]);
+        assert_eq!(state.collect_ready_deliveries(metrics.as_ref()).len(), 1);
+
+        // The old bundle is still in flight when the validator committee changes.
+        assert!(state
+            .apply_attestor_set(
+                RouteAttestors {
+                    chain_key: 2,
+                    attestors: vec![a, c],
+                    threshold: 2
+                },
+                metrics.as_ref(),
+            )
+            .is_empty());
+        state.note_delivery_result(
+            DeliveryResult {
+                chain_key: 2,
+                message_id: hash,
+                outcome: DeliveryResultKind::Retryable,
+            },
+            metrics.as_ref(),
+        );
+        let slot = state
+            .by_route
+            .get_mut(&2)
+            .unwrap()
+            .by_message
+            .get_mut(&hash)
+            .unwrap();
+        slot.next_delivery_attempt_at = None;
+        assert!(!slot.signers.contains_key(&b));
+        assert!(state.collect_ready_deliveries(metrics.as_ref()).is_empty());
+
+        // Fresh votes from the current committee can resume the same publication.
+        let slot = state
+            .by_route
+            .get_mut(&2)
+            .unwrap()
+            .by_message
+            .get_mut(&hash)
+            .unwrap();
+        slot.signers.insert(c, [3; 65]);
+        let jobs = state.collect_ready_deliveries(metrics.as_ref());
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].message_id, hash);
+        assert_eq!(jobs[0].votes_calldata, encode_votes(&[[1; 65], [3; 65]]));
     }
 
     #[test]
