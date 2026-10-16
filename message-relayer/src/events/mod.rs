@@ -1,56 +1,40 @@
-//! Outbox event discovery.
+//! Source message discovery across every historically authorized Outbox.
 //!
-//! For every configured route, this module spawns a poller that watches the Creditcoin L1 EVM
-//! endpoint for `MessagePublished` events on the route's resolved Outbox. New events become
-//! [`IndexedMessage`]s pushed into the shared vote pool — the **chain-first allowlist** of PoC
-//! §6.2: votes for `messageId`s we have not indexed are dropped on arrival.
+//! Default changes, removal and Discovery replacement do not reset the scan. Each candidate
+//! emitter is checked against governance's Discovery at the finalized source block, matching
+//! the attestor's block-end authorization semantics. Historical RPC failures stop progress.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, B256};
 use alloy::providers::Provider;
-use alloy::rpc::types::Filter;
+use alloy::rpc::types::{BlockNumberOrTag, Filter, Log};
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
+mod authority;
+pub mod factory;
 pub mod finality;
 
 use crate::abi::IOutbox;
 use crate::checkpoint::CheckpointStore;
 use crate::config::ChainRoute;
 use crate::prom::Metrics;
+use finality::{pick_to_block, read_finalized_head, FinalityPolicy, FinalityTracker};
 use write_ability::protocol::chain_key_to_bytes32;
 
-use finality::{pick_to_block, read_finalized_head, FinalityPolicy, FinalityTracker};
-
-pub mod factory;
-
 pub use factory::{DiscoveryResolver, OutboxResolver, ResolvedOutbox};
-
-/// Default poll cadence for re-checking whether [`OutboxResolver::resolve`] now returns a
-/// different address (an Outbox rotation). Independent of, and much slower than,
-/// [`DEFAULT_POLL_INTERVAL_SECS`]'s `MessagePublished` scan — a rotation is rare, and a registry
-/// read costs at most two precompile/contract calls.
+/// Settlement's legacy resolver refresh cadence. Source discovery does not poll a default.
 pub const DEFAULT_RESOLVE_POLL_INTERVAL_SECS: u64 = 60;
-
-/// Retry cadence for the startup resolution bootstrap while [`OutboxResolver::resolve`] has not
-/// yet produced an address (e.g. no discovery registry registered for the chain key yet). Short:
-/// this only blocks the very first scan, not the running loop.
-const RESOLVE_BOOTSTRAP_RETRY: Duration = Duration::from_secs(5);
-
-/// Default poll cadence for `eth_getLogs`. WS subscription would be lower-latency but adds an
-/// extra failure mode (silent stream stalls) we don't want in PoC scope.
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 6;
-
-/// Maximum block span per `eth_getLogs` scan. Public RPCs cap the queryable range; an over-large
-/// resume range (long downtime, deep `start_block` backfill) would error on every tick and wedge
-/// the watcher forever on the same oversized query. Bounded chunks advance the checkpoint
-/// incrementally — at one chunk per 6s tick the watcher catches up quickly.
 const MAX_BLOCKS_PER_SCAN: u64 = 2_000;
+/// Bound individual network calls, never draining a bounded channel under backpressure.
+const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A finalized message that the relayer has discovered on the Creditcoin Outbox. The vote pool
 /// keys on `message_id` (also the digest attestors sign directly since asc-contracts #54); the
@@ -76,17 +60,44 @@ pub struct IndexedMessage {
     pub block_height: u64,
 }
 
-/// Spawn one outbox watcher per route. Returns immediately; the watcher loops until `cancel`
-/// fires or an unrecoverable error occurs. `scan_lookback_blocks` rewinds the persisted cursor on
-/// startup so messages indexed-but-undelivered when the process died are re-discovered (see
-/// [`crate::config::DEFAULT_SCAN_LOOKBACK_BLOCKS`]).
+/// Immutable route domain plus the optional, explicit operator trust override.
+#[derive(Debug, Clone, Copy)]
+struct SourceRoute {
+    chain_key: u64,
+    destination_chain_key: B256,
+    creditcoin_chain_id: u64,
+    outbox_override: Option<Address>,
+}
+
+/// One cursor covers every Outbox for a route. A pinned override gets a distinct key so enabling,
+/// changing or disabling it cannot turn a partial address scan into an all-Outbox checkpoint.
+fn checkpoint_key(chain_key: u64, outbox_override: Option<Address>) -> String {
+    match outbox_override {
+        Some(address) => format!("outbox-pinned:{chain_key}:{address}"),
+        None => format!("outboxes:{chain_key}"),
+    }
+}
+
+fn resume_cursor(
+    checkpoint: Option<u64>,
+    durable_work: bool,
+    start_block: Option<u64>,
+    lookback: u64,
+) -> u64 {
+    checkpoint.filter(|_| durable_work).map_or_else(
+        || start_block.unwrap_or(1).saturating_sub(1),
+        |block| block.saturating_sub(lookback),
+    )
+}
+
+/// Watch finalized publication history without depending on today's default or active set.
+/// Legacy single-Outbox checkpoints are intentionally not reused: they did not cover this scope.
 #[allow(clippy::too_many_arguments)]
 pub async fn watch_outbox(
     route: ChainRoute,
     creditcoin_eth_rpc_url: String,
     indexed_tx: mpsc::Sender<IndexedMessage>,
     metrics: Metrics,
-    resolver: Arc<dyn OutboxResolver>,
     checkpoint: Option<Arc<CheckpointStore>>,
     scan_lookback_blocks: u64,
     health: Arc<crate::health::Health>,
@@ -94,15 +105,23 @@ pub async fn watch_outbox(
     cancel: CancellationToken,
 ) -> Result<()> {
     let chain_key = route.chain_key;
-    let checkpoint_key = format!("outbox:{chain_key}");
-    let health_key = checkpoint_key.clone();
-    // Register at startup so a watcher that wedges before its first successful scan still goes stale.
+    anyhow::ensure!(
+        checkpoint.is_some() == work.is_some(),
+        "source checkpoint and unfinished-work persistence must be enabled together"
+    );
+    if route.outbox_address.is_none() {
+        authority::registry_chain_key(chain_key)?;
+    }
+    if let Some(address) = route.outbox_address {
+        anyhow::ensure!(
+            !address.is_zero(),
+            "outbox_address override must not be zero"
+        );
+        warn!(chain_key, %address, "source scan pinned by outbox_address; bypassing historical Discovery authorization");
+    }
+    let key = checkpoint_key(chain_key, route.outbox_address);
+    let health_key = format!("outbox:{chain_key}");
     health.heartbeat(&health_key);
-    // The source-chain provider lives in a rebuilding slot: after `rpc::REBUILD_AFTER_FAILURES`
-    // failed scans it is dropped and re-dialed on the next tick, so a dead transport heals
-    // in-process instead of through a liveness restart (see `crate::health`). The slot hands out
-    // type-erased handles, which is also what `resolve()` needs through the `dyn OutboxResolver`
-    // trait object; cloning one is cheap (Arc-backed transport).
     let mut source_rpc = crate::rpc::Reconnecting::new(
         format!("outbox:{chain_key} source"),
         creditcoin_eth_rpc_url.clone(),
@@ -110,246 +129,68 @@ pub async fn watch_outbox(
     let provider = source_rpc
         .connect()
         .await
-        .with_context(|| {
-            format!(
-                "chain_key {chain_key}: failed to connect to Creditcoin EVM RPC at {creditcoin_eth_rpc_url}"
-            )
-        })?
+        .with_context(|| format!("chain_key {chain_key}: failed to connect to source RPC"))?
         .clone();
-
-    // Startup bootstrap: retry until `resolve()` produces an address — resolves on the first try
-    // or not at all (a registry read is a single atomic lookup, nothing to catch up on).
-    let resolved = loop {
-        match resolver.resolve(&route, &provider).await {
-            Ok(resolved) => break resolved,
-            Err(err) => {
-                warn!(chain_key, %err, "outbox resolution not ready yet; retrying");
-                // Heartbeat so waiting on a chain key with no discovery address registered yet
-                // does not trip /health's PROGRESS_DEADLINE and get killed.
-                health.heartbeat(&health_key);
-                tokio::select! {
-                    () = tokio::time::sleep(RESOLVE_BOOTSTRAP_RETRY) => {}
-                    () = cancel.cancelled() => {
-                        info!(chain_key, "🛑 Outbox watcher exiting on cancel during resolution");
-                        return Ok(());
-                    }
-                }
-            }
-        }
-    };
-    let mut outbox = resolved.address;
-
-    // The destination chain_key is known locally — derived from the route's `u64` chain_key — and
-    // bound into messageHash for every event seen on this outbox (see PoC §5.1). It is not read
-    // back from the Outbox.
-    let destination_chain_key = chain_key_to_bytes32(chain_key);
-
-    let creditcoin_chain_id = provider.get_chain_id().await.with_context(|| {
-        format!("chain_key {chain_key}: failed to read Creditcoin EVM chain id")
-    })?;
-
-    info!(
+    let creditcoin_chain_id = tokio::time::timeout(RPC_TIMEOUT, provider.get_chain_id())
+        .await
+        .context("source chain ID lookup timed out")??;
+    let source = SourceRoute {
         chain_key,
-        %outbox,
-        ?destination_chain_key,
+        destination_chain_key: chain_key_to_bytes32(chain_key),
         creditcoin_chain_id,
-        "📡 Outbox watcher initialized"
-    );
-
-    // Resume from the persisted cursor (so events emitted while we were down are not skipped),
-    // falling back to the current head on first run / when persistence is disabled.
-    // Unfinished messages are restored independently from the work store. The lookback is an
-    // idempotent rescan, not a bound on how long delivery may remain unfinished.
-    // A checkpoint recorded against a different, known Outbox address is not a valid resume point
-    // for the one just resolved — see `checkpoint_contradicts_resolved_outbox` for why "unknown"
-    // must not be treated the same as "different".
-    let checkpoint_block = checkpoint.as_ref().and_then(|c| c.get(&checkpoint_key));
-    let checkpoint_outbox = checkpoint
+        outbox_override: route.outbox_address,
+    };
+    let persisted = checkpoint.as_ref().and_then(|c| c.get(&key));
+    let durable_work = checkpoint
         .as_ref()
-        .and_then(|c| c.get_outbox(&checkpoint_key));
-    let checkpoint_is_stale =
-        checkpoint_contradicts_resolved_outbox(checkpoint_outbox.as_deref(), resolved.address);
-    let durable_checkpoint = checkpoint
-        .as_ref()
-        .is_some_and(|c| c.has_durable_work(&checkpoint_key));
+        .is_some_and(|c| c.has_durable_work(&key));
     if let Some(work) = &work {
-        work.prepare_route(chain_key, durable_checkpoint).await?;
+        work.prepare_route(chain_key, durable_work).await?;
     }
-
-    let mut last_seen = if checkpoint_block.is_some() && work.is_some() && !durable_checkpoint {
-        // Old holdback checkpoints could advance over unfinished work even before the lookback
-        // window. Only a complete rescan can recover it; never bless that cursor as journaled.
-        let resume = legacy_replay_cursor(route.start_block, resolved.current_since_block);
-        warn!(
-            chain_key,
-            resume_from = resume + 1,
-            "upgrading legacy Outbox checkpoint: replaying source history into durable work store"
-        );
-        resume
-    } else if let (Some(block), false) = (checkpoint_block, checkpoint_is_stale) {
-        let resume = block.saturating_sub(scan_lookback_blocks);
-        info!(
-            chain_key,
-            checkpoint = block,
-            resume_from = resume + 1,
-            "↩️ resuming Outbox scan from checkpoint (rewound by lookback)"
-        );
-        resume
-    } else {
-        if let Some(block) = checkpoint_block {
-            info!(
-                chain_key,
-                checkpoint = block,
-                recorded_outbox = ?checkpoint_outbox,
-                resolved_outbox = %resolved.address,
-                "↩️ checkpoint is recorded against a different Outbox address; not reusing it as \
-                 a resume point"
-            );
-        }
-        if let Some(since) = resolved.current_since_block {
-            info!(
-                chain_key,
-                since_block = since,
-                "⏮️ starting scan from the resolved Outbox's discovery block"
-            );
-            since.saturating_sub(1)
-        } else if let Some(start) = route.start_block {
-            info!(
-                chain_key,
-                start_block = start,
-                "⏮️ no Outbox checkpoint; starting initial scan from configured block"
-            );
-            start.saturating_sub(1)
-        } else {
-            provider
-                .get_block_number()
-                .await
-                .with_context(|| format!("chain_key {chain_key}: failed to read chain head"))?
-        }
-    };
-
-    // Creditcoin has deterministic finality, so scan up to the finalized head, exactly where the
-    // attestors sign. `block_confirmation_depth` is only the fallback when the `finalized` tag is
-    // unavailable or finality has stalled (see `events::finality`). With depth 32 at ~6 s blocks
-    // the old `tip - depth` boundary cost ~3 minutes per message on usc-devnet.
-    let policy = FinalityPolicy::Finalized {
-        fallback_depth: route.block_confirmation_depth,
-    };
-    let mut finality = FinalityTracker::new(Instant::now());
-    info!(
-        chain_key,
-        fallback_depth = route.block_confirmation_depth,
-        "📡 Outbox scan boundary: Creditcoin finalized head (depth is the fallback only)"
+    let mut last_seen = resume_cursor(
+        persisted,
+        durable_work,
+        route.start_block,
+        scan_lookback_blocks,
     );
-
+    if persisted.is_none() || !durable_work {
+        info!(chain_key, from_block = last_seen + 1, "starting all-Outbox history scan; single-address checkpoints cannot establish coverage");
+    }
+    let policy = FinalityPolicy::Finalized;
+    let mut finality = FinalityTracker::new(Instant::now());
     let mut tick = tokio::time::interval(Duration::from_secs(DEFAULT_POLL_INTERVAL_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    let mut resolve_tick =
-        tokio::time::interval(Duration::from_secs(crate::config::poll_secs_override(
-            "RELAYER_OUTBOX_RESOLVE_POLL_SECS",
-            DEFAULT_RESOLVE_POLL_INTERVAL_SECS,
-        )));
-    resolve_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
     loop {
         tokio::select! {
-            () = cancel.cancelled() => {
-                info!(chain_key, "🛑 Outbox watcher exiting on cancel");
-                return Ok(());
-            }
-            _ = resolve_tick.tick() => {
-                let provider = match source_rpc.connect().await {
-                    Ok(provider) => provider.clone(),
-                    Err(err) => {
-                        warn!(chain_key, %err, "outbox re-resolution skipped; source RPC not connectable");
-                        continue;
-                    }
-                };
-                match resolver.resolve(&route, &provider).await {
-                    Ok(fresh) => {
-                        if fresh.address != outbox {
-                            // Switching now would abandon any not-yet-scanned MessagePublished
-                            // range on the old address (poll_once only ever tracks one
-                            // (address, last_seen) pair) — safe only once `last_seen` has already
-                            // reached the new Outbox's creation block, so the old address has
-                            // nothing left unscanned up to that point. Until then, keep discovering
-                            // on the old address (poll_once's regular ticks are already advancing
-                            // it) and re-check next resolve_tick; the switch is deferred, not lost.
-                            if outbox_rotation_is_safe(last_seen, fresh.current_since_block) {
-                                info!(
-                                    chain_key,
-                                    old = %outbox,
-                                    new = %fresh.address,
-                                    "🔁 Outbox rotation detected; switching discovery to the new address"
-                                );
-                                outbox = fresh.address;
-                                last_seen = fresh
-                                    .current_since_block
-                                    .map(|b| b.saturating_sub(1))
-                                    .unwrap_or(last_seen);
-                            } else {
-                                debug!(
-                                    chain_key,
-                                    old = %outbox,
-                                    new = %fresh.address,
-                                    last_seen,
-                                    since_block = ?fresh.current_since_block,
-                                    "🔁 Outbox rotation detected but old address still has an \
-                                     unscanned backlog; deferring the switch"
-                                );
-                            }
-                        }
-                    }
-                    Err(err) => warn!(chain_key, %err, "outbox re-resolution failed; keeping current address"),
-                }
-            }
+            () = cancel.cancelled() => return Ok(()),
             _ = tick.tick() => {
                 let scan = match source_rpc.connect().await {
-                    Ok(provider) => {
-                        let provider = provider.clone();
-                        poll_once(
-                            chain_key,
-                            outbox,
-                            destination_chain_key,
-                            creditcoin_chain_id,
-                            &policy,
-                            &mut finality,
-                            &provider,
-                            &mut last_seen,
-                            &indexed_tx,
-                            metrics.as_ref(),
-                            work.as_deref(),
-                            &cancel,
-                        ).await
-                    }
+                    Ok(provider) => poll_once(&source, &policy, &mut finality, provider,
+                        &mut last_seen, &indexed_tx, metrics.as_ref(), work.as_deref(), &cancel, &|| health.heartbeat(&health_key)).await,
                     Err(err) => Err(err),
                 };
                 match scan {
                     Ok(()) => {
-                        // Successful scan = forward progress (C2r). A failing provider reports an
-                        // error below instead: the worker shows as degraded, and after a streak
-                        // the provider is re-dialed; only a *silent* worker trips a restart.
                         source_rpc.note_ok();
                         health.heartbeat(&health_key);
                         if let Some(cp) = &checkpoint {
-                            // Every discovered message is durable before poll_once advances this
-                            // cursor. Recovery no longer depends on a periodically published floor.
+                            // Every message in the successful prefix was persisted before it
+                            // reached the channel. No periodically sampled holdback is needed.
                             let saved = if work.is_some() {
-                                cp.set_with_work(&checkpoint_key, last_seen, &outbox.to_string())
+                                cp.set_journaled(&key, last_seen, None)
                             } else {
-                                cp.set_with_outbox(&checkpoint_key, last_seen, &outbox.to_string())
+                                cp.set(&key, last_seen)
                             };
                             if let Err(err) = saved {
                                 metrics.inc_checkpoint_write_failure(chain_key);
-                                warn!(chain_key, %err, "failed to persist Outbox checkpoint");
+                                warn!(chain_key, %err, "failed to persist source checkpoint");
                             }
                         }
                     }
                     Err(err) => {
                         health.error(&health_key);
                         source_rpc.note_err();
-                        warn!(chain_key, %err, "outbox poll iteration failed; will retry");
+                        warn!(chain_key, %err, "source poll failed; cursor retained for retry");
                     }
                 }
             }
@@ -357,18 +198,9 @@ pub async fn watch_outbox(
     }
 }
 
-/// A legacy cursor contains no reliable unfinished-work inventory. An explicit operator floor
-/// or the Outbox's creation block is safe; with neither, replay from the first scannable block.
-fn legacy_replay_cursor(start_block: Option<u64>, since_block: Option<u64>) -> u64 {
-    start_block.or(since_block).unwrap_or(0).saturating_sub(1)
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn poll_once<P: Provider>(
-    chain_key: u64,
-    outbox: Address,
-    destination_chain_key: B256,
-    creditcoin_chain_id: u64,
+    source: &SourceRoute,
     policy: &FinalityPolicy,
     finality: &mut FinalityTracker,
     provider: &P,
@@ -377,307 +209,229 @@ async fn poll_once<P: Provider>(
     metrics: &dyn crate::prom::MetricsTrait,
     work: Option<&crate::work::WorkStore>,
     cancel: &CancellationToken,
+    progress: &(dyn Fn() + Sync),
 ) -> Result<()> {
-    let tip = provider.get_block_number().await?;
-    // Only ask for the finalized head when the policy can use it; a depth policy never does.
-    let finalized = match policy {
-        FinalityPolicy::Finalized { .. } => read_finalized_head(provider, chain_key).await,
-        FinalityPolicy::Depth(_) => None,
+    let (finalized, tip) = match policy {
+        FinalityPolicy::Finalized => (Some(read_finalized_head(provider).await?), 0),
+        FinalityPolicy::Depth(_) => (
+            None,
+            tokio::time::timeout(RPC_TIMEOUT, provider.get_block_number())
+                .await
+                .context("source tip lookup timed out")??,
+        ),
     };
-    let was_fallback = finality.in_fallback();
-    let confirmed = pick_to_block(finalized, tip, policy, finality, Instant::now());
-    if finality.in_fallback() != was_fallback {
-        if finality.in_fallback() {
-            warn!(
-                chain_key,
-                tip,
-                ?finalized,
-                to_block = confirmed,
-                "Outbox scan switched to the depth fallback (finalized head unavailable or stalled)"
-            );
-        } else {
-            info!(
-                chain_key,
-                tip,
-                ?finalized,
-                "Outbox scan back on the finalized head"
-            );
-        }
+    let was_stalled = finality.is_stalled();
+    let confirmed = pick_to_block(finalized, tip, policy, finality, Instant::now())?;
+    if finality.is_stalled() && !was_stalled {
+        warn!(
+            chain_key = source.chain_key,
+            confirmed, "source finality stalled; waiting for a finalized advance"
+        );
     }
     if confirmed <= *last_seen {
         return Ok(());
     }
     let from_block = *last_seen + 1;
-    // Bounded chunk (see MAX_BLOCKS_PER_SCAN): never ask the RPC for more than it will serve.
-    let to_block = confirmed.min(last_seen.saturating_add(MAX_BLOCKS_PER_SCAN));
-
-    let filter = Filter::new()
-        .address(outbox)
-        .event_signature(IOutbox::MessagePublished::SIGNATURE_HASH)
-        .from_block(from_block)
-        .to_block(to_block);
-
-    let logs = provider
-        .get_logs(&filter)
+    let mut to_block = confirmed.min(last_seen.saturating_add(MAX_BLOCKS_PER_SCAN));
+    let logs = loop {
+        match fetch_message_logs(
+            provider,
+            from_block,
+            to_block,
+            source.outbox_override,
+            progress,
+        )
         .await
-        .with_context(|| format!("eth_getLogs from {from_block} to {to_block} failed"))?;
-
-    for log in logs {
-        match IOutbox::MessagePublished::decode_log(&log.inner) {
-            Ok(decoded) => {
-                let Some(tx_hash) = log.transaction_hash else {
-                    warn!(
-                        chain_key,
-                        "MessagePublished log without transaction_hash; skipping"
-                    );
-                    continue;
-                };
-                let Some(block_height) = log.block_number else {
-                    warn!(
-                        chain_key,
-                        "MessagePublished log without block_number; skipping"
-                    );
-                    continue;
-                };
-                let payload = decoded.data.payload.to_vec();
-                // `emitterAddress` is emitted as `bytes32` (cross-chain consistency); the 20-byte
-                // EVM address sits in the high bytes. Recover the plain `Address` — `messageId`'s
-                // preimage and `deliverMessage` both use `address`.
-                let emitter = alloy::primitives::Address::from_slice(
-                    &decoded.data.emitterAddress.as_slice()[..20],
-                );
-                let indexed = IndexedMessage {
-                    chain_key,
-                    message_id: decoded.data.messageId,
-                    emitter,
-                    outbox,
-                    sequence: decoded.data.sequence,
-                    destination_chain_key,
-                    creditcoin_chain_id,
-                    payload,
-                    tx_hash,
-                    block_height,
-                };
-                debug!(
-                    chain_key,
-                    message_id = %indexed.message_id,
-                    sequence = indexed.sequence,
-                    "📨 Indexed MessagePublished"
-                );
-                // Do not advance the range or hand work to the pool until its recovery record
-                // is durable. An I/O error retries this same range, including earlier records.
-                if let Some(work) = work {
-                    work.record(indexed.clone()).await?;
-                }
-                metrics.inc_messages_indexed(chain_key);
-                // Bounded channel. Indexed messages are NOT re-gossiped (they come from chain
-                // logs and the cursor advances past them), so they must not be dropped: block if
-                // the pool is briefly saturated, but bail promptly on shutdown.
-                tokio::select! {
-                    // Cancel first: on shutdown the pool drops its receiver at the same instant
-                    // the token fires, and without `biased` the closed-channel arm could win and
-                    // turn an orderly exit into an ERROR (the set-update aggregator did exactly
-                    // that on 2026-09-17 and misled the incident report).
-                    biased;
-                    () = cancel.cancelled() => {
-                        debug!(chain_key, "cancel during indexed dispatch; stopping poll");
-                        return Ok(());
-                    }
-                    res = indexed_tx.send(indexed) => {
-                        if res.is_err() {
-                            if cancel.is_cancelled() {
-                                debug!(chain_key, "cancel during indexed dispatch; stopping poll");
-                                return Ok(());
-                            }
-                            error!(chain_key, "vote pool channel closed outside shutdown — exiting watcher");
-                            anyhow::bail!("vote pool channel closed");
-                        }
-                    }
-                }
+        {
+            Ok(logs) => break logs,
+            Err(err) if err.is::<LogRangeTooLarge>() => {
+                to_block = from_block + (to_block - from_block) / 2;
             }
-            Err(err) => {
-                warn!(chain_key, %err, "could not decode MessagePublished log; skipping");
+            Err(err) => return Err(err),
+        }
+    };
+    // Cache only in this bounded range, never across source blocks or registry replacement.
+    let mut discoveries = HashMap::new();
+    let mut memberships = HashMap::new();
+    for log in logs {
+        // Dense valid ranges can take many bounded RPC calls. Keep liveness tied to active
+        // scanning rather than forcing a restart that endlessly replays the same prefix.
+        progress();
+        let block_height = log
+            .block_number
+            .context("MessagePublished has no block number")?;
+        anyhow::ensure!(
+            !log.removed && (from_block..=to_block).contains(&block_height),
+            "MessagePublished is removed or outside the requested range"
+        );
+        let outbox = log.address();
+        if let Some(pinned) = source.outbox_override {
+            anyhow::ensure!(
+                outbox == pinned,
+                "provider returned a log outside the pinned Outbox"
+            );
+        } else {
+            let discovery = match discoveries.get(&block_height) {
+                Some(discovery) => *discovery,
+                None => {
+                    let discovery =
+                        authority::discovery_at(provider, source.chain_key, block_height).await?;
+                    discoveries.insert(block_height, discovery);
+                    discovery
+                }
+            };
+            let Some(discovery) = discovery else { continue };
+            let authorized = match memberships.get(&(block_height, outbox)) {
+                Some(authorized) => *authorized,
+                None => {
+                    let authorized = authority::authorized_at(
+                        provider,
+                        source.chain_key,
+                        discovery,
+                        outbox,
+                        block_height,
+                    )
+                    .await?;
+                    memberships.insert((block_height, outbox), authorized);
+                    authorized
+                }
+            };
+            if !authorized {
+                continue;
+            }
+        }
+        let decoded = IOutbox::MessagePublished::decode_log_validate(&log.inner)
+            .with_context(|| format!("invalid MessagePublished from authorized Outbox {outbox} at block {block_height}"))?;
+        let tx_hash = log
+            .transaction_hash
+            .context("authorized MessagePublished has no transaction hash")?;
+        let indexed = IndexedMessage {
+            chain_key: source.chain_key,
+            message_id: decoded.data.messageId,
+            emitter: Address::from_slice(&decoded.data.emitterAddress.as_slice()[..20]),
+            outbox,
+            sequence: decoded.data.sequence,
+            destination_chain_key: source.destination_chain_key,
+            creditcoin_chain_id: source.creditcoin_chain_id,
+            payload: decoded.data.payload.to_vec(),
+            tx_hash,
+            block_height,
+        };
+        debug!(chain_key = source.chain_key, %outbox, message_id = %indexed.message_id, block_height, "indexed authorized source message");
+        // Preserve unfinished work before sending it or advancing the source scan. Any write
+        // failure returns with the original cursor, so the complete range remains replayable.
+        if let Some(work) = work {
+            work.record(indexed.clone()).await?;
+        }
+        metrics.inc_messages_indexed(source.chain_key);
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(()),
+            sent = indexed_tx.send(indexed) => {
+                if sent.is_err() {
+                    if cancel.is_cancelled() { return Ok(()); }
+                    anyhow::bail!("vote pool channel closed");
+                }
             }
         }
     }
-
     *last_seen = to_block;
     Ok(())
 }
 
-/// Whether a checkpoint's recorded Outbox address (if any) positively contradicts the currently
-/// resolved one. `None` — no address was ever recorded, e.g. a pre-migration checkpoint file — is
-/// deliberately NOT a contradiction: only a recorded address that actually differs counts.
-fn checkpoint_contradicts_resolved_outbox(recorded: Option<&str>, resolved: Address) -> bool {
-    recorded.is_some_and(|recorded| recorded != resolved.to_string())
+#[derive(Debug)]
+struct LogRangeTooLarge;
+impl std::fmt::Display for LogRangeTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("source log range exceeds provider result limit")
+    }
+}
+impl std::error::Error for LogRangeTooLarge {}
+
+/// Shrink multi-block result-limit failures; for one dense block, authenticate candidate logs
+/// from its receipts so unauthorized event spam cannot permanently block discovery.
+async fn fetch_message_logs<P: Provider>(
+    provider: &P,
+    from: u64,
+    to: u64,
+    pinned: Option<Address>,
+    progress: &(dyn Fn() + Sync),
+) -> Result<Vec<Log>> {
+    let mut filter = Filter::new()
+        .event_signature(IOutbox::MessagePublished::SIGNATURE_HASH)
+        .from_block(from)
+        .to_block(to);
+    if let Some(address) = pinned {
+        filter = filter.address(address);
+    }
+    match tokio::time::timeout(RPC_TIMEOUT, provider.get_logs(&filter))
+        .await
+        .context("source log query timed out")?
+    {
+        Ok(logs) => Ok(logs),
+        Err(err) if log_limit_error(&err.to_string()) && from < to => Err(LogRangeTooLarge.into()),
+        Err(err) if log_limit_error(&err.to_string()) => {
+            message_logs_from_receipts(provider, from, pinned, progress).await
+        }
+        Err(err) => Err(err).context("source log query failed"),
+    }
 }
 
-/// Whether discovery can switch to a newly-resolved Outbox address right now without abandoning
-/// an unscanned range on the old one. Safe only once `last_seen` has already reached (or passed)
-/// the new Outbox's creation block — i.e. the old address has nothing left unscanned up to that
-/// point. An unknown creation block (no boundary to wait for) is always safe.
-fn outbox_rotation_is_safe(last_seen: u64, new_current_since_block: Option<u64>) -> bool {
-    match new_current_since_block {
-        Some(since) => last_seen >= since.saturating_sub(1),
-        None => true,
+fn log_limit_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("query returned more than")
+        || message.contains("too many results")
+        || message.contains("too many logs")
+        || message.contains("log response size exceeded")
+}
+
+async fn message_logs_from_receipts<P: Provider>(
+    provider: &P,
+    number: u64,
+    pinned: Option<Address>,
+    progress: &(dyn Fn() + Sync),
+) -> Result<Vec<Log>> {
+    let block = tokio::time::timeout(
+        RPC_TIMEOUT,
+        provider.get_block_by_number(BlockNumberOrTag::Number(number)),
+    )
+    .await
+    .context("receipt fallback block lookup timed out")??
+    .context("receipt fallback block missing")?;
+    anyhow::ensure!(
+        block.header.number == number,
+        "receipt fallback returned wrong block"
+    );
+    let mut logs = Vec::new();
+    for hash in block.transactions.hashes() {
+        let receipt = tokio::time::timeout(RPC_TIMEOUT, provider.get_transaction_receipt(hash))
+            .await
+            .context("receipt fallback lookup timed out")??
+            .context("receipt fallback transaction missing")?;
+        anyhow::ensure!(
+            receipt.transaction_hash == hash
+                && receipt.block_number == Some(number)
+                && receipt.block_hash == Some(block.header.hash),
+            "receipt fallback returned inconsistent provenance"
+        );
+        progress();
+        for log in receipt.inner.logs() {
+            anyhow::ensure!(
+                log.block_number == Some(number)
+                    && log.block_hash == receipt.block_hash
+                    && log.transaction_hash == Some(hash)
+                    && !log.removed,
+                "receipt fallback log has inconsistent provenance"
+            );
+            if log.topic0() == Some(&IOutbox::MessagePublished::SIGNATURE_HASH)
+                && pinned.is_none_or(|address| log.address() == address)
+            {
+                logs.push(log.clone());
+            }
+        }
     }
+    Ok(logs)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn legacy_replay_does_not_trust_old_cursor_or_fixed_lookback() {
-        assert_eq!(legacy_replay_cursor(None, None), 0);
-        assert_eq!(legacy_replay_cursor(Some(100), None), 99);
-        assert_eq!(legacy_replay_cursor(None, Some(50)), 49);
-        assert_eq!(legacy_replay_cursor(Some(100), Some(50)), 99);
-    }
-
-    async fn scan_one_message(
-        work: &crate::work::WorkStore,
-    ) -> (Result<()>, u64, mpsc::Receiver<IndexedMessage>) {
-        use alloy::{
-            primitives::{Bytes, U64},
-            providers::ProviderBuilder,
-            transports::mock::Asserter,
-        };
-        let rpc = Asserter::new();
-        let outbox = Address::repeat_byte(0x11);
-        let event = IOutbox::MessagePublished {
-            messageId: B256::repeat_byte(1),
-            emitterAddress: B256::repeat_byte(2),
-            sequence: 1,
-            canAck: true,
-            payload: Bytes::from(vec![3]),
-        };
-        let log = alloy::rpc::types::Log {
-            inner: alloy::primitives::Log {
-                address: outbox,
-                data: event.encode_log_data(),
-            },
-            block_number: Some(1),
-            transaction_hash: Some(B256::repeat_byte(4)),
-            ..Default::default()
-        };
-        rpc.push_success(&U64::from(5000));
-        rpc.push_success(&vec![log]);
-        let provider = ProviderBuilder::new().connect_mocked_client(rpc);
-        let (tx, rx) = mpsc::channel(8);
-        let mut last_seen = 0;
-        let mut finality = FinalityTracker::new(Instant::now());
-        let result = poll_once(
-            2,
-            outbox,
-            B256::repeat_byte(2),
-            42,
-            &FinalityPolicy::Depth(0),
-            &mut finality,
-            &provider,
-            &mut last_seen,
-            &tx,
-            crate::prom::NoopMetrics::new().as_ref(),
-            Some(work),
-            &CancellationToken::new(),
-        )
-        .await;
-        (result, last_seen, rx)
-    }
-
-    #[tokio::test]
-    async fn crash_before_pool_consumes_event_recovers_work_past_lookback() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("checkpoint.json");
-        let work = crate::work::WorkStore::for_checkpoint(&path);
-        let (result, last_seen, rx) = scan_one_message(&work).await;
-        result.unwrap();
-        assert_eq!(last_seen, MAX_BLOCKS_PER_SCAN);
-        let cp = CheckpointStore::load(&path).unwrap();
-        cp.set_with_work(
-            "outbox:2",
-            last_seen,
-            &Address::repeat_byte(0x11).to_string(),
-        )
-        .unwrap();
-        // Simulate the crash before the pool consumes the channel or runs its periodic tick.
-        drop(rx);
-        drop(work);
-        let restored = crate::work::WorkStore::for_checkpoint(&path)
-            .pending(2, Default::default(), 1)
-            .await
-            .unwrap();
-        assert_eq!(restored.len(), 1);
-        assert_eq!(restored[0].block_height, 1);
-        assert!(
-            CheckpointStore::load(path)
-                .unwrap()
-                .get("outbox:2")
-                .unwrap()
-                .saturating_sub(600)
-                > 1
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_work_write_cannot_advance_scan_or_publish_an_event() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("checkpoint.json");
-        std::fs::write(
-            dir.path().join("checkpoint.json.messages"),
-            "not a directory",
-        )
-        .unwrap();
-        let work = crate::work::WorkStore::for_checkpoint(&path);
-        let (result, last_seen, mut rx) = scan_one_message(&work).await;
-        assert!(result.is_err());
-        assert_eq!(last_seen, 0);
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn no_recorded_outbox_is_not_a_contradiction() {
-        let resolved = Address::from([1u8; 20]);
-        // Pre-migration checkpoint file, or a resolver that never records one — either way,
-        // "unknown" must trust the checkpoint exactly as it did before this tracking existed.
-        assert!(!checkpoint_contradicts_resolved_outbox(None, resolved));
-    }
-
-    #[test]
-    fn matching_recorded_outbox_is_not_a_contradiction() {
-        let resolved = Address::from([1u8; 20]);
-        assert!(!checkpoint_contradicts_resolved_outbox(
-            Some(&resolved.to_string()),
-            resolved
-        ));
-    }
-
-    #[test]
-    fn different_recorded_outbox_is_a_contradiction() {
-        let resolved = Address::from([1u8; 20]);
-        let other = Address::from([2u8; 20]);
-        assert!(checkpoint_contradicts_resolved_outbox(
-            Some(&other.to_string()),
-            resolved
-        ));
-    }
-
-    #[test]
-    fn rotation_deferred_while_old_address_still_has_unscanned_backlog() {
-        // last_seen is far behind the new Outbox's creation block: switching now would abandon
-        // the unscanned range on the old address.
-        assert!(!outbox_rotation_is_safe(100, Some(10_000)));
-    }
-
-    #[test]
-    fn rotation_safe_once_caught_up_to_new_outbox_creation_block() {
-        assert!(outbox_rotation_is_safe(9_999, Some(10_000)));
-        assert!(outbox_rotation_is_safe(10_000, Some(10_000)));
-        assert!(outbox_rotation_is_safe(50_000, Some(10_000)));
-    }
-
-    #[test]
-    fn rotation_safe_when_new_outbox_creation_block_is_unknown() {
-        assert!(outbox_rotation_is_safe(0, None));
-    }
-}
+mod tests;

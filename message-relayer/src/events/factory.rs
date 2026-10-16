@@ -1,27 +1,6 @@
-//! Outbox address resolution.
-//!
-//! One [`OutboxResolver`] implementation — [`DiscoveryResolver`] — used by every route. It reads
-//! the discovery-registry address off the chain-info precompile (see
-//! [`resolve_from_precompile_registry`]) and calls `defaultOutbox` on it. There is no scan
-//! fallback: the factory's permissionless `OutboxCreated` logs and the config-driven
-//! `outbox_registry_address` override are gone — `OutboxDiscovery` (asc-contracts#38) is the only
-//! source of truth the production path trusts.
-//!
-//! The one exception is `outbox_address` (route config / `--outbox-address`), an operator-pinned
-//! override checked before the registry lookup — see [`DiscoveryResolver::override_address`] for
-//! when to use it.
-//!
-//! **Known gap**: [`resolve_from_precompile_registry`] always returns `current_since_block:
-//! None` — `OutboxDiscovery.defaultOutbox` is a bare address with no provenance, and finding the
-//! real answer means locating that Outbox's `OutboxRegistered` event. A restart while down during
-//! a live rotation therefore falls through to `route.start_block` or the chain head and can
-//! permanently miss `MessagePublished` events already emitted on the new Outbox — there is no
-//! reobservation path for a message the relayer never discovered. Deliberately not patched here:
-//! the planned per-Outbox multi-watch work (`activeOutboxes` + `OutboxRegistered`, tracked for
-//! right after this PR) determines each listener's start block from that same event as a core part
-//! of its design, so a narrow stopgap here would likely be replaced within days. See also the
-//! symmetric, equally-deferred gap on creditcoin3's attestor side (`resolver.rs`'s
-//! `ResolvedOutbox`, which dropped the analogous `created_at_block` in the same rescope).
+//! Legacy default-Outbox resolution for settlement. Source publication discovery uses
+//! historical authorization (`events::authority`) across all Outboxes and never calls this
+//! resolver. Keep the explicit operator override for settlement deployments that use it.
 
 use alloy::primitives::{address, Address};
 use alloy::providers::DynProvider;
@@ -43,9 +22,7 @@ pub struct ResolvedOutbox {
     pub current_since_block: Option<u64>,
 }
 
-/// Pluggable strategy for resolving an Outbox address for a given route. Called once at startup
-/// and periodically thereafter (see `events::watch_outbox`), so a rotation is picked up without a
-/// restart — implementations should make a call with nothing new to report cheap.
+/// Pluggable default-Outbox resolver for settlement. Source scans do not use this address.
 #[async_trait]
 pub trait OutboxResolver: Send + Sync + std::fmt::Debug {
     async fn resolve(&self, route: &ChainRoute, provider: &DynProvider) -> Result<ResolvedOutbox>;
@@ -129,10 +106,6 @@ async fn resolve_from_precompile_registry(
     let address =
         default_outbox_from_discovery(chain_key, discovery_result.discoveryAddr, provider).await?;
 
-    // `current_since_block: None` — see this module's "Known gap" doc. `defaultOutbox` returns a
-    // bare address; finding when it actually started serving would mean locating its
-    // `OutboxRegistered` event, which the planned multi-watch work will do as part of its own
-    // design rather than as a stopgap here.
     Ok(Some(ResolvedOutbox {
         address,
         current_since_block: None,

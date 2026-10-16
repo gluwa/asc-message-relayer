@@ -192,6 +192,12 @@ impl CheckpointStore {
 
     /// Commit a source scan only after all its message records have reached stable storage.
     pub fn set_with_work(&self, key: &str, block: u64, outbox: &str) -> Result<()> {
+        self.set_journaled(key, block, Some(outbox))
+    }
+
+    /// Record a source cursor backed by durable unfinished work. An all-Outbox scope carries no
+    /// single address: its key identifies the scope and historical authorization covers emitters.
+    pub fn set_journaled(&self, key: &str, block: u64, outbox: Option<&str>) -> Result<()> {
         let mut guard = self.inner.lock().expect("checkpoint mutex");
         Self::persist_entry(
             &self.path,
@@ -199,7 +205,7 @@ impl CheckpointStore {
             key,
             Entry {
                 block,
-                outbox: Some(outbox.to_string()),
+                outbox: outbox.map(str::to_owned),
                 durable_work: true,
             },
         )
