@@ -217,6 +217,7 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
         "deliverMessage(bytes32,address,address,uint64,bytes,bytes)",
         &IInbox::deliverMessageCall::SELECTOR,
     );
+    inbox.assert_output_tuple("deliverMessage", "bool");
     inbox.assert_mirrored(
         "function",
         "retryPendingMessage(bytes32)",

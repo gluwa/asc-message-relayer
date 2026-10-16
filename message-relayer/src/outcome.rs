@@ -49,8 +49,8 @@ pub enum OutcomeKind {
     /// `abi.encode(address,uint256,uint256,bytes)` envelope), or the envelope exceeds the route's
     /// native-value / gas caps. Fixable only by publishing a new message.
     Undeliverable,
-    /// Any other deterministic, non-retryable failure (validation revert, dispatcher misconfigured,
-    /// under-funded past the top-up window, mined-and-reverted).
+    /// A known non-retryable policy/funding failure, such as under-funding past the top-up window.
+    /// Contract-state reverts (pause, validation, dispatcher configuration) remain retryable.
     Terminal,
 }
 

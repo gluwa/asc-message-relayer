@@ -116,7 +116,9 @@ pub struct ChainRoute {
     /// boundary: the watcher scans up to the finalized head (Creditcoin has deterministic
     /// finality, and that is where the attestors sign) and uses `tip - depth` only when the
     /// `finalized` tag is unavailable or finality has stalled (`events::finality`). The Outbox
-    /// factory scan and the destination-side workers still use it as a plain depth.
+    /// factory scan and destination settlement use it as a plain depth. Destination execution
+    /// remains durable until `processedAt + depth <= head`; zero explicitly permits immediate
+    /// completion on an execution receipt. A nonzero depth guards against destination reorgs.
     pub block_confirmation_depth: u64,
     /// First block to scan on first run when no persisted checkpoint exists.
     pub start_block: Option<u64>,
