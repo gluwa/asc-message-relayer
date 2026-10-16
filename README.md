@@ -123,8 +123,8 @@ and repeated failures escalate in logs and metrics:
 - **Revert classification is node-agnostic** (`src/revert.rs`) — nodes word reverts differently
   (geth: `execution reverted`; Creditcoin's EVM RPC: `VM Exception … revert, data: "0x<selector>"`),
   so classification extracts the raw 4-byte custom-error selector and compares against the shared
-  ABI's `SolError::SELECTOR` constants, with phrase and error-name fallbacks. String-matching
-  decoded names alone *will* misclassify deterministic reverts as transient and loop forever.
+  ABI's `SolError::SELECTOR` constants, with phrase and error-name fallbacks. These selectors
+  distinguish retry outcomes, gas escalation, and cases needing on-chain state reconciliation.
 - **Ack lifecycle** — proofs that are not ready yet (proof-gen 422 or 404) are re-polled at
   `ack.not_ready_poll_secs` (default 20 s) for `ack.not_ready_poll_window_secs` (default 30 min),
   then back off to a capped 10 min cadence. After 24 h, overdue proofs trigger warnings and
