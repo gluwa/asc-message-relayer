@@ -1908,8 +1908,20 @@ async fn reconcile_execution<P: Provider>(
         if !processed_at.is_zero() {
             if route.block_confirmation_depth > 0 {
                 let tip = provider.get_block_number().await?;
-                if processed_at > U256::from(tip.saturating_sub(route.block_confirmation_depth)) {
+                let confirmed = tip.saturating_sub(route.block_confirmation_depth);
+                if processed_at > U256::from(confirmed) {
                     return Ok::<_, anyhow::Error>(ExecutionState::Confirming);
+                }
+                // Latest-state and head reads can straddle a reorg. Require the execution in
+                // the explicit confirmed block state before deleting its durable publication.
+                if inbox
+                    .processedAt(message_id)
+                    .block(BlockId::number(confirmed))
+                    .call()
+                    .await?
+                    .is_zero()
+                {
+                    return Ok(ExecutionState::Confirming);
                 }
             }
             return Ok(ExecutionState::Executed);
@@ -2472,8 +2484,26 @@ mod tests {
             .await,
             DeliveryResultKind::AwaitingVotes
         );
+        // A reorg between latest-state and head reads must not combine unrelated evidence.
+        rpc.push_success(&Bytes::from(U256::from(200).abi_encode()));
+        rpc.push_success(&"0xd4");
+        rpc.push_success(&Bytes::from(U256::ZERO.abi_encode()));
+        assert_eq!(
+            reconcile_execution(
+                &provider,
+                Address::repeat_byte(4),
+                &locks,
+                &route,
+                job.message_id,
+                &outcomes
+            )
+            .await,
+            DeliveryResultKind::AwaitingExecution { retry_after: None }
+        );
+        assert!(outcomes.get(&job.message_id).is_none());
         rpc.push_success(&Bytes::from(U256::from(200).abi_encode()));
         rpc.push_success(&"0xd4"); // head 212: replacement execution reaches the configured depth
+        rpc.push_success(&Bytes::from(U256::from(200).abi_encode()));
         assert_eq!(
             reconcile_execution(
                 &provider,
