@@ -161,6 +161,8 @@ and repeated failures escalate in logs and metrics:
   `start_block` or block 1, even if it already uses the all-Outbox scope key.
   Startup still rewinds marked cursors by `scan_lookback_blocks` (default 600) for idempotent
   rescanning and memory-only settlement recovery. Votes are recovered through reobservation.
+  Initial route recovery counts stored records once with constant memory; subsequent refill scans
+  inspect at most 4,096 directory entries, so a huge backlog can still lengthen startup/recovery.
 - **Bounded memory and supervised execution** — source backlog stays on disk until final delivery.
   Stalled, non-inflight working-set entries rotate back to disk so later publications can progress;
   accepted queued/failed work reconciles on-chain and retries without requiring fresh signatures.
