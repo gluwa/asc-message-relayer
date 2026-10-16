@@ -112,8 +112,10 @@ pub struct ChainRoute {
     /// submits `claimDelivery` for each delivered message. `None` falls back to gas estimation
     /// (fee not claimable).
     pub relayer_contract_address: Option<Address>,
-    /// Reorg guard for destination settlement workers. Source publication discovery always
-    /// requires Creditcoin's finalized head; RPC failure or stalled finality pauses the scan.
+    /// Reorg guard for destination settlement and completion. Execution remains durable until
+    /// `processedAt + depth <= head`; zero explicitly permits completion on an execution receipt.
+    /// Source publication discovery always requires Creditcoin's finalized head and pauses on
+    /// unavailable, regressed or stalled finality instead of falling back to this depth.
     pub block_confirmation_depth: u64,
     /// First source block to scan when no checkpoint exists for the current scan scope. Defaults
     /// to block 1, including migration from legacy single-Outbox checkpoints.

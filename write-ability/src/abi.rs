@@ -146,7 +146,7 @@ sol! {
             uint64 sequence,
             bytes calldata messagePayload,
             bytes calldata votes
-        ) external payable;
+        ) external payable returns (bool);
 
         /// Retry a message previously left in the `MessageQueued`/`MessageDeferred` state (e.g.
         /// dApp ran out of gas during `receiveMessage`, or a dispatcher policy queue). Permissionless.
