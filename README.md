@@ -17,13 +17,13 @@ the message up), but cannot forge.
   └────────────┬────────────┘                             └──────────────│────────────────────┘
                │  eth_getLogs                                            │ deliverMessage(votes)
                ▼                                                         │ (EOAValidator checks
-  attestors (N) ── observe, ECDSA-sign messageHash ──┐                   │  2N/3+1 signatures)
+  attestors (N) ── observe, ECDSA-sign messageId ──┐                   │  2N/3+1 signatures)
                │                                     │                   │
                │        libp2p gossipsub             ▼                   │
                └──────► {chain_key}/message-votes/v1 ──► RELAYER: pool ──┘
                                                           (aggregate to threshold)
 
-  ack path (reverse):  Inbox MessageDelivered ──► RELAYER: fetch native USC proof from proof-gen
+  ack path (reverse):  Inbox MessageExecuted ──► RELAYER: fetch native USC proof from proof-gen
                         ──► AcknowledgmentValidator.submitAcknowledgment on Creditcoin
                         ──► Outbox.acknowledgeMessage  (proof is self-validating)
 ```
@@ -31,55 +31,47 @@ the message up), but cannot forge.
 ## How a message flows (outbound)
 
 1. **Publish** — a dApp on Creditcoin calls `Outbox.publishMessage(canAck, payload)`; the
-   Outbox emits `MessagePublished(messageId, emitter, canAck, payload)`.
-2. **Index** — the relayer's per-route *outbox watcher* polls Creditcoin EVM (`eth_getLogs`,
-   cursor + confirmation depth, 5 000-block chunks) and inserts an `IndexedMessage` into the vote
-   pool. Indexing establishes the **chain-first allowlist**: votes for a `messageHash` the relayer
-   has not seen on-chain are dropped on arrival.
-3. **Vote** — each attestor independently observes the same event (after its own confirmation
-   depth), signs the raw 32-byte `messageHash` with its EVM secp256k1 key (no EIP-191 prefix), and
-   gossips a `MessageVote` on `{chain_key}/message-votes/v1`.
-4. **Aggregate** — the pool validates every vote (decode → `ecrecover` → signer ∈ attestor
-   allowlist → dedup) and counts distinct signers. At threshold — `⌊2N/3⌋+1` — it encodes the
-   votes and dispatches a `DeliveryJob`.
-5. **Deliver** — the per-route *delivery worker* (optionally) simulates
-   `Inbox.deliverMessage(messageId, outbox, emitter, payload, votes)`, then sends it. Since
-   asc-contracts #36 the payload is an envelope `abi.encode(destination, nativeCoinValue,
-   gasLimit, payloadData)` and `deliverMessage` is `payable`: the relayer fronts `nativeCoinValue`
-   as `msg.value` (capped per route by `max_native_coin_value_wei`, default 0) and refuses
-   envelopes whose attested `gasLimit` exceeds `max_gas_limit` (default 5M — the router only
-   rejects zero, and an oversized one can never fit a block). The Inbox's `EOAValidator`
-   re-verifies every signature on-chain and hands the message to the `DispatcherRouter`, which
-   calls the destination with exactly the attested `gasLimit`. Three successful-tx shapes come
-   back in the receipt logs: `MessageDelivered` alone (executed); `MessagePending` (the dispatcher
-   deferred/queued it — stored for permissionless `retryPendingMessage`, which may itself revert
-   `RetryDeferred(retryAfter)`, honoured as the next attempt time); or `MessageExecutionFailed`
-   *with* `MessageDelivered` (the destination call failed and the message is consumed — no retry,
-   but the delivery still counts and is still paid).
-6. **Acknowledge & settle** (optional) — the *ack submitter* watches the destination for
-   `MessageDelivered`/`MessagePending`, fetches a **native USC proof** of that transaction from
-   the proof-gen API, and submits it to `AcknowledgmentValidator` on Creditcoin (verified against
-   the block-prover precompile) for `canAck=true` messages — and, when the route has a
-   `RelayerContract` configured, calls `RelayerContract.claimDelivery` to pay the relay fee to
-   whoever delivered. The claim proof is always built from the *original* `deliverMessage` tx —
-   `MessagePending` is itself a payable, provable outcome, so a message that ever goes pending
-   still settles its fee without waiting on (or requiring) a retry to succeed. Both settlements
-   are permissionless: the proof, not the sender, is what's trusted.
+   Outbox emits `MessagePublished(messageId, emitterAddress, sequence, canAck, payload)`.
+2. **Index** — the per-route source watcher scans finalized Creditcoin logs in bounded ranges,
+   authorizes each emitting Outbox against historical governance state, and persists the full
+   message before advancing its cursor. This establishes the chain-first allowlist: votes for a
+   message ID not indexed from an authorized publication are not counted.
+3. **Vote** — attestors independently authorize the source publication and sign the raw 32-byte
+   `messageId` with their EVM secp256k1 keys, without an EIP-191 prefix. Votes travel over
+   `{chain_key}/message-votes/v1`.
+4. **Aggregate** — the pool validates each vote (decode, recover signer, check current attestor
+   membership, deduplicate). At `⌊2N/3⌋+1` distinct signers, it dispatches a `DeliveryJob`.
+5. **Deliver and recover execution** — the delivery worker sends
+   `Inbox.deliverMessage(messageId, outbox, emitter, sequence, payload, votes)` after preflighting
+   the exact transaction gas limit. Optional early simulation provides an additional check.
+   The payload envelope is `abi.encode(destination, nativeCoinValue, gasLimit, payloadData)`:
+   the relayer fronts `nativeCoinValue` subject to route caps, and the dispatcher forwards the
+   attested execution gas. `MessageReceived` establishes acceptance; `MessageExecuted` confirms
+   execution. `MessageQueued`/`MessageDeferred` and `DestinationFailed` retain durable work for
+   permissionless `retryPendingMessage` or `retryFailedMessage`. Restart reconstructs this state
+   from the Inbox, and confirmed execution is required before removing the durable record.
+6. **Acknowledge and settle** (optional) — the ack worker proves destination `MessageExecuted`
+   logs and submits each proof to the original Outbox's current acknowledgment validator.
+   With a configured `RelayerContract`, it independently proves the original delivery's
+   `MessageReceived`, `MessageQueued`, or `MessageDeferred` outcome to claim relay fees, even
+   while execution needs recovery. A successful retry's execution log can settle the ack but
+   does not replace the original fee-claim proof. Both submissions are permissionless; finalized
+   source acknowledgment and fee state must confirm completion before work leaves the queue.
 
-### The messageHash
+### Message ID and signed digest
 
-Everything keys on one hash, computed identically by the Outbox-side contracts, the attestors,
-this relayer, and the destination Inbox (`computeMessageHash`):
+The Outbox computes the ID, and the Inbox verifies the same original-publication binding:
 
-```
-keccak256(abi.encode(messageId, emitterAddress, destinationChainKey, creditcoinChainId, payload))
+```text
+messageId = keccak256(abi.encode(outbox, emitter, sequence, keccak256(payload), sourceChainId))
 ```
 
-`destinationChainKey` is the route's `u64` chain key left-encoded into `bytes32`. The
-implementation lives in the shared [`write-ability`](write-ability/) crate and is pinned by
-golden-vector tests in **both** this repo and the attestor's (see
-[write-ability/README.md](write-ability/README.md) for the sync contract — read it before
-touching anything on the wire path).
+Here `outbox` and `emitter` are addresses, `sequence` is `uint64`, and `sourceChainId` is the
+Creditcoin EVM chain ID encoded as `uint256`. Attestors sign `messageId` directly; there is no
+second message hash or signing prefix. The destination chain key scopes the route, Outbox,
+validator, and gossip topic rather than adding another field to this digest. Shared wire and
+ABI bindings live in [`write-ability`](write-ability/); both attestor and relayer must agree on
+these formats.
 
 ## Worker inventory
 
@@ -89,44 +81,39 @@ Workers communicate over `mpsc` channels only — the pool owns all aggregation 
 
 | Worker | Source | Purpose |
 |---|---|---|
-| Outbox watcher (per route) | `src/events/` | Resolve the route's Outbox (static or on-chain factory lookup, re-checked periodically), poll `MessagePublished`, feed the pool's allowlist |
+| Outbox watcher (per route) | `src/events/` | Scan finalized `MessagePublished` across historically authorized Outboxes, journal work, feed the pool |
 | Vote pool (one) | `src/pool/` | Validate + aggregate votes, dispatch deliveries, emit reobservation requests, serve `/votes` queries |
 | p2p worker (one swarm) | `src/p2p/` | gossipsub mesh with the attestors: receive votes, publish reobservation requests |
-| Delivery worker (per route) | `src/delivery/` | Simulate + send `deliverMessage`, classify outcomes, bounded retries |
-| Ack submitter (per route, opt-in) | `src/ack/` | `MessageDelivered`/`MessagePending` → proof-gen → `submitAcknowledgment` + `claimDelivery` |
+| Delivery worker (per route) | `src/delivery/` | Preflight delivery/retries, reconcile confirmed execution, retain retryable work |
+| Ack submitter (per route, opt-in) | `src/ack/` | Execution/acceptance logs → proof-gen → original-Outbox acknowledgment + independent fee claim |
 | Claim submitter (per route, opt-in) | `src/claim/` | bridge `Locked` → proof-gen → `CcBridge.claim` on Creditcoin ("relayer on both sides": users only send the lock tx) |
 | Attestor-set watcher (per on-chain route) | `src/attestor_set.rs` | Poll `EOAValidator.attestors()/threshold()` every 30 s, hot-reload the pool |
 | HTTP + metrics | `src/prom/` | `/health`, `/metrics`, `/votes/{message_hash}` |
 
 ## Liveness & failure semantics
 
-The relayer is designed to make **every failure either self-heal or terminate loudly** — never
-retry silently forever:
+Retryable work remains recoverable across outages and restarts. Capped backoff bounds RPC load,
+and repeated failures escalate in logs and metrics:
 
 - **Reobservation** (`{chain_key}/reobservation-requests/v1`) — a message stuck below quorum for
   60 s triggers a gossiped `ReobservationRequest` (rate-limited per message). Attestors re-fetch
-  the named transaction *from their own RPC*, re-verify against their own resolved Outbox, and
+  the named transaction *from their own RPC*, re-verify historical Outbox authorization, and
   re-sign — the request is unauthenticated and cannot make an attestor sign anything it can't
   independently confirm. This recovers votes lost to gossip partitions, attestor restarts, and
   observation-lag spread.
-- **Delivery retries** — RPC-level retries with exponential backoff inside the worker
-  (`delivery.max_retries`), then a bounded pool-level redispatch (5 attempts, 30 s → 5 min
-  backoff). Deterministic reverts are terminal immediately; `"Already validated"` (lost the race
-  to another relayer) is idempotent success.
-- **#36 outcome classification** — `relayer_deliver_tx{status=…}` gains `DestinationFailed`
-  (delivered + consumed, destination call failed; WARN, no retry), `RefusedNativeValue` /
-  `RefusedGasLimit` (envelope over the route caps; terminal before any tx), and
-  `ValidationFailedWithNativeValue` / `InvalidDispatcher` (the #36 hard reverts; ERROR, terminal).
-  A mined-but-reverted delivery is replayed at its block to learn why: `InsufficientGasForDestination`
-  (the destination failed and our tx gas was too low to prove the attested `gasLimit` was
-  forwarded) is resent with 25 % more gas per attempt up to `max_gas_limit`, within
-  `delivery.max_retries`. `retryPendingMessage` honours a `RetryDeferred(retryAfter)` hint
-  (plus a 5 s margin, capped at 6 h) instead of the fixed 15 s / 60 s / 240 s schedule, still
-  within the same three-attempt budget. A mined-and-reverted delivery whose revert shape
-  `classify_delivery_revert` doesn't recognize now gets its own
-  `relayer_deliver_tx{status="Unclassified"}` label, split out of the generic `Reverted` bucket it
-  used to fall into — **behavior change for dashboards/alerts**: anything keyed on
-  `status="Reverted"` will see that count drop correspondingly once this rolls out.
+- **Delivery retries** — RPC retries inside a worker attempt are bounded by
+  `delivery.max_retries`; unresolved work then returns to the supervised pool with capped
+  backoff. Five dispatch failures escalate warnings instead of abandoning the message.
+  Mutable-state reverts (pause, expired quorum, policy or validator changes) remain retryable.
+  `MessageAlreadyValidated` triggers confirmed Inbox-state reconciliation: it can mean executed,
+  queued, or failed, so acceptance alone is not success.
+- **Execution outcomes** — `MessageQueued`/`MessageDeferred` select `retryPendingMessage`, and
+  `DestinationFailed` selects `retryFailedMessage`. These obligations stay in the durable work
+  store until confirmed execution; scheduled retries do not consume a fixed lifetime budget.
+  `RetryDeferred(retryAfter)` controls the next attempt. Permanent envelope/cap failures remain
+  explicit refusal outcomes. Gas escalation stays within the route cap, and every broadcast
+  preflights the final transaction gas limit. `relayer_deliver_tx{status="Unclassified"}` identifies
+  mined reverts whose selector is not recognized; those remain retryable.
 - **Under-funded deliveries** — when the estimate exceeds the funded `gasLimit` the job waits
   for a `topUpGasLimit` (bounded by the delivery deadline / settlement). With
   `auto_request_top_up: true` the route additionally emits
@@ -217,7 +204,9 @@ message-relayer --single-route \
 
 Every flag has a `RELAYER_*` env twin (`--help` lists them); `.env` is loaded via dotenvy.
 Ack flags (`--ack-proof-gen-url`, `--ack-validator-address`, `--ack-signer-key`) must be set
-together or not at all. `--checkpoint-path ""` disables persistence (watchers start at head).
+together or not at all. `--checkpoint-path ""` disables persistence: source discovery replays from
+`start_block` or block 1 and uses memory backpressure; ack discovery starts from `ack.start_block`
+or the current destination head. Production restart recovery requires persistent storage.
 Per-route envelope policy (asc-contracts #36), YAML key = flag = env:
 `max_native_coin_value_wei` / `--max-native-coin-value-wei` / `RELAYER_MAX_NATIVE_COIN_VALUE_WEI`
 (decimal or 0x-hex string, default `0`: front no native value), `max_gas_limit` /
@@ -237,8 +226,8 @@ sensible defaults): `RELAYER_ACK_POLL_SECS` and `RELAYER_CLAIM_POLL_SECS`.
 
 Key metrics: `relayer_messages_indexed`, `relayer_votes_received` (by outcome),
 `relayer_votes_per_message`, `relayer_deliver_tx` (by status: submitted / succeeded /
-already-validated / pending / reverted / unclassified / …, see the #36 outcome classification
-bullet above), `relayer_time_to_threshold_seconds`, `relayer_time_to_deliver_seconds`,
+already-validated / pending / reverted / unclassified / …, see Execution outcomes
+above), `relayer_time_to_threshold_seconds`, `relayer_time_to_deliver_seconds`,
 `relayer_pool_messages_pending`, `relayer_attestor_set_size` / `relayer_attestor_set_reloads`,
 `relayer_p2p_peer_count`, `relayer_ack_submissions` / `relayer_claim_submissions` (by outcome:
 confirmed / terminal / failed — `submitAcknowledgment` and `claimDelivery` respectively; watch
@@ -293,8 +282,7 @@ message-relayer/         the relayer crate
   bin/relayer.rs         CLI entrypoint (clap; --config or --single-route)
   src/lib.rs             Server: worker wiring, channels, supervisor JoinSet
   src/config.rs          YAML schema + validation (see config.example.yaml)
-  src/events/            Outbox watcher + outbox resolver (discovery-registry resolution only;
-                         see events/factory.rs)
+  src/events/            finalized source scans + historical Outbox authorization
   src/pool/              vote aggregation state machine (allowlist, threshold, retries,
                          reobservation triggers, /votes queries, hot set-reload)
   src/p2p/               libp2p swarm: gossipsub topics, envelope codecs, peer metrics

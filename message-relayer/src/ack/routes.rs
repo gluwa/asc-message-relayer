@@ -176,16 +176,38 @@ async fn read_range<P: Provider>(
         Err(_) if from == to => {
             // A single block can itself exceed an RPC's log-count limit. Receipts are not
             // subject to eth_getLogs result caps; never skip that block to make progress.
+            let block = provider
+                .get_block_by_number(BlockNumberOrTag::Number(from))
+                .await
+                .context("support-history fallback block lookup")?
+                .context("support-history fallback block unavailable")?;
+            let expected: Vec<B256> = block.transactions.hashes().collect();
+            if block.header.number != from
+                || block.header.hash == B256::ZERO
+                || expected.is_empty()
+                || expected.iter().copied().collect::<BTreeSet<_>>().len() != expected.len()
+            {
+                bail!("support-history fallback block has invalid transaction coverage");
+            }
             let receipts = provider
                 .get_block_receipts(BlockId::number(from))
                 .await
                 .context("single-block support-history receipt fallback")?
                 .context("support-history block receipts unavailable")?;
+            if receipts.len() != expected.len() {
+                bail!("support-history fallback receipts do not cover every block transaction");
+            }
             let mut logs = Vec::new();
+            let mut seen = BTreeSet::new();
             for receipt in receipts {
+                let expected_hash = receipt
+                    .transaction_index
+                    .and_then(|index| usize::try_from(index).ok())
+                    .and_then(|index| expected.get(index));
                 if receipt.block_number != Some(from)
-                    || receipt.block_hash.is_none()
-                    || receipt.transaction_index.is_none()
+                    || receipt.block_hash != Some(block.header.hash)
+                    || expected_hash != Some(&receipt.transaction_hash)
+                    || !seen.insert(receipt.transaction_hash)
                 {
                     bail!("support-history receipt is missing or mismatches block provenance");
                 }
@@ -713,6 +735,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(rpc.clone());
         let inbox = address(9);
         rpc.push_failure_msg("too many logs in one block");
+        rpc.push_success(&history_block(1, vec![B256::repeat_byte(1)]));
         rpc.push_success(&serde_json::json!([{
             "transactionHash": B256::repeat_byte(1), "transactionIndex": "0x0",
             "blockHash": B256::repeat_byte(2), "blockNumber": "0x1",
@@ -725,6 +748,65 @@ mod tests {
             read_range(&provider, inbox, 1, 1).await.unwrap(),
             BTreeSet::from([address(1)])
         );
+    }
+
+    fn history_block(number: u64, transactions: Vec<B256>) -> alloy::rpc::types::Block {
+        let mut block: alloy::rpc::types::Block = Default::default();
+        block.header.inner.number = number;
+        block.header.hash = B256::repeat_byte(2);
+        block.transactions = alloy::rpc::types::BlockTransactions::Hashes(transactions);
+        block
+    }
+
+    #[tokio::test]
+    async fn incomplete_receipt_fallback_never_advances_history() {
+        let tx = B256::repeat_byte(1);
+        let receipt = serde_json::json!({
+            "transactionHash": tx, "transactionIndex": "0x0",
+            "blockHash": B256::repeat_byte(2), "blockNumber": "0x0",
+            "gasUsed": "0x1", "effectiveGasPrice": "0x1", "cumulativeGasUsed": "0x1",
+            "from": address(1), "to": address(9), "contractAddress": null, "status": "0x1",
+            "type": "0x0", "logsBloom": alloy::primitives::Bloom::ZERO,
+            "logs": [support(address(9), address(1), false, 0)],
+        });
+        let mut wrong_block = receipt.clone();
+        wrong_block["blockHash"] = serde_json::json!(B256::repeat_byte(99));
+        let mut wrong_index = receipt.clone();
+        wrong_index["transactionIndex"] = serde_json::json!("0x2");
+        for receipts in [
+            serde_json::json!([]),
+            serde_json::json!([receipt.clone()]),
+            serde_json::json!([receipt.clone(), receipt.clone()]),
+            serde_json::json!([receipt.clone(), wrong_block]),
+            serde_json::json!([receipt.clone(), wrong_index]),
+        ] {
+            let rpc = Asserter::new();
+            let provider = ProviderBuilder::new().connect_mocked_client(rpc.clone());
+            rpc.push_success(&U64::ZERO);
+            rpc.push_failure_msg("too many logs");
+            rpc.push_success(&history_block(0, vec![tx, B256::repeat_byte(3)]));
+            rpc.push_success(&receipts);
+            let mut history = RouteHistory::load(None, address(9), SOURCE).unwrap();
+            assert!(history.refresh(&provider, 0).await.is_err());
+            assert!(history.state.scanned.is_none());
+            assert!(history.outboxes().is_empty());
+        }
+        let empty = serde_json::to_value(history_block(0, vec![])).unwrap();
+        let mut missing = empty.clone();
+        missing.as_object_mut().unwrap().remove("transactions");
+        let mut malformed = empty.clone();
+        malformed["transactions"] = serde_json::json!(["not-a-hash"]);
+        let duplicate = serde_json::to_value(history_block(0, vec![tx, tx])).unwrap();
+        for block in [empty, missing, malformed, duplicate] {
+            let rpc = Asserter::new();
+            let provider = ProviderBuilder::new().connect_mocked_client(rpc.clone());
+            rpc.push_success(&U64::ZERO);
+            rpc.push_failure_msg("too many logs");
+            rpc.push_success(&block);
+            let mut history = RouteHistory::load(None, address(9), SOURCE).unwrap();
+            assert!(history.refresh(&provider, 0).await.is_err());
+            assert!(history.state.scanned.is_none());
+        }
     }
 
     #[tokio::test]
