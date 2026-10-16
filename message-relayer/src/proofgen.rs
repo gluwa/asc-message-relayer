@@ -17,8 +17,8 @@
 //!   times over six minutes and then served normally; treating each 404 as a transient *error*
 //!   put the ack on the 30 s-doubling backoff and landed it 17 minutes after delivery, about four
 //!   of them pure backoff after the proof had become available. A tx hash that genuinely never
-//!   existed also answers 404 — the caller's bounded fast-poll window, slow backoff and age
-//!   give-up cover that case, so it is not worth classifying differently here.
+//!   existed also answers 404 — the caller's bounded fast-poll window and capped slow backoff
+//!   prevent hot-looping while preserving any outstanding settlement obligation.
 //!
 //! Everything else (5xx, connection errors, an unparseable proof) is an `Err`.
 

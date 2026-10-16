@@ -138,21 +138,20 @@ retry silently forever:
   so classification extracts the raw 4-byte custom-error selector and compares against the shared
   ABI's `SolError::SELECTOR` constants, with phrase and error-name fallbacks. String-matching
   decoded names alone *will* misclassify deterministic reverts as transient and loop forever.
-- **Ack lifecycle** — a proof that is *not ready yet* (proof-gen 422 `BlockNotReady`: destination
-  block not attested; or 404: proof-gen's own chain view has not caught up with the tx) is
-  re-polled on a flat cadence without penalty — `ack.not_ready_poll_secs` (default 20 s) for
-  `ack.not_ready_poll_window_secs` (default 30 min) from first sighting, then the 30 s → 10 min
-  slow backoff, bounded by a 24 h give-up. `relayer_ack_proof_fetches{outcome=Ready|NotReady|Error}`
-  separates that wait from real proof-gen failures (a 404 used to take the error backoff, which
-  turned a six-minute attestation lag into a 17-minute ack on usc-devnet). Transient submit
-  failures back off 30 s → 10 min and escalate loudly after 20 attempts (the unfunded-signer
-  failure mode); reverts bubbling from the
-  Outbox (`MessageCannotBeAcknowledged`, `MessageAlreadyAcknowledged`, …) are terminal. A
-  **canAck pre-check** reads the Outbox state first, so bridge-style `canAck=false` traffic costs
-  a view call instead of a proof fetch + guaranteed-revert estimate — tagged per-message at
-  discovery time against whichever Outbox is currently resolved (next bullet), so it is immune to
-  a later Outbox rotation retroactively changing which contract an already-queued message is
-  checked against.
+- **Ack lifecycle** — proofs that are not ready yet (proof-gen 422 or 404) are re-polled at
+  `ack.not_ready_poll_secs` (default 20 s) for `ack.not_ready_poll_window_secs` (default 30 min),
+  then back off to a capped 10 min cadence. After 24 h, overdue proofs trigger warnings and
+  remain pending. Transient submit failures similarly retain work and escalate after 20 attempts.
+  A full queue applies scan backpressure; the checkpoint stays behind unfinished settlements so
+  restart can recover them. A receipt or revert alone never releases an executed acknowledgment
+  or funded relay fee: source state must confirm settlement at `finalized`.
+- **Settlement across Outbox rotations** — recover every Outbox ever supported by the destination
+  Inbox, including removals, from bounded authorization-log scans back to genesis. Persist this
+  history beside the checkpoint independently of `ack.start_block`. Each message ID is bound to
+  its original source publication before checking `canAck` or selecting that Outbox's current
+  validator. One destination transaction can settle multiple validators independently; an unknown
+  route or failed RPC retains the obligation. The configured acknowledgment validator is only a
+  discovery hint. Fee ledgers remain explicitly configured per route.
 - **All historically authorized Outboxes** — source scans query every `MessagePublished` emitter,
   then read the governance-selected Discovery and `isActiveOutbox(chainKey, emitter)` at that
   message's finalized source block. Default changes, scheduled removal, cancellation,
@@ -226,9 +225,7 @@ Per-route envelope policy (asc-contracts #36), YAML key = flag = env:
 `auto_request_top_up` / `--auto-request-top-up` / `RELAYER_AUTO_REQUEST_TOP_UP` (default `false`;
 needs `relayer_contract_address` and an ack or claim signer). The caps are logged at startup.
 `--verbose` switches `info` → `debug` logging. A few poll cadences are env-only (no CLI flag,
-sensible defaults): `RELAYER_ACK_POLL_SECS`, `RELAYER_CLAIM_POLL_SECS`,
-`RELAYER_OUTBOX_RESOLVE_POLL_SECS` (how often settlement re-checks the discovery registry for
-its default Outbox, default 60 s).
+sensible defaults): `RELAYER_ACK_POLL_SECS` and `RELAYER_CLAIM_POLL_SECS`.
 
 ## HTTP API
 
@@ -328,6 +325,6 @@ Dockerfile               two-stage image build
   Confirm both are in place — precompile deployed, discovery address registered and pointing at
   the `OutboxDiscovery` proxy from asc-contracts#38 — before pointing this relayer at a network.
   `outbox_address` (route config / `--outbox-address`) is an operator-pinned escape hatch for
-  exactly that gap or an incident — see `events/factory.rs`'s module docs — but it bypasses the
+  exactly that gap or an incident — see `events/mod.rs`'s source watcher — but it bypasses the
   registry entirely, so treat it as temporary and logged (WARN) loudly while set, not a substitute
   for registering the chain key properly.

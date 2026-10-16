@@ -27,7 +27,7 @@ pub const TRANSIENT_BACKOFF_MAX: Duration = Duration::from_secs(10 * 60);
 /// a fixed short `poll_interval` for the first `poll_window`, then the same 30 s → 10 min
 /// exponential shape as the transient backoff (derived from the time past the window, so no
 /// attempt counter is needed) so a proof that never appears — a tx hash that does not exist, a
-/// block that is never attested — does not hot-loop until the caller's age give-up.
+/// block that is never attested — does not hot-loop while the caller retains the obligation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NotReadyPolicy {
     /// Re-poll cadence while the tx has been waiting less than `poll_window`. Must be non-zero

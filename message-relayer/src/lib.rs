@@ -61,7 +61,7 @@ pub use config::{
     AttestorSet, AttestorSource, ChainRoute, Config, DeliveryConfig, P2pConfig, VoteCacheConfig,
 };
 pub use delivery::DeliveryJob;
-pub use events::{DiscoveryResolver, IndexedMessage, OutboxResolver};
+pub use events::IndexedMessage;
 pub use p2p::MessageVote;
 pub use pool::{calculate_threshold, RouteAttestors};
 pub use prom::{Metrics, MetricsTrait, NoopMetrics, RelayerMetrics};
@@ -229,28 +229,6 @@ impl Server {
                 cancel.clone(),
             ),
         );
-
-        // Settlement's default resolver is independent from source discovery, which authenticates
-        // every candidate emitter at its publication block. Overrides remain explicit per route.
-        let resolvers: HashMap<u64, Arc<dyn OutboxResolver>> = self
-            .config
-            .routes
-            .iter()
-            .map(|route| {
-                if let Some(address) = route.outbox_address {
-                    tracing::warn!(
-                        chain_key = route.chain_key,
-                        %address,
-                        "⚠️ outbox_address is set for this route — Outbox resolution will bypass \
-                         the OutboxDiscovery registry entirely"
-                    );
-                }
-                let resolver: Arc<dyn OutboxResolver> = Arc::new(DiscoveryResolver {
-                    override_address: route.outbox_address,
-                });
-                (route.chain_key, resolver)
-            })
-            .collect();
 
         // Outbox watchers (per route).
         for route in &self.config.routes {

@@ -97,11 +97,10 @@ pub struct ChainRoute {
     pub destination_rpc_url: String,
     pub inbox_address: Address,
     pub signer_key: Option<String>,
-    /// Operator-pinned Outbox address, honored before the on-chain `OutboxDiscovery` registry
-    /// lookup (`DiscoveryResolver::override_address`). The registry is the default and the only
-    /// source of truth resolution otherwise trusts; set this only for a network where the
-    /// chain-info precompile getter is missing or misconfigured, or to pin an Outbox during an
-    /// incident. Logged loudly (`WARN`) at startup and on every resolve while set.
+    /// Operator-pinned source Outbox, bypassing historical on-chain registry authorization.
+    /// Use only where the chain-info precompile is unavailable or to pin a source during an
+    /// incident. The source watcher warns while this override is active. Settlement still
+    /// resolves each message's original Outbox independently.
     pub outbox_address: Option<Address>,
     /// `RelayerContract(Lite)` on the *source* (Creditcoin) chain — the contract holding the
     /// per-message fee ledger (`getMessageInfo`) and `claimDelivery` since usc-contracts #23 moved

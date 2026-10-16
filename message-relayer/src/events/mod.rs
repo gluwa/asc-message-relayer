@@ -18,7 +18,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 mod authority;
-pub mod factory;
 pub mod finality;
 
 use crate::abi::IOutbox;
@@ -28,9 +27,6 @@ use crate::prom::Metrics;
 use finality::{pick_to_block, read_finalized_head, FinalityPolicy, FinalityTracker};
 use write_ability::protocol::chain_key_to_bytes32;
 
-pub use factory::{DiscoveryResolver, OutboxResolver, ResolvedOutbox};
-/// Settlement's legacy resolver refresh cadence. Source discovery does not poll a default.
-pub const DEFAULT_RESOLVE_POLL_INTERVAL_SECS: u64 = 60;
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 6;
 const MAX_BLOCKS_PER_SCAN: u64 = 2_000;
 /// Bound individual network calls, never draining a bounded channel under backpressure.

@@ -71,7 +71,7 @@ use std::time::{Duration, Instant};
 use alloy::network::{Ethereum, EthereumWallet};
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{PendingTransactionBuilder, Provider};
-use alloy::rpc::types::Filter;
+use alloy::rpc::types::{BlockNumberOrTag, Filter};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::{SolError, SolEvent};
 use anyhow::{anyhow, Context, Result};
@@ -142,18 +142,11 @@ const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
 /// attempt can hold the signer's broadcast slot.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Give up on a tx whose proof never becomes ready (e.g. its block is never attested, or the tx
-/// hash proof-gen keeps answering 404 for does not exist). Generous: far beyond any healthy
-/// finality + attestation latency. The re-poll cadence *before* this point is the route's
-/// [`crate::pending::NotReadyPolicy`] (`ack.not_ready_poll_secs` /
-/// `ack.not_ready_poll_window_secs`): flat and short while the proof is expected to appear on its
-/// own, slow backoff once it is overdue. Not ready never counts against the transient-failure
-/// budget.
-const MAX_ACK_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Escalate prolonged proof unavailability without abandoning settlement or releasing the
+/// checkpoint holdback. The not-ready policy caps retries after its fast-poll window.
+const ACK_OVERDUE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Give up loudly after this many *transient* submit failures (RPC down, timeout, nonce) — a
-/// permanently failing submit (e.g. unfunded ack signer) must not hammer the RPC forever. The
-/// per-attempt exponential backoff lives in [`crate::pending`].
+/// Escalate the log after this many transient submit failures. Retries continue at capped backoff.
 const MAX_ACK_TRANSIENT_ATTEMPTS: u32 = 20;
 
 /// Spawn the acknowledgment submitter for one route. Returns immediately when the route has no
@@ -572,7 +565,7 @@ fn decode_delivery_log(
 /// Try to fetch a proof and submit an acknowledgment for every pending destination tx that is due
 /// for an attempt. Successful (or terminally-reverting) submissions move to `done`; not-yet-ready
 /// proofs are re-polled per the route's [`crate::pending::NotReadyPolicy`] (flat cadence inside
-/// the window, slow backoff past it, `MAX_ACK_AGE` give-up); transient failures back off
+/// the window, capped slow backoff past it); transient failures back off
 /// exponentially and escalate the log after [`MAX_ACK_TRANSIENT_ATTEMPTS`].
 #[allow(clippy::too_many_arguments)]
 async fn process_pending<P: Provider>(
@@ -637,23 +630,20 @@ async fn process_pending<P: Provider>(
                 done.insert(tx_hash);
             }
             Ok(AckOutcome::NotReady(reason)) => {
-                // Normal early state (destination finality + attestation take minutes) — re-poll
-                // without burning the transient budget, but don't wait forever on a block that
-                // never attests. INFO, not WARN: nothing is wrong yet, and the operator reading
-                // the latency of an ack needs to see how long it has been waiting and on what.
+                // A delayed proof remains an obligation even after a prolonged outage. Keeping
+                // the pending entry also holds the durable cursor behind its discovery block.
                 let waited = pending.age(&tx_hash, now).unwrap_or_default();
-                if waited > MAX_ACK_AGE {
+                let retry_in = not_ready_policy.next_delay(waited);
+                if waited > ACK_OVERDUE_AFTER {
                     warn!(
                         chain_key,
                         %tx_hash,
                         %reason,
-                        "proof never became ready within {MAX_ACK_AGE:?}; giving up on this ack"
+                        waited_secs = waited.as_secs(),
+                        retry_in_secs = retry_in.as_secs(),
+                        "proof is overdue; retaining settlement and retrying at capped backoff"
                     );
-                    pending.remove(&tx_hash);
-                    done.insert(tx_hash);
                 } else {
-                    let retry_in = not_ready_policy.next_delay(waited);
-                    let past_window = waited >= not_ready_policy.poll_window;
                     info!(
                         chain_key,
                         %tx_hash,
@@ -661,12 +651,12 @@ async fn process_pending<P: Provider>(
                         %reason,
                         waited_secs = waited.as_secs(),
                         retry_in_secs = retry_in.as_secs(),
-                        past_poll_window = past_window,
+                        past_poll_window = waited >= not_ready_policy.poll_window,
                         "⏳ proof not ready yet (destination block not attested / proof-gen catching \
                          up); polling"
                     );
-                    pending.defer(&tx_hash, now + retry_in);
                 }
+                pending.defer(&tx_hash, now + retry_in);
             }
             Err(err) => {
                 let attempts = pending.record_transient_failure(&tx_hash, now);
@@ -750,7 +740,8 @@ enum SubmitOutcome {
 
 /// Await a broadcast result and classify it, shared by both submit paths so the receipt-wait, revert
 /// classification, and gas accounting cannot drift between ack and claim. `Err` is a transient
-/// failure the caller should retry; `Ok(Terminal)` is permanent. `call` names the call for logs.
+/// failure the caller should retry; `Ok(Terminal)` still requires a finalized source-state check.
+/// `call` names the call for logs.
 async fn classify_submit(
     pending_tx: Result<PendingTransactionBuilder<Ethereum>, alloy::contract::Error>,
     call: &str,
@@ -798,6 +789,7 @@ async fn relay_claimable_ids<P: Provider>(
     for id in ids {
         let info = ledger
             .getMessageInfo(*id)
+            .block(BlockNumberOrTag::Finalized.into())
             .call()
             .await
             .context("IRelayerContract.getMessageInfo call failed")?;
@@ -902,8 +894,8 @@ async fn acknowledge_tx<P: Provider>(
             // attestation latency, not a fault, and must not look like the outage shape below.
             metrics.inc_ack_proof_fetch(chain_key, ProofFetchOutcome::NotReady);
             if let Some(err) = failure {
-                // Incomplete routing is not subject to the proof-readiness age cutoff. Preserve
-                // every unknown executed obligation while history or source RPCs recover.
+                // Preserve the routing error while history or source RPCs recover, even when
+                // proof-gen also needs more time.
                 return Err(err.context(format!("delivery proof also not ready: {reason}")));
             }
             return Ok(AckOutcome::NotReady(reason));
@@ -1132,11 +1124,8 @@ fn ack_revert_name(sel: [u8; 4]) -> Option<&'static str> {
     })
 }
 
-/// Classify a submit error as a permanent on-chain revert (vs. a transient RPC failure). A contract
-/// revert observed at send / gas-estimation time is deterministic, so it must be terminal — otherwise
-/// the tx is retried forever (e.g. every bridge Release delivery, which reverts
-/// `MessageCannotBeAcknowledged`). Matches revert phrasing across node dialects (see [`crate::revert`])
-/// plus decoded error names as a fallback.
+/// Recognize on-chain reverts for submission diagnostics. Even a deterministic revert needs a
+/// finalized source-state check before the settlement can be removed from the queue.
 fn is_terminal_revert(err: &impl std::fmt::Display) -> bool {
     let s = err.to_string();
     // NativeTransferFailed is the one revert that is NOT deterministic for a given message: it
@@ -1151,11 +1140,8 @@ fn is_terminal_revert(err: &impl std::fmt::Display) -> bool {
     {
         return false;
     }
-    // Any other revert observed at send/estimation time is deterministic for the proof + message
-    // state at hand, so it must be terminal — otherwise e.g. every bridge Release delivery
-    // (MessageCannotBeAcknowledged) retries forever. A mined-but-reverted settlement is terminal for
-    // the same reason: the state that made it revert (already settled / already acked) does not
-    // un-happen, and the pre-checks drop that id on the next pass anyway.
+    // Reverts can reflect already-settled work or temporary contract state (pause/verifier
+    // changes). The caller checks the actual obligation after processing all independent groups.
     if crate::revert::is_revert(&s) {
         return true;
     }
@@ -1174,7 +1160,7 @@ fn is_terminal_revert(err: &impl std::fmt::Display) -> bool {
 }
 
 /// Prefix a terminal revert with the decoded error name when the selector is recognized, so the
-/// `ack skipped (terminal)` log tells the operator *why* without a manual selector lookup.
+/// submission diagnostic tells the operator why without a manual selector lookup.
 fn describe_revert(err: &impl std::fmt::Display) -> String {
     let s = err.to_string();
     match crate::revert::revert_selector(&s).and_then(ack_revert_name) {
@@ -1331,6 +1317,154 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (ProofGenClient::new(&url).unwrap(), task)
+    }
+
+    #[tokio::test]
+    async fn overdue_proof_remains_pending_and_holds_restart_checkpoint() {
+        let rpc = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(rpc.clone());
+        let outbox = Address::repeat_byte(1);
+        let validator = Address::repeat_byte(2);
+        let message = crate::abi::OutboxMessage {
+            emitter: Address::repeat_byte(3),
+            sequence: 4,
+            timestamp: 5,
+            canAck: true,
+            acknowledged: false,
+            payloadHash: B256::repeat_byte(6),
+        };
+        let id = alloy::primitives::keccak256(
+            (
+                outbox,
+                message.emitter,
+                message.sequence,
+                message.payloadHash,
+                U256::from(42),
+            )
+                .abi_encode_params(),
+        );
+        rpc.push_success(&Bytes::from(message.abi_encode()));
+        rpc.push_success(&Bytes::from(validator.abi_encode()));
+        rpc.push_success(&Bytes::from(outbox.abi_encode()));
+        rpc.push_success(&Bytes::from(2u64.abi_encode()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(|| async { axum::http::StatusCode::NOT_FOUND });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let ack = AckConfig {
+            proof_gen_url: url.clone(),
+            validator_address: validator,
+            signer_key: String::new(),
+            confirmation_depth: 0,
+            start_block: None,
+            not_ready_poll_secs: 6,
+            not_ready_poll_window_secs: 600,
+        };
+        let tx = B256::repeat_byte(9);
+        let mut pending = PendingTxs::new(1);
+        let mut done = BoundedSeen::new(10);
+        pending.insert(
+            tx,
+            Instant::now() - ACK_OVERDUE_AFTER - Duration::from_secs(1),
+            12,
+            vec![DeliveryEvent {
+                message_id: id,
+                executed: true,
+            }],
+        );
+        process_pending(
+            2,
+            &ack,
+            &SettlementMode::Ack,
+            42,
+            &BTreeSet::from([outbox]),
+            &ProofGenClient::new(&url).unwrap(),
+            &provider,
+            Address::repeat_byte(8),
+            &crate::broadcast::BroadcastLocks::new(),
+            &(crate::prom::NoopMetrics::new() as Metrics),
+            &mut pending,
+            &mut done,
+        )
+        .await;
+        server.abort();
+        assert!(
+            pending.contains(&tx),
+            "old proof unavailability must not abandon custody"
+        );
+        assert!(!done.contains(&tx));
+        assert_eq!(pending.oldest_pending_block(), Some(12));
+        assert!(pending.ready(1, Instant::now()).is_empty());
+        assert_eq!(
+            pending
+                .ready(1, Instant::now() + crate::pending::TRANSIENT_BACKOFF_MAX)
+                .len(),
+            1
+        );
+        assert!(rpc.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn settlement_completion_reads_finalized_source_state() {
+        let outbox = Address::repeat_byte(1);
+        let message = crate::abi::OutboxMessage {
+            emitter: Address::repeat_byte(3),
+            sequence: 4,
+            timestamp: 5,
+            canAck: true,
+            acknowledged: true,
+            payloadHash: B256::repeat_byte(6),
+        };
+        let id = alloy::primitives::keccak256(
+            (
+                outbox,
+                message.emitter,
+                message.sequence,
+                message.payloadHash,
+                U256::from(42),
+            )
+                .abi_encode_params(),
+        );
+        let info = crate::abi::IRelayerContract::MessageInfo {
+            payer: Address::repeat_byte(1),
+            destinationChain: 2,
+            gasLimit: U256::from(100_000),
+            relayFee: U256::from(1),
+            tip: U256::ZERO,
+            tipExpiry: U256::ZERO,
+            deliveryDeadline: U256::ZERO,
+            relaySettled: true,
+            feesInNative: false,
+        };
+        let responses = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+            Bytes::from(message.abi_encode()),
+            Bytes::from(info.abi_encode()),
+        ])));
+        let received = responses.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(move |axum::Json(request): axum::Json<serde_json::Value>| {
+            let received = received.clone();
+            async move {
+                assert_eq!(request["method"], "eth_call");
+                assert_eq!(request["params"][1], "finalized");
+                let result = received.lock().unwrap().pop_front().unwrap();
+                axum::Json(serde_json::json!({ "jsonrpc": "2.0", "id": request["id"], "result": result }))
+            }
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = ProviderBuilder::new().connect_http(url.parse().unwrap());
+        let resolved = routes::validators(&provider, 42, 2, &BTreeSet::from([outbox]), &[id]).await;
+        assert!(resolved.failure.is_none());
+        assert!(resolved.authorities.is_empty());
+        assert!(
+            relay_claimable_ids(&provider, Address::repeat_byte(2), &[id])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        server.abort();
+        assert!(responses.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

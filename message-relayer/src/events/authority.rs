@@ -7,9 +7,17 @@ use alloy::rpc::types::BlockNumberOrTag;
 use alloy::sol_types::SolCall;
 use anyhow::{Context, Result};
 
-use super::factory::IChainInfo;
 use super::RPC_TIMEOUT;
 use crate::abi::IOutboxDiscovery;
+
+alloy::sol! {
+    /// Governance-selected Outbox discovery registry from the chain-info precompile.
+    #[sol(rpc)]
+    contract IChainInfo {
+        function get_outbox_discovery_address(uint64 chainKey)
+            external view returns (address discoveryAddr, bool exists);
+    }
+}
 
 const CHAIN_INFO_PRECOMPILE: Address =
     alloy::primitives::address!("0000000000000000000000000000000000000fd3");

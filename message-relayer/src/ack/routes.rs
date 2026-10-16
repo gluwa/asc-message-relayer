@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use alloy::primitives::{keccak256, Address, B256, U256};
 use alloy::providers::Provider;
-use alloy::rpc::types::{BlockId, Filter};
+use alloy::rpc::types::{BlockId, BlockNumberOrTag, Filter};
 use alloy::sol_types::{SolError, SolEvent, SolValue};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -332,7 +332,13 @@ async fn validator_for<P: Provider>(
     let mut failure = None;
     for address in candidates {
         let outbox = IOutbox::new(*address, provider);
-        let message = match outbox.getMessage(*id).call().await {
+        // Completion must survive a source reorg before the pending cursor is released.
+        let message = match outbox
+            .getMessage(*id)
+            .block(BlockNumberOrTag::Finalized.into())
+            .call()
+            .await
+        {
             Ok(message) => message,
             Err(err)
                 if crate::revert::revert_selector(&err.to_string())
