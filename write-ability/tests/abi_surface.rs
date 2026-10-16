@@ -228,6 +228,7 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
         "deliverMessage(bytes32,address,address,uint64,bytes,bytes)",
         &IInbox::deliverMessageCall::SELECTOR,
     );
+    inbox.assert_output_tuple("deliverMessage", "bool");
     inbox.assert_mirrored(
         "function",
         "retryPendingMessage(bytes32)",
@@ -243,6 +244,11 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
         "function",
         "isPending(bytes32)",
         &IInbox::isPendingCall::SELECTOR,
+    );
+    inbox.assert_mirrored(
+        "function",
+        "processedAt(bytes32)",
+        &IInbox::processedAtCall::SELECTOR,
     );
     // #54: new view guarding retryFailedMessage against a guaranteed-revert call.
     inbox.assert_mirrored(

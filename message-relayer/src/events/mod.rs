@@ -55,7 +55,7 @@ const MAX_BLOCKS_PER_SCAN: u64 = 2_000;
 /// A finalized message that the relayer has discovered on the Creditcoin Outbox. The vote pool
 /// keys on `message_id` (also the digest attestors sign directly since asc-contracts #54); the
 /// rest of the fields are needed to recompute the calldata for `Inbox.deliverMessage`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct IndexedMessage {
     pub chain_key: u64,
     pub message_id: B256,
@@ -90,7 +90,7 @@ pub async fn watch_outbox(
     checkpoint: Option<Arc<CheckpointStore>>,
     scan_lookback_blocks: u64,
     health: Arc<crate::health::Health>,
-    holdback: Arc<crate::checkpoint::CursorHoldback>,
+    work: Option<Arc<crate::work::WorkStore>>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let chain_key = route.chain_key;
@@ -158,11 +158,8 @@ pub async fn watch_outbox(
 
     // Resume from the persisted cursor (so events emitted while we were down are not skipped),
     // falling back to the current head on first run / when persistence is disabled.
-    // The cursor is rewound by `scan_lookback_blocks`: pool votes are memory-only, so a message
-    // indexed-but-undelivered before a crash would otherwise be skipped forever (the cursor is
-    // past it and stray votes are dropped by the chain-first allowlist). Re-indexing the recent
-    // window is idempotent — already-delivered messages re-collect votes via reobservation and
-    // resolve as "Already validated" at simulate.
+    // Unfinished messages are restored independently from the work store. The lookback is an
+    // idempotent rescan, not a bound on how long delivery may remain unfinished.
     // A checkpoint recorded against a different, known Outbox address is not a valid resume point
     // for the one just resolved — see `checkpoint_contradicts_resolved_outbox` for why "unknown"
     // must not be treated the same as "different".
@@ -172,8 +169,24 @@ pub async fn watch_outbox(
         .and_then(|c| c.get_outbox(&checkpoint_key));
     let checkpoint_is_stale =
         checkpoint_contradicts_resolved_outbox(checkpoint_outbox.as_deref(), resolved.address);
+    let durable_checkpoint = checkpoint
+        .as_ref()
+        .is_some_and(|c| c.has_durable_work(&checkpoint_key));
+    if let Some(work) = &work {
+        work.prepare_route(chain_key, durable_checkpoint).await?;
+    }
 
-    let mut last_seen = if let (Some(block), false) = (checkpoint_block, checkpoint_is_stale) {
+    let mut last_seen = if checkpoint_block.is_some() && work.is_some() && !durable_checkpoint {
+        // Old holdback checkpoints could advance over unfinished work even before the lookback
+        // window. Only a complete rescan can recover it; never bless that cursor as journaled.
+        let resume = legacy_replay_cursor(route.start_block, resolved.current_since_block);
+        warn!(
+            chain_key,
+            resume_from = resume + 1,
+            "upgrading legacy Outbox checkpoint: replaying source history into durable work store"
+        );
+        resume
+    } else if let (Some(block), false) = (checkpoint_block, checkpoint_is_stale) {
         let resume = block.saturating_sub(scan_lookback_blocks);
         info!(
             chain_key,
@@ -306,6 +319,7 @@ pub async fn watch_outbox(
                             &mut last_seen,
                             &indexed_tx,
                             metrics.as_ref(),
+                            work.as_deref(),
                             &cancel,
                         ).await
                     }
@@ -319,17 +333,14 @@ pub async fn watch_outbox(
                         source_rpc.note_ok();
                         health.heartbeat(&health_key);
                         if let Some(cp) = &checkpoint {
-                            // Clamp the *persisted* cursor to before the pool's oldest undelivered
-                            // message (fed on its prune tick), so a restart re-indexes every
-                            // unfinished message no matter how long it has been stalled. The
-                            // in-memory cursor keeps advancing; re-indexing is idempotent
-                            // (duplicate slots kept, delivery resolves AlreadyValidated).
-                            // Recording the Outbox address (not just a plain `set`) is what lets
-                            // the resume logic above tell a valid checkpoint from a stale one.
-                            let persist = holdback.clamp(chain_key, last_seen);
-                            if let Err(err) =
-                                cp.set_with_outbox(&checkpoint_key, persist, &outbox.to_string())
-                            {
+                            // Every discovered message is durable before poll_once advances this
+                            // cursor. Recovery no longer depends on a periodically published floor.
+                            let saved = if work.is_some() {
+                                cp.set_with_work(&checkpoint_key, last_seen, &outbox.to_string())
+                            } else {
+                                cp.set_with_outbox(&checkpoint_key, last_seen, &outbox.to_string())
+                            };
+                            if let Err(err) = saved {
                                 metrics.inc_checkpoint_write_failure(chain_key);
                                 warn!(chain_key, %err, "failed to persist Outbox checkpoint");
                             }
@@ -346,6 +357,12 @@ pub async fn watch_outbox(
     }
 }
 
+/// A legacy cursor contains no reliable unfinished-work inventory. An explicit operator floor
+/// or the Outbox's creation block is safe; with neither, replay from the first scannable block.
+fn legacy_replay_cursor(start_block: Option<u64>, since_block: Option<u64>) -> u64 {
+    start_block.or(since_block).unwrap_or(0).saturating_sub(1)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn poll_once<P: Provider>(
     chain_key: u64,
@@ -358,6 +375,7 @@ async fn poll_once<P: Provider>(
     last_seen: &mut u64,
     indexed_tx: &mpsc::Sender<IndexedMessage>,
     metrics: &dyn crate::prom::MetricsTrait,
+    work: Option<&crate::work::WorkStore>,
     cancel: &CancellationToken,
 ) -> Result<()> {
     let tip = provider.get_block_number().await?;
@@ -446,6 +464,11 @@ async fn poll_once<P: Provider>(
                     sequence = indexed.sequence,
                     "📨 Indexed MessagePublished"
                 );
+                // Do not advance the range or hand work to the pool until its recovery record
+                // is durable. An I/O error retries this same range, including earlier records.
+                if let Some(work) = work {
+                    work.record(indexed.clone()).await?;
+                }
                 metrics.inc_messages_indexed(chain_key);
                 // Bounded channel. Indexed messages are NOT re-gossiped (they come from chain
                 // logs and the cursor advances past them), so they must not be dropped: block if
@@ -503,6 +526,114 @@ fn outbox_rotation_is_safe(last_seen: u64, new_current_since_block: Option<u64>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_replay_does_not_trust_old_cursor_or_fixed_lookback() {
+        assert_eq!(legacy_replay_cursor(None, None), 0);
+        assert_eq!(legacy_replay_cursor(Some(100), None), 99);
+        assert_eq!(legacy_replay_cursor(None, Some(50)), 49);
+        assert_eq!(legacy_replay_cursor(Some(100), Some(50)), 99);
+    }
+
+    async fn scan_one_message(
+        work: &crate::work::WorkStore,
+    ) -> (Result<()>, u64, mpsc::Receiver<IndexedMessage>) {
+        use alloy::{
+            primitives::{Bytes, U64},
+            providers::ProviderBuilder,
+            transports::mock::Asserter,
+        };
+        let rpc = Asserter::new();
+        let outbox = Address::repeat_byte(0x11);
+        let event = IOutbox::MessagePublished {
+            messageId: B256::repeat_byte(1),
+            emitterAddress: B256::repeat_byte(2),
+            sequence: 1,
+            canAck: true,
+            payload: Bytes::from(vec![3]),
+        };
+        let log = alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: outbox,
+                data: event.encode_log_data(),
+            },
+            block_number: Some(1),
+            transaction_hash: Some(B256::repeat_byte(4)),
+            ..Default::default()
+        };
+        rpc.push_success(&U64::from(5000));
+        rpc.push_success(&vec![log]);
+        let provider = ProviderBuilder::new().connect_mocked_client(rpc);
+        let (tx, rx) = mpsc::channel(8);
+        let mut last_seen = 0;
+        let mut finality = FinalityTracker::new(Instant::now());
+        let result = poll_once(
+            2,
+            outbox,
+            B256::repeat_byte(2),
+            42,
+            &FinalityPolicy::Depth(0),
+            &mut finality,
+            &provider,
+            &mut last_seen,
+            &tx,
+            crate::prom::NoopMetrics::new().as_ref(),
+            Some(work),
+            &CancellationToken::new(),
+        )
+        .await;
+        (result, last_seen, rx)
+    }
+
+    #[tokio::test]
+    async fn crash_before_pool_consumes_event_recovers_work_past_lookback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint.json");
+        let work = crate::work::WorkStore::for_checkpoint(&path);
+        let (result, last_seen, rx) = scan_one_message(&work).await;
+        result.unwrap();
+        assert_eq!(last_seen, MAX_BLOCKS_PER_SCAN);
+        let cp = CheckpointStore::load(&path).unwrap();
+        cp.set_with_work(
+            "outbox:2",
+            last_seen,
+            &Address::repeat_byte(0x11).to_string(),
+        )
+        .unwrap();
+        // Simulate the crash before the pool consumes the channel or runs its periodic tick.
+        drop(rx);
+        drop(work);
+        let restored = crate::work::WorkStore::for_checkpoint(&path)
+            .pending(2, Default::default(), 1)
+            .await
+            .unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].block_height, 1);
+        assert!(
+            CheckpointStore::load(path)
+                .unwrap()
+                .get("outbox:2")
+                .unwrap()
+                .saturating_sub(600)
+                > 1
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_work_write_cannot_advance_scan_or_publish_an_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint.json");
+        std::fs::write(
+            dir.path().join("checkpoint.json.messages"),
+            "not a directory",
+        )
+        .unwrap();
+        let work = crate::work::WorkStore::for_checkpoint(&path);
+        let (result, last_seen, mut rx) = scan_one_message(&work).await;
+        assert!(result.is_err());
+        assert_eq!(last_seen, 0);
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn no_recorded_outbox_is_not_a_contradiction() {

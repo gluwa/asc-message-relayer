@@ -153,7 +153,7 @@ sol! {
             uint64 sequence,
             bytes calldata messagePayload,
             bytes calldata votes
-        ) external payable;
+        ) external payable returns (bool);
 
         /// Retry a message previously left in the `MessageQueued`/`MessageDeferred` state (e.g.
         /// dApp ran out of gas during `receiveMessage`, or a dispatcher policy queue). Permissionless.
@@ -171,6 +171,9 @@ sol! {
         /// Whether `messageId` was validated but its `receiveMessage` callback failed, leaving it
         /// retryable via `retryPendingMessage`. Mirrors `SimpleInbox.isPending`.
         function isPending(bytes32 messageId) external view returns (bool);
+
+        /// Nonzero only after the destination executed successfully.
+        function processedAt(bytes32 messageId) external view returns (uint256);
 
         /// asc-contracts #54: whether `messageId` failed at the destination and awaits
         /// `retryFailedMessage`. Checked before spawning a retry attempt so a guaranteed-revert

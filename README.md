@@ -159,19 +159,28 @@ retry silently forever:
   factory log scan. Re-checked periodically, so a registry-level rotation (`setDefaultOutbox`) is
   picked up without a restart. New discovery moves to the new address; already-indexed/pending
   work is unaffected. A chain key with no discovery address registered fails closed.
-- **Checkpoints + startup lookback** — block cursors persist to `--checkpoint-path` so restarts
-  never skip events. Because votes and pending acks are memory-only, cursors are rewound by
-  `scan_lookback_blocks` (default 600) on startup: in-flight work is re-discovered, and
+- **Durable source work + checkpoints** — each source message is fsynced into
+  `<checkpoint-path>.messages` before the scan cursor advances. The vote cache loads a bounded
+  working set; unfinished overflow remains on disk and is restored after restart, regardless of
+  its age. Keep the checkpoint file and sibling directory together on persistent storage and in
+  backups. Disk errors stop scan progress; missing or corrupt durable work fails closed.
+  The first upgrade from an older checkpoint replays from `start_block` (or the Outbox's known
+  creation block, otherwise block 1), because old cursors could advance past unfinished work.
+  Cursors still rewind by `scan_lookback_blocks` (default 600) on startup for idempotent rescanning
+  and memory-only pending acknowledgments. Votes are recovered through reobservation, and
   already-finished work resolves idempotently (delivered → `Already validated` at simulate,
   acked → skipped by the pre-check). The Outbox watcher's checkpoint additionally records which
   Outbox address it was scanned against, so a restart can tell a valid long-running cursor apart
   from one left over from a since-rotated-away Outbox. Outbox resolution itself persists nothing —
   a registry read is complete and authoritative on every call, so there is no scan cursor to
   resume.
-- **Bounded everything** — vote cache (TTL + LRU cap), pending-ack queue (cap 10 000, oldest
+- **Bounded memory** — vote cache (resolved-entry pruning + admission cap), pending-ack queue (cap 10 000, oldest
   evicted), per-tick ack batch (256) and concurrency (8), 5 000-block `eth_getLogs` chunks (an
   over-large resume range would error on every tick forever on range-capped RPCs), 120 s receipt
   timeouts (one stuck underpriced tx cannot wedge a route's serial worker).
+  Source backlog is retained on disk until final delivery. A full working set waits for a slot
+  to finish before loading more messages for that route. With persistence disabled, ingestion
+  uses channel backpressure instead; unfinished messages are never evicted to admit new ones.
 
 ## Trust & key model
 
