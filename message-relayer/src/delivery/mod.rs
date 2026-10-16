@@ -1467,6 +1467,24 @@ async fn handle_job<P: Provider + Clone + 'static>(
         if let Some(gas) = gas_limit {
             tx = tx.gas(gas);
         }
+        // A pinned gas limit bypasses the wallet's estimate. Check that exact limit before
+        // spending it, including every bump and every later pool retry. Otherwise reaching the
+        // cap once would repeatedly restart the same sequence of paid, reverting transactions.
+        // Keep failed work retryable: a dispatcher/configuration change can make it executable.
+        let preflight = if gas_limit.is_some() {
+            match tokio::time::timeout(
+                FUNDED_GAS_READ_TIMEOUT,
+                tx.clone().from(signer_address).call(),
+            )
+            .await
+            {
+                Ok(Ok(_)) => None,
+                Ok(Err(err)) => Some(Err(err)),
+                Err(_) => break SendOutcome::Failed("pinned-gas preflight timed out".into()),
+            }
+        } else {
+            None
+        };
         // `send()` is several RPC round trips (gas, fee, nonce, `eth_sendRawTransaction`) and alloy's
         // HTTP transport sets no timeout, so on a black-holed endpoint this await never returns and
         // parks the route — the same hazard FUNDED_GAS_READ_TIMEOUT and RECEIPT_TIMEOUT guard.
@@ -1476,25 +1494,29 @@ async fn handle_job<P: Provider + Clone + 'static>(
         // `retryPendingMessage` tasks and the set-update submitter. The guard covers only the
         // broadcast; the receipt is awaited below, outside it, or a single confirmation would block
         // every other sender on the key. Either stall is retryable and consumes no nonce.
-        let pending = match broadcast_locks
-            .broadcast(signer_address, SEND_TIMEOUT, tx.send())
-            .await
-        {
-            Ok(res) => res,
-            Err(stalled) => {
-                if attempts <= delivery_config.max_retries {
-                    warn!(
-                        chain_key = route.chain_key,
-                        message_id = %job.message_id,
-                        attempts,
-                        %stalled,
-                        "send did not complete; retrying"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
-                    continue;
+        let pending = if let Some(result) = preflight {
+            result
+        } else {
+            match broadcast_locks
+                .broadcast(signer_address, SEND_TIMEOUT, tx.send())
+                .await
+            {
+                Ok(res) => res,
+                Err(stalled) => {
+                    if attempts <= delivery_config.max_retries {
+                        warn!(
+                            chain_key = route.chain_key,
+                            message_id = %job.message_id,
+                            attempts,
+                            %stalled,
+                            "send did not complete; retrying"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                        continue;
+                    }
+                    break SendOutcome::Failed(stalled.to_string());
                 }
-                break SendOutcome::Failed(stalled.to_string());
             }
         };
 
@@ -2386,6 +2408,123 @@ mod tests {
                 "{stage} did not exercise the intended RPC path"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn repeated_gas_cap_failures_do_not_broadcast_and_recover_after_state_changes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Mutex;
+
+        let (mut route, job) = delivery_fixture();
+        route.max_gas_limit = 100_000;
+        let signer = Address::repeat_byte(4);
+        let recovered = Arc::new(AtomicBool::new(false));
+        let requests = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let hash = B256::repeat_byte(0x44);
+        let event = IInbox::MessageExecuted {
+            messageId: job.message_id,
+            emitterAddress: job.emitter,
+            destination: Address::repeat_byte(5),
+            dispatcher: Address::repeat_byte(6),
+            relayer: signer,
+            messagePayload: job.payload.clone().into(),
+        };
+        let log = Log {
+            inner: alloy::primitives::Log {
+                address: route.inbox_address,
+                data: event.encode_log_data(),
+            },
+            ..Default::default()
+        };
+        let receipt = serde_json::json!({
+            "status": "0x1", "cumulativeGasUsed": "0x1",
+            "logsBloom": format!("0x{}", "00".repeat(256)), "logs": [log],
+            "transactionHash": hash, "transactionIndex": "0x0",
+            "blockHash": B256::repeat_byte(0x55), "blockNumber": "0x1",
+            "gasUsed": "0x1", "effectiveGasPrice": "0x1",
+            "from": signer, "to": route.inbox_address, "type": "0x2",
+        });
+        let app = axum::Router::new().route("/", axum::routing::post({
+            let recovered = recovered.clone();
+            let requests = requests.clone();
+            move |axum::Json(request): axum::Json<serde_json::Value>| {
+                let recovered = recovered.clone();
+                let requests = requests.clone();
+                let receipt = receipt.clone();
+                async move {
+                    requests.lock().unwrap().push(request.clone());
+                    let mut response = serde_json::json!({"jsonrpc": "2.0", "id": request["id"]});
+                    if request["method"] == "eth_call" && !recovered.load(Ordering::SeqCst) {
+                        response["error"] = serde_json::json!({
+                            "code": 3, "message": "execution reverted: InsufficientGasForDestination()"
+                        });
+                    } else {
+                        response["result"] = match request["method"].as_str().unwrap() {
+                            "eth_estimateGas" => serde_json::json!("0x186a0"),
+                            "eth_call" => serde_json::json!(Bytes::from(true.abi_encode())),
+                            "eth_sendTransaction" => serde_json::json!(hash),
+                            "eth_getTransactionReceipt" => receipt,
+                            method => panic!("unexpected RPC method {method}"),
+                        };
+                    }
+                    axum::Json(response)
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect(&url)
+            .await
+            .unwrap();
+        let outcomes = Arc::new(OutcomeStore::new(8));
+        let config = DeliveryConfig {
+            simulate_before_send: false,
+            max_retries: 1,
+            ..Default::default()
+        };
+        for attempt in 0..4 {
+            if attempt == 3 {
+                recovered.store(true, Ordering::SeqCst);
+            }
+            let result = handle_job(
+                &route,
+                &config,
+                &provider,
+                signer,
+                &crate::broadcast::BroadcastLocks::new(),
+                &job,
+                MessageFunding {
+                    gas: Some(100_000),
+                    ..MessageFunding::unknown()
+                },
+                NoopMetrics::new().as_ref(),
+                None,
+                &outcomes,
+            )
+            .await
+            .unwrap();
+            let requests = requests.lock().unwrap();
+            let sends = requests
+                .iter()
+                .filter(|r| r["method"] == "eth_sendTransaction")
+                .count();
+            if attempt < 3 {
+                assert_eq!(result, DeliveryResultKind::Retryable);
+                assert_eq!(sends, 0, "a known gas-cap failure was broadcast");
+                assert!(outcomes.get(&job.message_id).is_none());
+            } else {
+                assert_eq!(result, DeliveryResultKind::Delivered);
+                assert_eq!(sends, 1);
+            }
+            for call in requests.iter().filter(|r| r["method"] == "eth_call") {
+                assert_eq!(call["params"][0]["gas"], "0x186a0");
+                assert_eq!(call["params"][0]["from"], serde_json::json!(signer));
+            }
+        }
+        server.abort();
     }
 
     #[tokio::test]
