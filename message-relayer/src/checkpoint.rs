@@ -37,6 +37,9 @@ struct Entry {
     block: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     outbox: Option<String>,
+    /// Every message through this cursor was recorded in the unfinished-work store.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    durable_work: bool,
 }
 
 /// Deserialization-only shape: a bare JSON number is a checkpoint file written before per-entry
@@ -50,6 +53,8 @@ enum RawEntry {
         block: u64,
         #[serde(default)]
         outbox: Option<String>,
+        #[serde(default)]
+        durable_work: bool,
     },
 }
 
@@ -60,7 +65,15 @@ impl From<RawEntry> for Entry {
                 block,
                 ..Entry::default()
             },
-            RawEntry::Full { block, outbox } => Entry { block, outbox },
+            RawEntry::Full {
+                block,
+                outbox,
+                durable_work,
+            } => Entry {
+                block,
+                outbox,
+                durable_work,
+            },
         }
     }
 }
@@ -131,6 +144,16 @@ impl CheckpointStore {
             .and_then(|e| e.outbox.clone())
     }
 
+    /// Legacy scan cursors cannot vouch for unfinished messages: the old periodically updated
+    /// holdback could lag ingestion or lose an evicted slot. Upgrade must rescan their history.
+    pub fn has_durable_work(&self, key: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("checkpoint mutex")
+            .get(key)
+            .is_some_and(|e| e.durable_work)
+    }
+
     /// Record `block` as the last fully-processed block for `key` and persist the whole store.
     /// Preserves whatever Outbox address (if any) was last recorded for `key` — this is the
     /// ordinary per-tick progress update, not an Outbox change; use [`Self::set_with_outbox`] for
@@ -140,9 +163,9 @@ impl CheckpointStore {
     /// snapshot over a newer one; writes are small and infrequent (one per poll tick).
     pub fn set(&self, key: &str, block: u64) -> Result<()> {
         let mut guard = self.inner.lock().expect("checkpoint mutex");
-        let outbox = guard.get(key).and_then(|e| e.outbox.clone());
-        guard.insert(key.to_string(), Entry { block, outbox });
-        Self::persist(&self.path, &guard)
+        let mut entry = guard.get(key).cloned().unwrap_or_default();
+        entry.block = block;
+        Self::persist_entry(&self.path, &mut guard, key, entry)
     }
 
     /// Like [`Self::set`], but also records `outbox` as the Outbox address this block cursor was
@@ -151,14 +174,55 @@ impl CheckpointStore {
     /// left over from an Outbox since rotated away from.
     pub fn set_with_outbox(&self, key: &str, block: u64, outbox: &str) -> Result<()> {
         let mut guard = self.inner.lock().expect("checkpoint mutex");
-        guard.insert(
-            key.to_string(),
+        Self::persist_entry(
+            &self.path,
+            &mut guard,
+            key,
             Entry {
                 block,
                 outbox: Some(outbox.to_string()),
+                durable_work: false,
             },
-        );
-        Self::persist(&self.path, &guard)
+        )
+    }
+
+    /// Commit a source scan only after all its message records have reached stable storage.
+    pub fn set_with_work(&self, key: &str, block: u64, outbox: &str) -> Result<()> {
+        self.set_journaled(key, block, Some(outbox))
+    }
+
+    /// Record a source cursor backed by durable unfinished work. An all-Outbox scope carries no
+    /// single address: its key identifies the scope and historical authorization covers emitters.
+    pub fn set_journaled(&self, key: &str, block: u64, outbox: Option<&str>) -> Result<()> {
+        let mut guard = self.inner.lock().expect("checkpoint mutex");
+        Self::persist_entry(
+            &self.path,
+            &mut guard,
+            key,
+            Entry {
+                block,
+                outbox: outbox.map(str::to_owned),
+                durable_work: true,
+            },
+        )
+    }
+
+    fn persist_entry(
+        path: &Path,
+        entries: &mut HashMap<String, Entry>,
+        key: &str,
+        entry: Entry,
+    ) -> Result<()> {
+        let previous = entries.insert(key.to_string(), entry);
+        if let Err(err) = Self::persist(path, entries) {
+            if let Some(previous) = previous {
+                entries.insert(key.to_string(), previous);
+            } else {
+                entries.remove(key);
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 
     fn persist(path: &Path, entries: &HashMap<String, Entry>) -> Result<()> {
@@ -168,51 +232,8 @@ impl CheckpointStore {
     }
 }
 
-/// Cross-task cursor holdback for the Outbox watchers (per `chain_key`).
-///
-/// The Outbox checkpoint is written by the watcher, but "is this message finished?" is pool state —
-/// a message can sit undelivered (below quorum, or destination down) long after the scan cursor
-/// passed its block. Persisting the raw cursor therefore loses undelivered messages across a
-/// restart once they age out of the fixed lookback window: the rescan no longer reaches them, stray
-/// votes are dropped by the chain-first allowlist, and no reobservation is ever requested. The pool
-/// publishes the oldest unfinished (undelivered, non-terminal) message block per route here on its
-/// prune tick; the watcher clamps the *persisted* cursor to `oldest - 1` so a restart always
-/// re-indexes every unfinished message. The in-memory cursor is not clamped — the live scan never
-/// re-reads.
-#[derive(Debug, Default)]
-pub struct CursorHoldback {
-    /// `chain_key` → oldest unfinished message block (`None` = route has no unfinished messages).
-    oldest: Mutex<HashMap<u64, Option<u64>>>,
-}
-
-impl CursorHoldback {
-    /// Publish the oldest unfinished block for `chain_key` (`None` clears the holdback).
-    pub fn update(&self, chain_key: u64, oldest_block: Option<u64>) {
-        self.oldest
-            .lock()
-            .expect("holdback mutex")
-            .insert(chain_key, oldest_block);
-    }
-
-    /// Clamp `cursor` so it does not advance past the oldest unfinished block for `chain_key`.
-    /// Identity when the route has no unfinished messages (or has not reported yet).
-    pub fn clamp(&self, chain_key: u64, cursor: u64) -> u64 {
-        match self
-            .oldest
-            .lock()
-            .expect("holdback mutex")
-            .get(&chain_key)
-            .copied()
-            .flatten()
-        {
-            Some(oldest) => cursor.min(oldest.saturating_sub(1)),
-            None => cursor,
-        }
-    }
-}
-
 /// Write `bytes` to `path` durably: sibling temp file, fsync, rename, fsync the directory.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
@@ -261,6 +282,35 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_journaled_source_cursors_are_marked_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cp.json");
+        std::fs::write(
+            &path,
+            r#"{"outbox:2":1000,"outbox:3":{"block":2000,"outbox":"old"}}"#,
+        )
+        .unwrap();
+        let store = CheckpointStore::load(&path).unwrap();
+        assert!(!store.has_durable_work("outbox:2"));
+        assert!(!store.has_durable_work("outbox:3"));
+        store.set_with_work("outbox:2", 100, "new").unwrap();
+        let reloaded = CheckpointStore::load(&path).unwrap();
+        assert!(reloaded.has_durable_work("outbox:2"));
+        assert!(!reloaded.has_durable_work("outbox:3"));
+    }
+
+    #[test]
+    fn failed_persistence_rolls_back_in_memory_cursor_and_work_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cp.json");
+        let store = CheckpointStore::load(&path).unwrap();
+        std::fs::create_dir(&path).unwrap(); // Make the atomic rename fail.
+        assert!(store.set_with_work("outbox:2", 1000, "outbox").is_err());
+        assert_eq!(store.get("outbox:2"), None);
+        assert!(!store.has_durable_work("outbox:2"));
+    }
 
     #[test]
     fn round_trips_and_persists_across_reload() {
@@ -332,23 +382,6 @@ mod tests {
             CheckpointStore::load(&path).unwrap().get("outbox:2"),
             Some(1300)
         );
-    }
-
-    #[test]
-    fn holdback_clamps_only_when_unfinished_work_reported() {
-        let hb = CursorHoldback::default();
-        // Unreported route: identity.
-        assert_eq!(hb.clamp(2, 1000), 1000);
-        // Unfinished message at block 400 → cursor pinned to 399.
-        hb.update(2, Some(400));
-        assert_eq!(hb.clamp(2, 1000), 399);
-        // A cursor already below the holdback is untouched.
-        assert_eq!(hb.clamp(2, 300), 300);
-        // Another route is independent.
-        assert_eq!(hb.clamp(7, 1000), 1000);
-        // Clearing (all delivered/terminal) releases the cursor.
-        hb.update(2, None);
-        assert_eq!(hb.clamp(2, 1000), 1000);
     }
 
     #[test]

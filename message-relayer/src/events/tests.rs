@@ -58,6 +58,7 @@ async fn scan<P: Provider>(
         cursor,
         &tx,
         crate::prom::NoopMetrics::new().as_ref(),
+        None,
         &CancellationToken::new(),
         &|| {},
     )
@@ -136,8 +137,14 @@ fn checkpoint_scope_cannot_reuse_single_outbox_or_another_override() {
     cp.set_with_outbox("outbox:2", 100_000, &Address::repeat_byte(1).to_string())
         .unwrap();
     let all = checkpoint_key(2, None);
-    assert_eq!(resume_cursor(cp.get(&all), None, 600), 0);
-    assert_eq!(resume_cursor(cp.get(&all), Some(50), 600), 49);
+    assert_eq!(
+        resume_cursor(cp.get(&all), cp.has_durable_work(&all), None, 600),
+        0
+    );
+    assert_eq!(
+        resume_cursor(cp.get(&all), cp.has_durable_work(&all), Some(50), 600),
+        49
+    );
     let pinned = checkpoint_key(2, Some(Address::repeat_byte(1)));
     cp.set(&pinned, 5000).unwrap();
     assert_eq!(cp.get(&all), None);
@@ -145,8 +152,11 @@ fn checkpoint_scope_cannot_reuse_single_outbox_or_another_override() {
         cp.get(&checkpoint_key(2, Some(Address::repeat_byte(2)))),
         None
     );
-    cp.set(&all, 8000).unwrap();
-    assert_eq!(resume_cursor(cp.get(&all), None, 600), 7400);
+    cp.set_journaled(&all, 8000, None).unwrap();
+    assert_eq!(
+        resume_cursor(cp.get(&all), cp.has_durable_work(&all), None, 600),
+        7400
+    );
 }
 
 #[tokio::test]
@@ -213,7 +223,7 @@ async fn restart_replays_membership_at_each_publication_across_removal_reregistr
         responses.push(json!({"result":membership(active)}));
     }
     let rpc = RpcMock::start(responses).await;
-    let mut cursor = resume_cursor(None, None, 600);
+    let mut cursor = resume_cursor(None, false, None, 600);
     let (result, messages) = scan(&rpc.provider, source(None), &mut cursor).await;
     result.unwrap();
     assert_eq!(
@@ -368,6 +378,7 @@ async fn finalized_rpc_failures_null_and_regression_do_not_scan_or_weaken_bounda
             &mut cursor,
             &tx,
             crate::prom::NoopMetrics::new().as_ref(),
+            None,
             &CancellationToken::new(),
             &|| {},
         )
@@ -462,4 +473,120 @@ async fn unrepresentable_registry_chain_key_is_rejected_before_rpc() {
         .unwrap_err()
         .to_string()
         .contains("uint32"));
+}
+
+#[test]
+fn unmarked_all_outbox_cursor_replays_history_before_marking_work_durable() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cp.json");
+    let key = checkpoint_key(2, None);
+    let cp = CheckpointStore::load(&path).unwrap();
+    cp.set(&key, 100_000).unwrap();
+    assert_eq!(
+        resume_cursor(cp.get(&key), cp.has_durable_work(&key), None, 600),
+        0
+    );
+    assert_eq!(
+        resume_cursor(cp.get(&key), cp.has_durable_work(&key), Some(50), 600),
+        49
+    );
+    cp.set_journaled(&key, 2_000, None).unwrap();
+    let restored = CheckpointStore::load(path).unwrap();
+    assert!(restored.has_durable_work(&key));
+    assert_eq!(
+        restored.get_outbox(&key),
+        None,
+        "an all-Outbox cursor has no fabricated default address"
+    );
+    assert_eq!(
+        resume_cursor(
+            restored.get(&key),
+            restored.has_durable_work(&key),
+            None,
+            600
+        ),
+        1_400
+    );
+}
+
+async fn scan_to_channel_with_store(
+    work: &crate::work::WorkStore,
+    count: u8,
+) -> (Result<()>, u64, mpsc::Receiver<IndexedMessage>) {
+    let outbox = Address::repeat_byte(1);
+    let rpc = Asserter::new();
+    rpc.push_success(&U64::from(5_000));
+    rpc.push_success(
+        &((1..=count)
+            .map(|id| publication(outbox, id, u64::from(id)))
+            .collect::<Vec<_>>()),
+    );
+    let provider = ProviderBuilder::new().connect_mocked_client(rpc);
+    let (tx, rx) = mpsc::channel(8);
+    let mut cursor = 0;
+    let result = poll_once(
+        &source(Some(outbox)),
+        &FinalityPolicy::Depth(0),
+        &mut FinalityTracker::new(Instant::now()),
+        &provider,
+        &mut cursor,
+        &tx,
+        crate::prom::NoopMetrics::new().as_ref(),
+        Some(work),
+        &CancellationToken::new(),
+        &|| {},
+    )
+    .await;
+    (result, cursor, rx)
+}
+
+#[tokio::test]
+async fn scanner_crash_before_pool_tick_restores_old_work_with_bounded_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cp.json");
+    let work = crate::work::WorkStore::for_checkpoint(&path);
+    let (result, cursor, rx) = scan_to_channel_with_store(&work, 3).await;
+    result.unwrap();
+    assert_eq!(cursor, MAX_BLOCKS_PER_SCAN);
+    let key = checkpoint_key(2, None);
+    let cp = CheckpointStore::load(&path).unwrap();
+    cp.set_journaled(&key, cursor, None).unwrap();
+    // No pool has consumed the channel or published a periodic checkpoint holdback.
+    drop(rx);
+    drop(work);
+    let work = crate::work::WorkStore::for_checkpoint(&path);
+    work.prepare_route(2, cp.has_durable_work(&key))
+        .await
+        .unwrap();
+    let first = work.pending(2, Default::default(), 1).await.unwrap();
+    assert_eq!(
+        first.len(),
+        1,
+        "the working-set limit must bound restore memory"
+    );
+    let rest = work
+        .pending(2, first.iter().map(|m| m.message_id).collect(), 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        rest.len(),
+        2,
+        "overflow remains durable despite the advanced checkpoint"
+    );
+    assert!(first
+        .iter()
+        .chain(&rest)
+        .all(|m| m.block_height < cursor.saturating_sub(600)));
+}
+
+#[tokio::test]
+async fn journal_write_failure_cannot_publish_work_or_advance_source_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cp.json");
+    std::fs::write(dir.path().join("cp.json.messages"), "not a directory").unwrap();
+    let work = crate::work::WorkStore::for_checkpoint(&path);
+    let (result, cursor, mut rx) = scan_to_channel_with_store(&work, 1).await;
+    assert!(result.is_err());
+    assert_eq!(cursor, 0);
+    assert!(rx.try_recv().is_err());
 }

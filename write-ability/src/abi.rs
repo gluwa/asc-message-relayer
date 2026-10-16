@@ -165,6 +165,9 @@ sol! {
         /// retryable via `retryPendingMessage`. Mirrors `SimpleInbox.isPending`.
         function isPending(bytes32 messageId) external view returns (bool);
 
+        /// Nonzero only after the destination executed successfully.
+        function processedAt(bytes32 messageId) external view returns (uint256);
+
         /// asc-contracts #54: whether `messageId` failed at the destination and awaits
         /// `retryFailedMessage`. Checked before spawning a retry attempt so a guaranteed-revert
         /// call is never sent once someone else's retry (or ours, unobserved) already resolved it.

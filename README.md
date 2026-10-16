@@ -167,16 +167,20 @@ retry silently forever:
   this coverage, so upgrade replays from `start_block` or block 1 when no floor is configured.
   An explicit `outbox_address` override bypasses Discovery and gets its own address-scoped key;
   changing or clearing that override cannot reuse its partial cursor as complete history.
-- **Checkpoints + startup lookback** — block cursors persist to `--checkpoint-path` so restarts
-  never skip events. Because votes and pending acks are memory-only, cursors are rewound by
-  `scan_lookback_blocks` (default 600) on startup: in-flight work is re-discovered, and
-  already-finished work resolves idempotently (delivered → `Already validated` at simulate,
-  acked → skipped by the pre-check). Source scan cursors cover all Outboxes independently of
-  current defaults; settlement retains its own cursors.
-- **Bounded everything** — vote cache (TTL + LRU cap), pending-ack queue (cap 10 000, oldest
-  evicted), per-tick ack batch (256) and concurrency (8), 2 000-block `eth_getLogs` chunks (an
-  over-large resume range would error on every tick forever on range-capped RPCs), 120 s receipt
-  timeouts (one stuck underpriced tx cannot wedge a route's serial worker).
+- **Durable source work + checkpoints** — each source message is fsynced into
+  `<checkpoint-path>.messages` before the scan cursor advances. The bounded vote cache restores
+  unfinished work independently of cursor age or lookback. Keep the checkpoint file and sibling
+  directory together on persistent storage and in backups. Missing or corrupt work fails closed;
+  disk errors stop source progress. A cursor without a durable-work marker is replayed from
+  `start_block` or block 1, even if it already uses the all-Outbox scope key.
+  Startup still rewinds marked cursors by `scan_lookback_blocks` (default 600) for idempotent
+  rescanning and memory-only settlement recovery. Votes are recovered through reobservation.
+- **Bounded memory and supervised execution** — source backlog stays on disk until final delivery.
+  Stalled, non-inflight working-set entries rotate back to disk so later publications can progress;
+  accepted queued/failed work reconciles on-chain and retries without requiring fresh signatures.
+  Retry tasks run through the supervised delivery worker instead of detached memory-only loops.
+  With persistence disabled, source admission uses backpressure and retains unfinished entries.
+  Source log scans cover at most 2,000 blocks per request, shrinking further on provider limits.
 
 ## Trust & key model
 

@@ -55,6 +55,7 @@ pub mod receipt;
 pub mod revert;
 pub mod rpc;
 pub mod set_update;
+pub mod work;
 
 pub use config::{
     AttestorSet, AttestorSource, ChainRoute, Config, DeliveryConfig, P2pConfig, VoteCacheConfig,
@@ -133,11 +134,6 @@ impl Server {
         // roles stop colliding. The two halves are only correct together; see `crate::broadcast`.
         let broadcast_locks = broadcast::BroadcastLocks::new();
 
-        // Outbox-cursor holdback: the pool reports its oldest unfinished message per route; the
-        // outbox watchers clamp their persisted checkpoints to it so restart-recovery always
-        // re-indexes undelivered messages (never lost to the lookback window).
-        let holdback = Arc::new(checkpoint::CursorHoldback::default());
-
         // Persistent block cursors (resume after restart instead of from the chain head). Disabled
         // when `checkpoint_path` is None.
         let checkpoint: Option<Arc<checkpoint::CheckpointStore>> =
@@ -157,6 +153,12 @@ impl Server {
                     None
                 }
             };
+
+        let work = self
+            .config
+            .checkpoint_path
+            .as_ref()
+            .map(|path| Arc::new(work::WorkStore::for_checkpoint(path)));
 
         // Resolve attestor sets up-front so the pool only sees concrete addresses.
         let mut route_attestors: Vec<RouteAttestors> = Vec::with_capacity(self.config.routes.len());
@@ -220,7 +222,7 @@ impl Server {
                     set_update_rx: set_rx,
                     reobs_tx,
                     query_rx,
-                    holdback: holdback.clone(),
+                    work: work.clone(),
                 },
                 metrics.clone(),
                 health.clone(),
@@ -263,7 +265,7 @@ impl Server {
                     checkpoint.clone(),
                     self.config.scan_lookback_blocks,
                     health.clone(),
-                    holdback.clone(),
+                    work.clone(),
                     cancel.clone(),
                 ),
             );

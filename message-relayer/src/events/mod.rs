@@ -39,7 +39,7 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// A finalized message that the relayer has discovered on the Creditcoin Outbox. The vote pool
 /// keys on `message_id` (also the digest attestors sign directly since asc-contracts #54); the
 /// rest of the fields are needed to recompute the calldata for `Inbox.deliverMessage`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct IndexedMessage {
     pub chain_key: u64,
     pub message_id: B256,
@@ -78,8 +78,13 @@ fn checkpoint_key(chain_key: u64, outbox_override: Option<Address>) -> String {
     }
 }
 
-fn resume_cursor(checkpoint: Option<u64>, start_block: Option<u64>, lookback: u64) -> u64 {
-    checkpoint.map_or_else(
+fn resume_cursor(
+    checkpoint: Option<u64>,
+    durable_work: bool,
+    start_block: Option<u64>,
+    lookback: u64,
+) -> u64 {
+    checkpoint.filter(|_| durable_work).map_or_else(
         || start_block.unwrap_or(1).saturating_sub(1),
         |block| block.saturating_sub(lookback),
     )
@@ -96,10 +101,14 @@ pub async fn watch_outbox(
     checkpoint: Option<Arc<CheckpointStore>>,
     scan_lookback_blocks: u64,
     health: Arc<crate::health::Health>,
-    holdback: Arc<crate::checkpoint::CursorHoldback>,
+    work: Option<Arc<crate::work::WorkStore>>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let chain_key = route.chain_key;
+    anyhow::ensure!(
+        checkpoint.is_some() == work.is_some(),
+        "source checkpoint and unfinished-work persistence must be enabled together"
+    );
     if route.outbox_address.is_none() {
         authority::registry_chain_key(chain_key)?;
     }
@@ -132,8 +141,19 @@ pub async fn watch_outbox(
         outbox_override: route.outbox_address,
     };
     let persisted = checkpoint.as_ref().and_then(|c| c.get(&key));
-    let mut last_seen = resume_cursor(persisted, route.start_block, scan_lookback_blocks);
-    if persisted.is_none() {
+    let durable_work = checkpoint
+        .as_ref()
+        .is_some_and(|c| c.has_durable_work(&key));
+    if let Some(work) = &work {
+        work.prepare_route(chain_key, durable_work).await?;
+    }
+    let mut last_seen = resume_cursor(
+        persisted,
+        durable_work,
+        route.start_block,
+        scan_lookback_blocks,
+    );
+    if persisted.is_none() || !durable_work {
         info!(chain_key, from_block = last_seen + 1, "starting all-Outbox history scan; single-address checkpoints cannot establish coverage");
     }
     let policy = FinalityPolicy::Finalized;
@@ -146,7 +166,7 @@ pub async fn watch_outbox(
             _ = tick.tick() => {
                 let scan = match source_rpc.connect().await {
                     Ok(provider) => poll_once(&source, &policy, &mut finality, provider,
-                        &mut last_seen, &indexed_tx, metrics.as_ref(), &cancel, &|| health.heartbeat(&health_key)).await,
+                        &mut last_seen, &indexed_tx, metrics.as_ref(), work.as_deref(), &cancel, &|| health.heartbeat(&health_key)).await,
                     Err(err) => Err(err),
                 };
                 match scan {
@@ -154,8 +174,14 @@ pub async fn watch_outbox(
                         source_rpc.note_ok();
                         health.heartbeat(&health_key);
                         if let Some(cp) = &checkpoint {
-                            let persist = holdback.clamp(chain_key, last_seen);
-                            if let Err(err) = cp.set(&key, persist) {
+                            // Every message in the successful prefix was persisted before it
+                            // reached the channel. No periodically sampled holdback is needed.
+                            let saved = if work.is_some() {
+                                cp.set_journaled(&key, last_seen, None)
+                            } else {
+                                cp.set(&key, last_seen)
+                            };
+                            if let Err(err) = saved {
                                 metrics.inc_checkpoint_write_failure(chain_key);
                                 warn!(chain_key, %err, "failed to persist source checkpoint");
                             }
@@ -181,6 +207,7 @@ async fn poll_once<P: Provider>(
     last_seen: &mut u64,
     indexed_tx: &mpsc::Sender<IndexedMessage>,
     metrics: &dyn crate::prom::MetricsTrait,
+    work: Option<&crate::work::WorkStore>,
     cancel: &CancellationToken,
     progress: &(dyn Fn() + Sync),
 ) -> Result<()> {
@@ -291,6 +318,11 @@ async fn poll_once<P: Provider>(
             block_height,
         };
         debug!(chain_key = source.chain_key, %outbox, message_id = %indexed.message_id, block_height, "indexed authorized source message");
+        // Preserve unfinished work before sending it or advancing the source scan. Any write
+        // failure returns with the original cursor, so the complete range remains replayable.
+        if let Some(work) = work {
+            work.record(indexed.clone()).await?;
+        }
         metrics.inc_messages_indexed(source.chain_key);
         tokio::select! {
             biased;
