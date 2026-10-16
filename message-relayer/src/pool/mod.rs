@@ -102,10 +102,9 @@ pub struct PoolHandles {
     pub reobs_tx: mpsc::Sender<ReobservationRequest>,
     /// Read-only vote-bundle queries (served at `GET /votes/{message_id}`).
     pub query_rx: mpsc::Receiver<PoolQuery>,
-    /// Outbox-cursor holdback the pool feeds on its prune tick (oldest unfinished message block per
-    /// route) so the watchers never persist a cursor past an undelivered message. See
-    /// [`crate::checkpoint::CursorHoldback`].
-    pub holdback: std::sync::Arc<crate::checkpoint::CursorHoldback>,
+    /// Source messages committed before the watcher advances its cursor. The vote cache is only
+    /// a bounded working set; unfinished backlog remains here across eviction pressure/restarts.
+    pub work: Option<std::sync::Arc<crate::work::WorkStore>>,
 }
 
 /// Run the pool task. Returns when `cancel` fires or both inputs close.
@@ -126,8 +125,12 @@ pub async fn run(
         mut set_update_rx,
         reobs_tx,
         mut query_rx,
-        holdback,
+        work,
     } = handles;
+
+    // With persistence disabled, retain one incoming item outside the bounded cache and stop
+    // receiving until it fits. Other pool inputs keep running, so delivery can free capacity.
+    let mut deferred_indexed: Option<IndexedMessage> = None;
 
     // Publish the starting allowlist sizes (static routes report their configured size; on-chain
     // routes start empty until their watcher resolves the set).
@@ -146,6 +149,19 @@ pub async fn run(
     health.heartbeat("pool");
 
     loop {
+        if deferred_indexed
+            .as_ref()
+            .is_some_and(|indexed| state.can_index(indexed))
+        {
+            let indexed = deferred_indexed.take().expect("deferred item exists");
+            if let Some(job) = state.note_indexed(indexed, metrics.as_ref()) {
+                if let Err((ck, mh)) =
+                    dispatch_delivery_job(&delivery_txs, job, "deferred indexing")
+                {
+                    state.requeue_delivery(ck, mh, Instant::now());
+                }
+            }
+        }
         tokio::select! {
             () = cancel.cancelled() => {
                 info!("🛑 vote pool exiting on cancel");
@@ -162,11 +178,18 @@ pub async fn run(
                     }
                 }
             }
-            maybe = indexed_rx.recv() => {
+            maybe = indexed_rx.recv(), if deferred_indexed.is_none() => {
                 let Some(indexed) = maybe else {
                     info!("indexed_rx channel closed; shutting pool down");
                     return Ok(());
                 };
+                if !state.can_index(&indexed) {
+                    if work.is_none() {
+                        deferred_indexed = Some(indexed);
+                    }
+                    // Persistent messages remain on disk and are loaded when a slot opens.
+                    continue;
+                }
                 if let Some(job) = state.note_indexed(indexed, metrics.as_ref()) {
                     let label = "buffered-vote dispatch";
                     if let Err((ck, mh)) = dispatch_delivery_job(&delivery_txs, job, label) {
@@ -190,6 +213,13 @@ pub async fn run(
                     warn!("delivery result channel closed");
                     continue;
                 };
+                if matches!(result.outcome, DeliveryResultKind::Delivered | DeliveryResultKind::Terminal) {
+                    if let Some(work) = &work {
+                        // Failure stops this supervised task instead of silently losing cleanup.
+                        // A crash before removal replays safely; after removal the result is final.
+                        work.complete(result.chain_key, result.message_id).await?;
+                    }
+                }
                 if let Some(job) = state.note_delivery_result(result, metrics.as_ref()) {
                     if let Err((ck, mh)) = dispatch_delivery_job(&delivery_txs, job, "delivery retry dispatch") {
                         state.requeue_delivery(ck, mh, Instant::now());
@@ -209,11 +239,12 @@ pub async fn run(
                 health.heartbeat("pool");
                 state.prune_expired();
                 metrics.set_pool_messages_pending(state.total_pending() as i64);
-                // Publish the oldest unfinished message block per route so the outbox watchers
-                // clamp their persisted cursors — restart-recovery then always re-indexes every
-                // undelivered message, however old (checkpoint-past-unfinished-work fix).
-                for (ck, oldest) in state.oldest_unfinished_blocks() {
-                    holdback.update(ck, oldest);
+                if let Some(work) = &work {
+                    for job in state.refill(work, metrics.as_ref()).await? {
+                        if let Err((ck, mh)) = dispatch_delivery_job(&delivery_txs, job, "durable backlog dispatch") {
+                            state.requeue_delivery(ck, mh, Instant::now());
+                        }
+                    }
                 }
                 // Nudge attestors to re-sign anything stuck below quorum. Best effort: a full
                 // request channel just means we try again on the next tick.
@@ -377,6 +408,10 @@ impl State {
             debug!(chain_key, %hash, "re-indexing existing message; keeping original slot");
             return None;
         }
+        if !route.make_room() {
+            debug!(chain_key, %hash, "vote cache full; message remains in durable backlog");
+            return None;
+        }
         route.by_message.insert(
             hash,
             MessageSlot {
@@ -392,7 +427,6 @@ impl State {
             },
         );
         route.order.push_back(hash);
-        route.evict_overflow(chain_key);
 
         // Adopt any votes that arrived before this message was indexed. Doing it here rather than
         // waiting for re-gossip is the whole point of the buffer: it is what removes the
@@ -567,7 +601,7 @@ impl State {
                 // because the budget outlives the scan lookback (C1r). Keep retrying at the capped
                 // backoff instead (delivery_retry_delay tops out at DELIVERY_RETRY_MAX); re-attempts
                 // are safe via on-chain idempotency (AlreadyValidated), and the slot is still bounded
-                // by the count-based LRU (evict_overflow). Genuine permanent failures (reverts) are
+                // by the bounded working set. Genuine permanent failures (reverts) are
                 // classified `Terminal`, not `Retryable`, so they are unaffected.
                 let delay = delivery_retry_delay(slot.delivery_attempts);
                 slot.next_delivery_attempt_at = Some(Instant::now() + delay);
@@ -619,23 +653,42 @@ impl State {
         self.by_route.values().map(|r| r.by_message.len()).sum()
     }
 
-    /// Oldest unfinished (undelivered, non-terminal) message block per route — the outbox-cursor
-    /// holdback anchors. Delivered and terminal slots don't hold the cursor back: delivered work is
-    /// done, and terminal (genuine revert) messages will never deliver no matter how often they are
-    /// re-indexed.
-    fn oldest_unfinished_blocks(&self) -> Vec<(u64, Option<u64>)> {
-        self.by_route
-            .iter()
-            .map(|(chain_key, route)| {
-                let oldest = route
+    fn can_index(&self, indexed: &IndexedMessage) -> bool {
+        self.by_route.get(&indexed.chain_key).is_none_or(|route| {
+            route.by_message.contains_key(&indexed.message_id)
+                || route.by_message.len() < route.cache_max
+                || route
                     .by_message
                     .values()
-                    .filter(|slot| !slot.delivered && !slot.terminal)
-                    .map(|slot| slot.indexed.block_height)
-                    .min();
-                (*chain_key, oldest)
+                    .any(|slot| slot.delivered || slot.terminal)
+        })
+    }
+
+    async fn refill(
+        &mut self,
+        work: &crate::work::WorkStore,
+        metrics: &dyn crate::prom::MetricsTrait,
+    ) -> Result<Vec<DeliveryJob>> {
+        let mut jobs = Vec::new();
+        let capacities: Vec<_> = self
+            .by_route
+            .iter()
+            .map(|(&chain_key, route)| {
+                (
+                    chain_key,
+                    route.by_message.keys().copied().collect(),
+                    route.cache_max.saturating_sub(route.by_message.len()),
+                )
             })
-            .collect()
+            .collect();
+        for (chain_key, loaded, capacity) in capacities {
+            for indexed in work.pending(chain_key, loaded, capacity).await? {
+                if let Some(job) = self.note_indexed(indexed, metrics) {
+                    jobs.push(job);
+                }
+            }
+        }
+        Ok(jobs)
     }
 
     /// Return a job to its slot after a full delivery channel (backpressure, not a delivery
@@ -918,47 +971,26 @@ impl RouteState {
         }
     }
 
-    /// Evict once the route is over `cache_max`, preferring an already-resolved slot (`delivered`
-    /// or `terminal`) over the oldest slot outright. `prune_expired` already reaps `delivered`
-    /// slots eagerly and `terminal` ones past TTL on its own ~30s tick, so in the common case there
-    /// is nothing left here for this scan to find — this exists for the gap between prune ticks,
-    /// and for the sustained-backlog case prune can't help with.
-    ///
-    /// Falling back to the strict-oldest slot (today's only behavior) means evicting a message that
-    /// is still gathering votes or awaiting delivery. That is a real capacity-pressure signal, not
-    /// routine housekeeping: the evicted hash drops out of `oldest_unfinished_blocks` (the
-    /// checkpoint holdback's input), so a restart can rescan straight past it, and any votes
-    /// collected for it so far are gone outright — if it is later re-observed, vote collection
-    /// starts over from zero. Logged loudly so an operator sees capacity pressure before it turns
-    /// into a silently dropped message.
-    fn evict_overflow(&mut self, chain_key: u64) {
-        while self.by_message.len() > self.cache_max {
-            let mut resolved = None;
-            for hash in &self.order {
-                if let Some(slot) = self.by_message.get(hash) {
-                    if slot.delivered || slot.terminal {
-                        resolved = Some(*hash);
-                        break;
-                    }
-                }
-            }
-            let forced_undelivered = resolved.is_none();
-            let Some(victim) = resolved.or_else(|| self.order.front().copied()) else {
-                break;
+    /// Reuse resolved slots, never an unfinished message's collected votes or in-flight state.
+    /// New work stays in the disk backlog (or upstream channel when persistence is disabled).
+    fn make_room(&mut self) -> bool {
+        while self.by_message.len() >= self.cache_max {
+            let Some(victim) = self
+                .order
+                .iter()
+                .find(|hash| {
+                    self.by_message
+                        .get(*hash)
+                        .is_some_and(|slot| slot.delivered || slot.terminal)
+                })
+                .copied()
+            else {
+                return false;
             };
-            if forced_undelivered {
-                warn!(
-                    chain_key,
-                    message_id = %victim,
-                    cache_max = self.cache_max,
-                    "pool at capacity with no delivered/terminal slot to evict; forcibly dropping \
-                     the oldest still-undelivered message — its collected votes are lost and it \
-                     loses checkpoint-holdback protection until re-observed"
-                );
-            }
             self.order.retain(|h| *h != victim);
             self.by_message.remove(&victim);
         }
+        true
     }
 
     fn prune_expired(&mut self, now: Instant, ttl: Duration) {
@@ -967,7 +999,7 @@ impl RouteState {
         // that reached quorum but has not been delivered — or is still gathering votes — must not
         // silently vanish just because it is slow (the old 30-min TTL evicted exactly the messages a
         // network isolation had starved, ending reobservation for them). They are bounded instead by
-        // the count-based LRU (`evict_overflow`), and reobservation keeps driving them toward
+        // admission backpressure and the durable backlog; reobservation keeps driving them toward
         // quorum. Full scan rather than a front-prefix walk, because a retained undelivered slot can
         // sit ahead of reapable ones in insertion order.
         let expired_removable: Vec<B256> = self
@@ -1451,7 +1483,7 @@ mod tests {
     }
 
     #[test]
-    fn evict_overflow_falls_back_to_oldest_when_nothing_is_resolved() {
+    fn full_cache_preserves_unfinished_messages() {
         let route = route_for(
             2,
             vec![address!("000000000000000000000000000000000000000a")],
@@ -1476,11 +1508,56 @@ mod tests {
         assert_eq!(state.total_pending(), 2);
         let route = &state.by_route[&2];
         assert!(
-            !route.by_message.contains_key(&hashes[0]),
-            "with nothing delivered/terminal, the strict-oldest slot is still the one evicted"
+            route.by_message.contains_key(&hashes[0]),
+            "the oldest unfinished message must retain its votes and execution state"
         );
         assert!(route.by_message.contains_key(&hashes[1]));
-        assert!(route.by_message.contains_key(&hashes[2]));
+        assert!(!route.by_message.contains_key(&hashes[2]));
+    }
+
+    #[tokio::test]
+    async fn bounded_cache_refills_from_durable_backlog_after_completion_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cp.json");
+        let work = crate::work::WorkStore::for_checkpoint(&path);
+        let metrics = NoopMetrics::new();
+        let cache = VoteCacheConfig {
+            ttl_seconds: 600,
+            max_messages: 1,
+        };
+        for id in 1..=3 {
+            work.record(indexed_for(2, B256::repeat_byte(id)))
+                .await
+                .unwrap();
+        }
+        let mut state = State::new(vec![route_for(2, vec![])], cache.clone());
+        state.refill(&work, metrics.as_ref()).await.unwrap();
+        assert_eq!(state.total_pending(), 1);
+        let first = *state.by_route[&2].by_message.keys().next().unwrap();
+        // Simulate the main loop's ordered final-result bookkeeping.
+        work.complete(2, first).await.unwrap();
+        state.note_delivery_result(
+            DeliveryResult {
+                chain_key: 2,
+                message_id: first,
+                outcome: DeliveryResultKind::Delivered,
+            },
+            metrics.as_ref(),
+        );
+        state.prune_expired();
+        state.refill(&work, metrics.as_ref()).await.unwrap();
+        assert_eq!(state.total_pending(), 1);
+        assert!(!state.by_route[&2].by_message.contains_key(&first));
+        drop(state);
+        let work = crate::work::WorkStore::for_checkpoint(&path);
+        assert_eq!(
+            work.pending(2, Default::default(), 10).await.unwrap().len(),
+            2
+        );
+        let mut state = State::new(vec![route_for(2, vec![])], cache);
+        state.refill(&work, metrics.as_ref()).await.unwrap();
+        assert_eq!(state.total_pending(), 1);
+        assert!(!state.by_route[&2].by_message.contains_key(&first));
     }
 
     #[test]
@@ -1499,44 +1576,6 @@ mod tests {
 
     /// Seed a slot with `signers` already accepted (bypassing ecrecover) so we can exercise
     /// `apply_attestor_set`'s re-evaluation directly.
-    #[test]
-    fn oldest_unfinished_blocks_skips_delivered_and_terminal() {
-        let metrics = NoopMetrics::new();
-        let mut state = State::new(
-            vec![route_for(2, vec![])],
-            VoteCacheConfig {
-                ttl_seconds: 600,
-                max_messages: 100,
-            },
-        );
-        // No messages: no holdback.
-        assert_eq!(state.oldest_unfinished_blocks(), vec![(2, None)]);
-
-        let mk = |b: u8, height: u64| {
-            let mut m = indexed_for(2, B256::from([b; 32]));
-            m.block_height = height;
-            m
-        };
-        state.note_indexed(mk(1, 500), metrics.as_ref());
-        state.note_indexed(mk(2, 300), metrics.as_ref());
-        state.note_indexed(mk(3, 400), metrics.as_ref());
-        assert_eq!(state.oldest_unfinished_blocks(), vec![(2, Some(300))]);
-
-        // Delivered and terminal slots release their holdback.
-        let route = state.by_route.get_mut(&2).unwrap();
-        route
-            .by_message
-            .get_mut(&B256::from([2u8; 32]))
-            .unwrap()
-            .delivered = true;
-        route
-            .by_message
-            .get_mut(&B256::from([3u8; 32]))
-            .unwrap()
-            .terminal = true;
-        assert_eq!(state.oldest_unfinished_blocks(), vec![(2, Some(500))]);
-    }
-
     fn seed_slot(state: &mut State, chain_key: u64, hash: B256, signers: &[Address]) {
         let metrics = NoopMetrics::new();
         state.note_indexed(indexed_for(chain_key, hash), metrics.as_ref());

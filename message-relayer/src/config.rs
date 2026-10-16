@@ -80,12 +80,12 @@ pub struct Config {
     pub vote_cache: VoteCacheConfig,
     pub delivery: DeliveryConfig,
     pub routes: Vec<ChainRoute>,
-    /// Where to persist per-watcher block cursors so the relayer resumes from the last processed
-    /// block after a restart (never silently skips on-chain events emitted while it was down).
+    /// Where to persist per-watcher block cursors. Unfinished source messages are stored in the
+    /// sibling `<checkpoint_path>.messages` directory; keep both on persistent storage.
     /// `None` disables persistence (watchers start from the chain head).
     pub checkpoint_path: Option<PathBuf>,
-    /// Blocks to rewind persisted cursors on startup so in-flight work lost with the process
-    /// (pool votes, pending acks) is re-discovered. See [`DEFAULT_SCAN_LOOKBACK_BLOCKS`];
+    /// Blocks to rewind persisted cursors on startup (including memory-only pending acks).
+    /// Source delivery work is durable independently of this window. See [`DEFAULT_SCAN_LOOKBACK_BLOCKS`];
     /// 0 disables the rewind.
     pub scan_lookback_blocks: u64,
 }
