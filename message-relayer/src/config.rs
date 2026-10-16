@@ -211,7 +211,9 @@ pub struct AckConfig {
     /// Base URL of the proof-gen API server (e.g. `http://127.0.0.1:8080`). The submitter calls
     /// `GET {base}/api/v1/proof-by-tx/{chain_key}/{tx_hash}`.
     pub proof_gen_url: String,
-    /// `AcknowledgmentValidator` contract on the Creditcoin (source) chain — the submit target.
+    /// Primary `AcknowledgmentValidator` address used as an Outbox discovery hint. Settlement resolves the actual target
+    /// from each message's original Outbox so rotations and multiple active Outboxes are safe.
+    /// Retained for config compatibility; this address is not an acknowledgment routing override.
     pub validator_address: Address,
     /// EVM key used to sign `submitAcknowledgment` txs on the Creditcoin chain. Submission is
     /// permissionless (the proof is self-validating), so this only needs gas, not authority.

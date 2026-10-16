@@ -62,6 +62,9 @@ sol! {
         /// widens it to `bytes32`.
         function getMessage(bytes32 messageId) external view returns (OutboxMessage memory);
 
+        /// Current acknowledgment authority for this Outbox, independent of discovery defaults.
+        function validator() external view returns (address);
+
         /// Reverts bubbled up through `AcknowledgmentValidator.submitAcknowledgment` when it calls
         /// `acknowledgeMessage` here. All three are permanent for a given delivery tx — the ack
         /// submitter classifies them as terminal (see `message-relayer/src/ack`).
@@ -125,6 +128,10 @@ sol! {
     #[sol(rpc)]
     #[derive(Debug)]
     contract IInbox {
+        /// Includes constructor additions and later removals. Settlement retains every address
+        /// ever supported, because execution retries can complete after an Outbox is retired.
+        event SupportedOutboxSet(address indexed outbox, bool supported);
+        function supportedOutboxes() external view returns (address[] memory);
         /// Submit an aggregated set of attestor votes that prove `messageId` was finalized
         /// on Creditcoin. Calldata is byte-identical to what attestors signed.
         /// Post asc-contracts #45 the Inbox takes the source `outbox` (second argument, must be
@@ -329,6 +336,8 @@ sol! {
     #[sol(rpc)]
     #[derive(Debug)]
     contract IAcknowledgmentValidator {
+        function outbox() external view returns (address);
+        function destinationChainKey() external view returns (uint64);
         /// Trust-minimized acknowledgment entrypoint on the *source* (Creditcoin) chain. The relayer
         /// proves — via the chain's native USC proving (block-prover precompile: merkle inclusion +
         /// continuity) — that a `MessageExecuted` event was emitted in a finalized block on the

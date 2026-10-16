@@ -300,14 +300,12 @@ impl Server {
             );
         }
         for route in self.config.routes.iter().filter(|r| r.ack.is_some()) {
-            let resolver = resolvers[&route.chain_key].clone();
             spawn_worker(
                 &mut tasks,
                 format!("ack submitter (chain_key {})", route.chain_key),
                 ack::run(
                     route.clone(),
                     self.config.creditcoin_eth_rpc_url.clone(),
-                    resolver,
                     checkpoint.clone(),
                     self.config.scan_lookback_blocks,
                     metrics.clone(),

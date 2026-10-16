@@ -74,6 +74,10 @@ pub struct CheckpointStore {
 }
 
 impl CheckpointStore {
+    /// Location used to keep independently persisted watcher metadata alongside its cursors.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
     /// Load the store from `path`.
     ///
     /// A **missing** file is a legitimately empty store — first boot, nothing recorded yet.
@@ -212,7 +216,7 @@ impl CursorHoldback {
 }
 
 /// Write `bytes` to `path` durably: sibling temp file, fsync, rename, fsync the directory.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)

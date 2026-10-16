@@ -194,6 +194,7 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
         &IOutbox::getMessageCall::SELECTOR,
     );
     outbox.assert_output_tuple("getMessage", "(address,uint64,uint64,bool,bool,bytes32)");
+    outbox.assert_mirrored("function", "validator()", &IOutbox::validatorCall::SELECTOR);
     outbox.assert_mirrored(
         "error",
         "MessageCannotBeAcknowledged(bytes32)",
@@ -212,6 +213,16 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
 
     // --- Inbox (destination chain) ---
     let inbox = Artifact::load(&contracts, "Inbox.sol/Inbox.json");
+    inbox.assert_mirrored(
+        "function",
+        "supportedOutboxes()",
+        &IInbox::supportedOutboxesCall::SELECTOR,
+    );
+    inbox.assert_mirrored(
+        "event",
+        IInbox::SupportedOutboxSet::SIGNATURE,
+        &IInbox::SupportedOutboxSet::SIGNATURE_HASH.0,
+    );
     inbox.assert_mirrored(
         "function",
         "deliverMessage(bytes32,address,address,uint64,bytes,bytes)",
@@ -367,6 +378,18 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
         &contracts,
         "AcknowledgementValidator.sol/AcknowledgmentValidator.json",
     );
+    ackv.assert_mirrored(
+        "function",
+        "outbox()",
+        &IAcknowledgmentValidator::outboxCall::SELECTOR,
+    );
+    ackv.assert_mirrored(
+        "function",
+        "destinationChainKey()",
+        &IAcknowledgmentValidator::destinationChainKeyCall::SELECTOR,
+    );
+    ackv.assert_output_tuple("outbox", "address");
+    ackv.assert_output_tuple("destinationChainKey", "uint64");
     ackv.assert_mirrored(
         "function",
         "submitAcknowledgment(uint64,(uint8,bytes32,bytes),(bytes32,bytes32[]))",

@@ -58,7 +58,7 @@ impl NotReadyPolicy {
 }
 
 /// One tracked tx awaiting proof + submission.
-struct PendingTx {
+struct PendingTx<M> {
     /// When the tx was first observed — drives cap eviction and the caller's max-age cutoff.
     first_seen: Instant,
     /// Block the tx was discovered in. Anchors the checkpoint holdback: the persisted discovery
@@ -72,20 +72,20 @@ struct PendingTx {
     next_attempt_at: Instant,
     /// Transient submit failures so far (not-ready deferrals do not count).
     transient_attempts: u32,
-    /// Submitter-specific 32-byte metadata decoded from the tx's logs at discovery time
-    /// (ack: delivered messageIds; claim: `claimed`-mapping keys). Drives cheap pre-checks
+    /// Submitter-specific metadata decoded from the tx's logs at discovery time
+    /// (ack: messageIds and execution status; claim: `claimed`-mapping keys). Drives pre-checks
     /// before any proof is fetched.
-    meta: Vec<B256>,
+    meta: Vec<M>,
 }
 
 /// Tx hashes awaiting submission, bounded by `cap`. Retried oldest-first; on overflow the oldest
 /// entry is evicted (a tx we give up on) so the queue cannot grow without limit.
-pub struct PendingTxs {
-    seen: HashMap<B256, PendingTx>,
+pub struct PendingTxs<M = B256> {
+    seen: HashMap<B256, PendingTx<M>>,
     cap: usize,
 }
 
-impl PendingTxs {
+impl<M: Clone + PartialEq> PendingTxs<M> {
     pub fn new(cap: usize) -> Self {
         Self {
             seen: HashMap::new(),
@@ -108,6 +108,11 @@ impl PendingTxs {
 
     pub fn is_empty(&self) -> bool {
         self.seen.is_empty()
+    }
+
+    /// Callers that require lossless discovery must stop scanning before inserting at capacity.
+    pub fn is_full(&self) -> bool {
+        self.seen.len() >= self.cap
     }
 
     pub fn remove(&mut self, tx: &B256) {
@@ -133,7 +138,7 @@ impl PendingTxs {
     /// Track a newly-observed tx (no-op if already tracked). `block` is the chain height the tx was
     /// discovered at (see [`Self::oldest_pending_block`]). Returns the tx hash evicted to honour
     /// the cap, if any — the caller logs it as a tracked tx being abandoned.
-    pub fn insert(&mut self, tx: B256, now: Instant, block: u64, meta: Vec<B256>) -> Option<B256> {
+    pub fn insert(&mut self, tx: B256, now: Instant, block: u64, meta: Vec<M>) -> Option<B256> {
         if self.seen.contains_key(&tx) {
             return None;
         }
@@ -158,7 +163,7 @@ impl PendingTxs {
 
     /// Append another metadata entry to an already-tracked tx (a tx may emit several relevant
     /// logs, discovered across scans).
-    pub fn note_meta(&mut self, tx: &B256, item: B256) {
+    pub fn note_meta(&mut self, tx: &B256, item: M) {
         if let Some(entry) = self.seen.get_mut(tx) {
             if !entry.meta.contains(&item) {
                 entry.meta.push(item);
@@ -167,8 +172,8 @@ impl PendingTxs {
     }
 
     /// The oldest `n` tx hashes whose next attempt is due, oldest-first, with their metadata.
-    pub fn ready(&self, n: usize, now: Instant) -> Vec<(B256, Vec<B256>)> {
-        let mut entries: Vec<(B256, Instant, Vec<B256>)> = self
+    pub fn ready(&self, n: usize, now: Instant) -> Vec<(B256, Vec<M>)> {
+        let mut entries: Vec<(B256, Instant, Vec<M>)> = self
             .seen
             .iter()
             .filter(|(_, e)| e.next_attempt_at <= now)
@@ -253,7 +258,7 @@ mod tests {
 
     #[test]
     fn pending_dedupes_and_reports_no_eviction_under_cap() {
-        let mut p = PendingTxs::new(4);
+        let mut p = PendingTxs::<B256>::new(4);
         let now = Instant::now();
         assert!(p.insert(tx(1), now, 10, vec![tx(9)]).is_none());
         assert!(p.contains(&tx(1)));
@@ -270,7 +275,7 @@ mod tests {
 
     #[test]
     fn pending_evicts_oldest_on_overflow() {
-        let mut p = PendingTxs::new(2);
+        let mut p = PendingTxs::<B256>::new(2);
         let t0 = Instant::now();
         // Distinct, increasing timestamps so "oldest" is unambiguous.
         assert!(p.insert(tx(1), t0, 10, Vec::new()).is_none());
@@ -287,7 +292,7 @@ mod tests {
 
     #[test]
     fn pending_ready_is_fifo_and_bounded_by_n() {
-        let mut p = PendingTxs::new(100);
+        let mut p = PendingTxs::<B256>::new(100);
         let t0 = Instant::now();
         for i in 0..5u8 {
             p.insert(
@@ -305,7 +310,7 @@ mod tests {
 
     #[test]
     fn pending_defer_and_backoff_gate_readiness() {
-        let mut p = PendingTxs::new(10);
+        let mut p = PendingTxs::<B256>::new(10);
         let t0 = Instant::now();
         p.insert(tx(1), t0, 10, Vec::new());
         assert_eq!(ready_txs(&p, 10, t0), vec![tx(1)]);
@@ -412,7 +417,7 @@ mod tests {
 
     #[test]
     fn oldest_pending_block_tracks_min_and_releases() {
-        let mut p = PendingTxs::new(10);
+        let mut p = PendingTxs::<B256>::new(10);
         let t0 = Instant::now();
         assert_eq!(p.oldest_pending_block(), None);
         p.insert(tx(1), t0, 500, Vec::new());
