@@ -4,6 +4,7 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use alloy::primitives::{keccak256, Address, B256, U256};
 use alloy::providers::Provider;
@@ -17,6 +18,7 @@ use crate::abi::{IAcknowledgmentValidator, IInbox, IOutbox, OutboxMessage};
 /// One bounded log range in each direction per tick. Backfill starts at the confirmed head and
 /// works all the way to genesis; forward scanning keeps up with newly authorized Outboxes.
 const HISTORY_SCAN_BLOCKS: u64 = 2_000;
+const HINT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct History {
@@ -30,6 +32,8 @@ struct History {
 pub(super) struct RouteHistory {
     path: Option<PathBuf>,
     state: History,
+    inbox_seeded: bool,
+    validator_seeded: bool,
 }
 
 impl RouteHistory {
@@ -64,7 +68,12 @@ impl RouteHistory {
             },
             Err(err) => return Err(err).context("reading settlement route history"),
         };
-        Ok(Self { path, state })
+        Ok(Self {
+            path,
+            state,
+            inbox_seeded: false,
+            validator_seeded: false,
+        })
     }
 
     pub(super) fn outboxes(&self) -> &BTreeSet<Address> {
@@ -74,14 +83,19 @@ impl RouteHistory {
     /// Seed current support as a fast path while full history catches up. These hints never
     /// advance historical coverage, and every message still has to match its committed Outbox.
     pub(super) async fn seed<P: Provider>(&mut self, provider: &P) -> Result<()> {
-        let supported = IInbox::new(self.state.inbox, provider)
-            .supportedOutboxes()
-            .call()
+        if self.inbox_seeded {
+            return Ok(());
+        }
+        let binding = IInbox::new(self.state.inbox, provider);
+        let supported = tokio::time::timeout(HINT_READ_TIMEOUT, binding.supportedOutboxes().call())
             .await
+            .context("current Inbox Outbox hint timed out")?
             .context("reading current Inbox Outboxes")?;
         let mut next = self.state.clone();
         next.outboxes.extend(supported);
-        self.commit(next).await
+        self.commit(next).await?;
+        self.inbox_seeded = true;
+        Ok(())
     }
 
     pub(super) async fn seed_validator<P: Provider>(
@@ -89,16 +103,20 @@ impl RouteHistory {
         provider: &P,
         authority: Address,
     ) -> Result<()> {
-        let outbox = IAcknowledgmentValidator::new(authority, provider)
-            .outbox()
-            .call()
+        if self.validator_seeded {
+            return Ok(());
+        }
+        let binding = IAcknowledgmentValidator::new(authority, provider);
+        let outbox = tokio::time::timeout(HINT_READ_TIMEOUT, binding.outbox().call())
             .await
+            .context("configured validator Outbox hint timed out")?
             .context("reading configured validator's Outbox hint")?;
         if outbox != Address::ZERO {
             let mut next = self.state.clone();
             next.outboxes.insert(outbox);
             self.commit(next).await?;
         }
+        self.validator_seeded = true;
         Ok(())
     }
 
@@ -756,6 +774,53 @@ mod tests {
         block.header.hash = B256::repeat_byte(2);
         block.transactions = alloy::rpc::types::BlockTransactions::Hashes(transactions);
         block
+    }
+
+    #[tokio::test]
+    async fn failed_hints_retry_independently_until_persisted_then_stop() {
+        let rpc = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(rpc.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routes.json");
+        let mut history = RouteHistory::load(Some(path.clone()), address(9), SOURCE).unwrap();
+        rpc.push_failure_msg("Inbox RPC temporarily down");
+        rpc.push_failure_msg("validator RPC temporarily down");
+        assert!(history.seed(&provider).await.is_err());
+        assert!(history
+            .seed_validator(&provider, address(10))
+            .await
+            .is_err());
+        rpc.push_success(&Bytes::from(vec![address(1)].abi_encode()));
+        history.seed(&provider).await.unwrap();
+        rpc.push_failure_msg("validator still down");
+        assert!(history
+            .seed_validator(&provider, address(10))
+            .await
+            .is_err());
+        assert!(
+            history.outboxes().contains(&address(1)),
+            "one hint failure must not block the other"
+        );
+        rpc.push_success(&Bytes::from(address(2).abi_encode()));
+        history
+            .seed_validator(&provider, address(10))
+            .await
+            .unwrap();
+        // An empty mock queue makes any accidental post-success request fail.
+        history.seed(&provider).await.unwrap();
+        history
+            .seed_validator(&provider, address(10))
+            .await
+            .unwrap();
+        let restarted = RouteHistory::load(Some(path), address(9), SOURCE).unwrap();
+        assert_eq!(
+            restarted.outboxes(),
+            &BTreeSet::from([address(1), address(2)])
+        );
+        assert!(
+            restarted.state.scanned.is_none(),
+            "hints must not skip historical coverage"
+        );
     }
 
     #[tokio::test]

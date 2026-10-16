@@ -339,9 +339,17 @@ pub async fn run(
                     continue;
                 }
                 let mut rate_limited = false;
+                // Retry failed startup hints independently. A successful hint becomes a no-op;
+                // a broken configured validator never prevents Inbox/history discovery.
+                if let Err(err) = route_history.seed_validator(&source_provider, ack.validator_address).await {
+                    debug!(chain_key, %err, "configured validator Outbox hint still unavailable; retrying later");
+                }
                 let scan = match dest_rpc.connect().await {
                     Ok(provider) => {
                         let provider = provider.clone();
+                        if let Err(err) = route_history.seed(&provider).await {
+                            debug!(chain_key, %err, "current Inbox Outbox hints still unavailable; retrying later");
+                        }
                         if let Err(err) = route_history.refresh(&provider, ack.confirmation_depth).await {
                             warn!(chain_key, %err, "settlement support history incomplete; unknown routes remain retryable");
                         }
