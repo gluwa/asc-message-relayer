@@ -228,14 +228,8 @@ impl Server {
             ),
         );
 
-        // One resolver per route, shared between its Outbox watcher and ack submitter below — both
-        // need to agree on the same live Outbox address. Every route uses the same
-        // `DiscoveryResolver`: it reads the discovery-registry address off the chain-info
-        // precompile and calls `defaultOutbox` on it, no fallback — a chain key with nothing
-        // registered in `OutboxDiscovery` fails closed instead of resolving from any spoofable
-        // source. `route.outbox_address` is the one operator-pinned exception (see
-        // `DiscoveryResolver::override_address`); flagged here at startup as well as on every
-        // resolve (`DiscoveryResolver::resolve`) since it bypasses that fail-closed default.
+        // Settlement's default resolver is independent from source discovery, which authenticates
+        // every candidate emitter at its publication block. Overrides remain explicit per route.
         let resolvers: HashMap<u64, Arc<dyn OutboxResolver>> = self
             .config
             .routes
@@ -258,7 +252,6 @@ impl Server {
 
         // Outbox watchers (per route).
         for route in &self.config.routes {
-            let resolver = resolvers[&route.chain_key].clone();
             spawn_worker(
                 &mut tasks,
                 format!("outbox watcher (chain_key {})", route.chain_key),
@@ -267,7 +260,6 @@ impl Server {
                     self.config.creditcoin_eth_rpc_url.clone(),
                     indexed_tx.clone(),
                     metrics.clone(),
-                    resolver,
                     checkpoint.clone(),
                     self.config.scan_lookback_blocks,
                     health.clone(),

@@ -112,13 +112,11 @@ pub struct ChainRoute {
     /// submits `claimDelivery` for each delivered message. `None` falls back to gas estimation
     /// (fee not claimable).
     pub relayer_contract_address: Option<Address>,
-    /// Reorg guard in blocks. For the Creditcoin **Outbox scan** this is only the *fallback*
-    /// boundary: the watcher scans up to the finalized head (Creditcoin has deterministic
-    /// finality, and that is where the attestors sign) and uses `tip - depth` only when the
-    /// `finalized` tag is unavailable or finality has stalled (`events::finality`). The Outbox
-    /// factory scan and the destination-side workers still use it as a plain depth.
+    /// Reorg guard for destination settlement workers. Source publication discovery always
+    /// requires Creditcoin's finalized head; RPC failure or stalled finality pauses the scan.
     pub block_confirmation_depth: u64,
-    /// First block to scan on first run when no persisted checkpoint exists.
+    /// First source block to scan when no checkpoint exists for the current scan scope. Defaults
+    /// to block 1, including migration from legacy single-Outbox checkpoints.
     pub start_block: Option<u64>,
     pub attestor_set: AttestorSet,
     pub threshold_override: Option<u32>,

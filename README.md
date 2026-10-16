@@ -153,23 +153,28 @@ retry silently forever:
   discovery time against whichever Outbox is currently resolved (next bullet), so it is immune to
   a later Outbox rotation retroactively changing which contract an already-queued message is
   checked against.
-- **Outbox resolution follows rotation** — every route resolves its Outbox from the chain key
-  alone: a chain-info precompile lookup for the `OutboxDiscovery` registry address, then
-  `defaultOutbox(chainKey)` on that registry (asc-contracts#38) — no operator-supplied address, no
-  factory log scan. Re-checked periodically, so a registry-level rotation (`setDefaultOutbox`) is
-  picked up without a restart. New discovery moves to the new address; already-indexed/pending
-  work is unaffected. A chain key with no discovery address registered fails closed.
+- **All historically authorized Outboxes** — source scans query every `MessagePublished` emitter,
+  then read the governance-selected Discovery and `isActiveOutbox(chainKey, emitter)` at that
+  message's finalized source block. Default changes, scheduled removal, cancellation,
+  re-registration and Discovery replacement do not reset the cursor or discard valid history.
+  The effective removal block is excluded, matching the attestor's block-end policy. Historical
+  `eth_call` support is required: missing state, RPC failures and malformed authorized events
+  stop progress for retry. Unregistered spoof emitters are ignored before decoding their data.
+  A result-limit error shrinks the log range; one dense block falls back to checked receipts.
+  Production source scans pause if finalized state is unavailable, regresses or stalls.
+- **Source checkpoint migration** — a new `outboxes:<chain-key>` checkpoint covers the complete
+  source scope. Legacy `outbox:<chain-key>` cursors only covered one default and cannot establish
+  this coverage, so upgrade replays from `start_block` or block 1 when no floor is configured.
+  An explicit `outbox_address` override bypasses Discovery and gets its own address-scoped key;
+  changing or clearing that override cannot reuse its partial cursor as complete history.
 - **Checkpoints + startup lookback** — block cursors persist to `--checkpoint-path` so restarts
   never skip events. Because votes and pending acks are memory-only, cursors are rewound by
   `scan_lookback_blocks` (default 600) on startup: in-flight work is re-discovered, and
   already-finished work resolves idempotently (delivered → `Already validated` at simulate,
-  acked → skipped by the pre-check). The Outbox watcher's checkpoint additionally records which
-  Outbox address it was scanned against, so a restart can tell a valid long-running cursor apart
-  from one left over from a since-rotated-away Outbox. Outbox resolution itself persists nothing —
-  a registry read is complete and authoritative on every call, so there is no scan cursor to
-  resume.
+  acked → skipped by the pre-check). Source scan cursors cover all Outboxes independently of
+  current defaults; settlement retains its own cursors.
 - **Bounded everything** — vote cache (TTL + LRU cap), pending-ack queue (cap 10 000, oldest
-  evicted), per-tick ack batch (256) and concurrency (8), 5 000-block `eth_getLogs` chunks (an
+  evicted), per-tick ack batch (256) and concurrency (8), 2 000-block `eth_getLogs` chunks (an
   over-large resume range would error on every tick forever on range-capped RPCs), 120 s receipt
   timeouts (one stuck underpriced tx cannot wedge a route's serial worker).
 
@@ -218,8 +223,8 @@ Per-route envelope policy (asc-contracts #36), YAML key = flag = env:
 needs `relayer_contract_address` and an ack or claim signer). The caps are logged at startup.
 `--verbose` switches `info` → `debug` logging. A few poll cadences are env-only (no CLI flag,
 sensible defaults): `RELAYER_ACK_POLL_SECS`, `RELAYER_CLAIM_POLL_SECS`,
-`RELAYER_OUTBOX_RESOLVE_POLL_SECS` (how often a route re-checks the discovery registry for an
-Outbox rotation, default 60 s).
+`RELAYER_OUTBOX_RESOLVE_POLL_SECS` (how often settlement re-checks the discovery registry for
+its default Outbox, default 60 s).
 
 ## HTTP API
 
@@ -312,25 +317,13 @@ Dockerfile               two-stage image build
   `CcBridge.claim`; when the reviewed `IUSCBridgeInbound.bridgeFromIntent` contracts deploy, the
   swap is an ABI + config change confined to `src/claim/` (identical proof arguments).
 - **Outbox resolution depends on an unmerged creditcoin3 branch** — the
-  `get_outbox_discovery_address` chain-info precompile getter `DiscoveryResolver` calls only exists
+  `get_outbox_discovery_address` chain-info precompile getter only exists
   on creditcoin3's `asc-dev` (the write-ability trunk, formerly `writeability-off-usc-dev`), not yet on `main`/`dev` (formerly `usc-dev`). **A route on a network without the
   precompile, or whose chain key has no discovery address registered via
-  `set_outbox_discovery_addr`, cannot resolve an Outbox at all** and fails closed by default.
+  `set_outbox_discovery_addr`, cannot authorize source publications** and fails closed by default.
   Confirm both are in place — precompile deployed, discovery address registered and pointing at
   the `OutboxDiscovery` proxy from asc-contracts#38 — before pointing this relayer at a network.
   `outbox_address` (route config / `--outbox-address`) is an operator-pinned escape hatch for
   exactly that gap or an incident — see `events/factory.rs`'s module docs — but it bypasses the
   registry entirely, so treat it as temporary and logged (WARN) loudly while set, not a substitute
   for registering the chain key properly.
-- **A restart during a live Outbox rotation can permanently skip early messages on the new
-  Outbox** — `OutboxDiscovery.defaultOutbox` is a bare address with no history, so
-  `DiscoveryResolver` cannot report when it actually started serving. On a normal (running)
-  rotation this is mostly harmless (the scan cursor carries over unchanged); the sharp edge is a
-  restart that lands after governance rotated to a new Outbox but before a fresh checkpoint for
-  it exists — resolution then falls back to `start_block` or the chain head, and any
-  `MessagePublished` already emitted on the new Outbox below that point is dropped with no
-  recovery path (reobservation recovers missing votes, not messages never discovered at all).
-  Deliberately not patched as a standalone fix — the planned per-Outbox multi-watch work
-  (`activeOutboxes` + `OutboxRegistered`, tracked as the next piece after this PR) determines each
-  listener's start block from that same event as part of its own design. See `events/factory.rs`'s
-  module docs.
