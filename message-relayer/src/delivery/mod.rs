@@ -7,9 +7,10 @@
 //!     `max_native_coin_value_wei`, or whose attested `gasLimit` exceeds `max_gas_limit`
 //!     (asc-contracts #36 — the router only rejects `gasLimit == 0`, so an oversized one would be
 //!     retried forever). Both are terminal with their own metric label.
-//!  2. (Optional) `eth_call` simulate to catch `validateVotes` reverts before paying gas.
-//!     Simulation distinguishes reverts (terminal / already-validated) from transport failures
-//!     (returned to the pool's bounded retry) — a mere RPC blip must not drop a message.
+//!  2. Optionally simulate early, then always preflight the exact gas limit before broadcasting.
+//!     Permanent envelope failures are terminal; pauses, quorum changes and other mutable-state
+//!     reverts stay retryable. Already-validated messages are reconciled against confirmed Inbox
+//!     execution state, since acceptance alone does not establish successful execution.
 //!  3. Send the transaction, watching for receipt (bounded by [`RECEIPT_TIMEOUT`] so a stuck
 //!     underpriced tx cannot wedge the route's serial worker).
 //!  4. Classify the outcome from the receipt logs. `MessageQueued`/`MessageDeferred` and

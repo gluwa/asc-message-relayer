@@ -1,23 +1,19 @@
 //! Persistent per-watcher block cursors.
 //!
-//! Both the Outbox watcher (source chain `MessagePublished`) and the acknowledgment watcher
-//! (destination chain `MessageReceived`) scan chain logs by block range. Without persistence they
-//! start from the chain head on every boot, so any event emitted while the relayer was down is
-//! silently skipped. This store records the last block each watcher has fully processed and is
-//! consulted on startup, so a restart resumes from `last_processed + 1` instead of the head — the
-//! relayer never misses an on-chain event, even across downtime.
+//! Source and settlement watchers scan chain logs by block range. Source scans resume only
+//! cursors backed by the durable unfinished-work journal; otherwise they replay from the
+//! configured start block or genesis. Ack scans rewind their saved cursor by the lookback and
+//! hold it behind pending settlements, so even long-delayed work is rediscovered after restart.
+//! Without an ack checkpoint, the route's configured start block applies, or the current head.
 //!
-//! Storage is a single JSON file written atomically (temp file + rename) so a crash mid-write
-//! cannot corrupt it. Reprocessing the tail of a range after an unclean shutdown is safe:
-//! delivery is idempotent (`MessageAlreadyValidated`) and acks are deduped + idempotent
-//! (`MessageAlreadyAcknowledged`), so the cursor gives at-least-once, never at-most-once.
+//! Storage is a single JSON file written atomically (temp file + rename + directory sync).
+//! Reprocessing after a crash is safe because delivery and settlement reconcile on-chain state.
+//! A source cursor advances only after its discovered work is durably recorded.
 //!
-//! Each entry is `{ "block": 1234, "outbox": "0x..." }` — `outbox` records which Outbox address
-//! that block cursor was scanned against (Outbox watcher keys only; a bare block number can't
-//! tell a valid checkpoint apart from one left over from a since-rotated-away Outbox, see
-//! `events::watch_outbox`'s resume logic). Checkpoint files written before this field existed
-//! store a bare number per key instead; both shapes deserialize, and any touched key is rewritten
-//! in the current shape on its next save.
+//! Entries contain `block`, optional `outbox` metadata for a pinned source, and `durable_work`
+//! marking source cursors backed by the unfinished-work journal. Source checkpoint keys separate
+//! all-Outbox scans from pinned-address scans. Older bare-number entries and objects without the
+//! journal marker still deserialize, but source discovery safely replays their history.
 //!
 //! Note: this covers durable *on-chain* events. Attestor votes travel over gossip (ephemeral) and
 //! are out of scope here — a relayer that was down while votes were gossiped relies on the votes
@@ -30,8 +26,7 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// One watcher's persisted state: the last fully-processed block, and (for the Outbox watcher
-/// only) which Outbox address it was scanned against.
+/// One watcher's cursor, optional pinned Outbox, and source journal coverage marker.
 #[derive(Debug, Clone, Default, Serialize)]
 struct Entry {
     block: u64,
@@ -79,7 +74,7 @@ impl From<RawEntry> for Entry {
 }
 
 /// A JSON-file-backed map of `watcher key -> last fully-processed block` (+ optional Outbox
-/// address per key — see the module docs).
+/// address and source journal marker per key — see the module docs).
 #[derive(Debug)]
 pub struct CheckpointStore {
     path: PathBuf,

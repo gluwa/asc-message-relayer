@@ -37,7 +37,6 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 # Workspace dependencies
 alloy = { workspace = true, features = ["full"] }
 anyhow = { workspace = true }
-async-trait = { workspace = true }
 axum = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
@@ -86,7 +85,6 @@ integration-tests = []
 
 [dev-dependencies]
 alloy-node-bindings = "2.1"
-async-trait = { workspace = true }
 parameterized = "2.1.0"
 tempfile = { workspace = true }
 # `test-util` only: lets the broadcast-lock tests assert their timeout bounds under
