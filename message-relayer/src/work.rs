@@ -17,7 +17,36 @@ pub struct WorkStore {
     path: PathBuf,
     /// A bounded cursor per configured route; reopening from the first filename on every read
     /// would repeatedly reload the same stalled messages and starve the rest of the backlog.
-    readers: Arc<Mutex<HashMap<u64, std::fs::ReadDir>>>,
+    readers: Arc<Mutex<HashMap<u64, RouteCursor>>>,
+}
+
+#[derive(Debug)]
+struct RouteCursor {
+    reader: Option<std::fs::ReadDir>,
+    live_records: usize,
+    remaining: usize,
+}
+
+impl RouteCursor {
+    fn new(route: &Path) -> std::io::Result<Self> {
+        // Count once, under the same lock as every writer. Memory is constant and new writes
+        // cannot extend this initialization scan. Later generations use the maintained count.
+        let mut live_records = 0;
+        for entry in std::fs::read_dir(route)? {
+            if is_record(&entry?.path()) {
+                live_records += 1;
+            }
+        }
+        Ok(Self {
+            reader: None,
+            live_records,
+            remaining: 0,
+        })
+    }
+}
+
+fn is_record(path: &Path) -> bool {
+    path.extension().and_then(|s| s.to_str()) == Some("json")
 }
 
 impl WorkStore {
@@ -54,11 +83,21 @@ impl WorkStore {
     /// Commit the original source event before handing it to an in-memory worker.
     pub async fn record(&self, message: IndexedMessage) -> Result<()> {
         let route = self.path.join(message.chain_key.to_string());
+        let readers = self.readers.clone();
         tokio::task::spawn_blocking(move || {
+            let mut readers = readers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("work cursor poisoned"))?;
             create_dir_durable(&route)?;
             let path = route.join(format!("{}.json", message.message_id));
+            let existed = path.try_exists().context("checking pending message")?;
             let bytes = serde_json::to_vec(&message).context("serializing pending message")?;
             crate::checkpoint::write_atomic(&path, &bytes)?;
+            if !existed {
+                if let Some(cursor) = readers.get_mut(&message.chain_key) {
+                    cursor.live_records += 1;
+                }
+            }
             // Unlike a cursor, losing a newly created record can lose delivery work. Its rename
             // and every newly created parent directory must be durable before the cursor moves.
             sync_directory(&route)
@@ -86,34 +125,50 @@ impl WorkStore {
             let mut readers = readers
                 .lock()
                 .map_err(|_| anyhow::anyhow!("work cursor poisoned"))?;
-            let mut wrapped = false;
-            // Bound directory IO even if a route has millions of records or temporary files.
-            // The next call resumes this iterator; memory stays bounded by the working-set limit.
-            for _ in 0..4096 {
-                if let std::collections::hash_map::Entry::Vacant(entry) = readers.entry(chain_key) {
-                    match std::fs::read_dir(&route) {
-                        Ok(entries) => {
-                            entry.insert(entries);
-                        }
+            let cursor = match readers.entry(chain_key) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    match RouteCursor::new(&route) {
+                        Ok(cursor) => entry.insert(cursor),
                         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                             return Ok(messages)
                         }
-                        Err(err) => return Err(err).context("reading pending-message directory"),
+                        Err(err) => return Err(err).context("initializing pending-message cursor"),
                     }
                 }
-                let Some(entry) = readers.get_mut(&chain_key).expect("reader inserted").next()
-                else {
-                    readers.remove(&chain_key);
+            };
+            let mut wrapped = false;
+            // After the one-time population count, bound each refill's directory IO even if a
+            // route has millions of records or temporary files.
+            // Each generation has a finite population budget: arrivals cannot indefinitely
+            // extend the iterator and prevent parked execution from being visited again.
+            for _ in 0..4096 {
+                if cursor.reader.is_none() {
+                    if cursor.live_records == 0 {
+                        break;
+                    }
+                    cursor.reader = Some(
+                        std::fs::read_dir(&route).context("reading pending-message directory")?,
+                    );
+                    cursor.remaining = cursor.live_records;
+                }
+                if cursor.remaining == 0 {
+                    cursor.reader = None;
                     if wrapped {
                         break;
                     }
                     wrapped = true;
                     continue;
+                }
+                let Some(entry) = cursor.reader.as_mut().expect("reader inserted").next() else {
+                    cursor.remaining = 0;
+                    continue;
                 };
                 let path = entry?.path();
-                if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                if !is_record(&path) {
                     continue; // Ignore an interrupted atomic write's temporary file.
                 }
+                cursor.remaining -= 1;
                 let id: B256 = path
                     .file_stem()
                     .and_then(|s| s.to_str())
@@ -151,9 +206,18 @@ impl WorkStore {
     /// successful bookkeeping and silently forget to retry it.
     pub async fn complete(&self, chain_key: u64, message_id: B256) -> Result<()> {
         let route = self.path.join(chain_key.to_string());
+        let readers = self.readers.clone();
         tokio::task::spawn_blocking(move || {
+            let mut readers = readers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("work cursor poisoned"))?;
             match std::fs::remove_file(route.join(format!("{message_id}.json"))) {
-                Ok(()) => sync_directory(&route),
+                Ok(()) => {
+                    if let Some(cursor) = readers.get_mut(&chain_key) {
+                        cursor.live_records = cursor.live_records.saturating_sub(1);
+                    }
+                    sync_directory(&route)
+                }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(err) => Err(err).context("removing completed message"),
             }
@@ -248,6 +312,78 @@ mod tests {
         assert_eq!(rest.len(), 3);
         assert_eq!(work.pending(3, HashSet::new(), 1).await.unwrap().len(), 1);
         assert_eq!(work.pending(2, HashSet::new(), 10).await.unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn scan_generations_revisit_parked_work_during_continuous_arrivals_and_completions() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = dir.path().join("cp");
+        let work = WorkStore::for_checkpoint(&checkpoint);
+        let indexed = |sequence: u64| {
+            let mut indexed = message(2, 0);
+            indexed.sequence = sequence;
+            indexed.message_id = B256::from(alloy::primitives::U256::from(sequence));
+            indexed
+        };
+        // Larger than a directory iterator's usual buffer, so arrivals can extend its listing.
+        for id in 1..=512 {
+            work.record(indexed(id)).await.unwrap();
+        }
+        // Reopening must initialize the population from disk, excluding interrupted writes.
+        std::fs::write(work.path.join("2/interrupted.tmp"), b"partial").unwrap();
+        let work = WorkStore::for_checkpoint(&checkpoint);
+        let first = work.pending(2, HashSet::new(), 32).await.unwrap();
+        let parked = first[0].clone();
+        let mut loaded = first.iter().map(|m| m.message_id).collect();
+        let mut visits: HashMap<B256, usize> = HashMap::new();
+        let original_remaining = work.readers.lock().unwrap()[&2].remaining;
+        for batch in 0..100 {
+            // Arrivals outpace both reads and completions throughout the test. An EOF-only
+            // cursor must not depend on catching up with this increasing population.
+            for offset in 0..48 {
+                work.record(indexed(513 + batch * 48 + offset))
+                    .await
+                    .unwrap();
+            }
+            // Parking a record is an overwrite, not a new entry or a reason to reset its scan.
+            work.record(parked.clone()).await.unwrap();
+            if batch == 0 {
+                let readers = work.readers.lock().unwrap();
+                assert_eq!(readers[&2].remaining, original_remaining);
+                assert_eq!(readers[&2].live_records, 512 + 48);
+            }
+            let next = work.pending(2, loaded, 32).await.unwrap();
+            loaded = next.iter().map(|m| m.message_id).collect();
+            let completed = next
+                .iter()
+                .find(|m| m.sequence > 512 && m.sequence != 1000)
+                .map(|m| m.message_id);
+            for indexed in next {
+                *visits.entry(indexed.message_id).or_default() += 1;
+            }
+            // Exercise removals without deleting the parked work or the late sentinel.
+            if let Some(completed) = completed.filter(|_| batch % 2 == 0) {
+                work.complete(2, completed).await.unwrap();
+            }
+        }
+        assert!(
+            visits[&parked.message_id] >= 2,
+            "parked execution was not revisited"
+        );
+        assert!(
+            visits.contains_key(&indexed(1000).message_id),
+            "late backlog was starved"
+        );
+        let remaining = std::fs::read_dir(work.path.join("2"))
+            .unwrap()
+            .filter(|entry| is_record(&entry.as_ref().unwrap().path()))
+            .count();
+        assert_eq!(work.readers.lock().unwrap()[&2].live_records, remaining);
+        assert!(work
+            .path
+            .join("2")
+            .join(format!("{}.json", parked.message_id))
+            .exists());
     }
 
     #[tokio::test]

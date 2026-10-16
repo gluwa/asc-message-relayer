@@ -357,10 +357,11 @@ pub async fn watch_outbox(
     }
 }
 
-/// A legacy cursor contains no reliable unfinished-work inventory. An explicit operator floor
-/// or the Outbox's creation block is safe; with neither, replay from the first scannable block.
+/// A legacy cursor contains no reliable unfinished-work inventory. Match first-run discovery:
+/// the Outbox's creation block takes precedence over the configured fallback start block.
+/// With neither, replay from the first scannable block.
 fn legacy_replay_cursor(start_block: Option<u64>, since_block: Option<u64>) -> u64 {
-    start_block.or(since_block).unwrap_or(0).saturating_sub(1)
+    since_block.or(start_block).unwrap_or(0).saturating_sub(1)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -532,7 +533,8 @@ mod tests {
         assert_eq!(legacy_replay_cursor(None, None), 0);
         assert_eq!(legacy_replay_cursor(Some(100), None), 99);
         assert_eq!(legacy_replay_cursor(None, Some(50)), 49);
-        assert_eq!(legacy_replay_cursor(Some(100), Some(50)), 99);
+        assert_eq!(legacy_replay_cursor(Some(100), Some(50)), 49);
+        assert_eq!(legacy_replay_cursor(Some(25), Some(50)), 49);
     }
 
     async fn scan_one_message(
