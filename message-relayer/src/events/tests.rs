@@ -437,6 +437,34 @@ async fn a_single_block_over_the_log_cap_uses_authenticated_receipts() {
 }
 
 #[tokio::test]
+async fn receipt_fallback_requires_a_nonempty_transaction_list() {
+    let mut block: alloy::rpc::types::Block = Default::default();
+    block.header.inner.number = 1;
+    block.header.hash = B256::repeat_byte(0xbb);
+    for transactions in [Some(json!([])), Some(Value::Null), None] {
+        let mut incomplete = serde_json::to_value(&block).unwrap();
+        if let Some(transactions) = transactions {
+            incomplete["transactions"] = transactions;
+        } else {
+            incomplete.as_object_mut().unwrap().remove("transactions");
+        }
+        let rpc = Asserter::new();
+        rpc.push_success(&U64::from(1));
+        rpc.push_failure_msg("too many logs");
+        rpc.push_success(&incomplete);
+        let provider = ProviderBuilder::new().connect_mocked_client(rpc);
+        let mut cursor = 0;
+        let (result, messages) = scan(&provider, source(None), &mut cursor).await;
+        assert!(
+            result.is_err(),
+            "incomplete fallback must preserve the cursor"
+        );
+        assert_eq!(cursor, 0);
+        assert!(messages.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn receipt_fallback_rejects_inconsistent_block_or_log_provenance() {
     let log = publication(Address::repeat_byte(1), 1, 1);
     for bad_receipt in [true, false] {

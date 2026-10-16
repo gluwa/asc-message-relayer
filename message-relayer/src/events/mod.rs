@@ -398,6 +398,12 @@ async fn message_logs_from_receipts<P: Provider>(
         block.header.number == number,
         "receipt fallback returned wrong block"
     );
+    // This path is reached only after the block's logs exceed the provider's result limit.
+    // An empty or header-only response cannot prove coverage and must not advance the cursor.
+    anyhow::ensure!(
+        !block.transactions.is_empty(),
+        "receipt fallback returned no transactions for a result-limited block"
+    );
     let mut logs = Vec::new();
     for hash in block.transactions.hashes() {
         let receipt = tokio::time::timeout(RPC_TIMEOUT, provider.get_transaction_receipt(hash))
