@@ -194,6 +194,7 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
         &IOutbox::getMessageCall::SELECTOR,
     );
     outbox.assert_output_tuple("getMessage", "(address,uint64,uint64,bool,bool,bytes32)");
+    outbox.assert_mirrored("function", "validator()", &IOutbox::validatorCall::SELECTOR);
     outbox.assert_mirrored(
         "error",
         "MessageCannotBeAcknowledged(bytes32)",
@@ -214,9 +215,20 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
     let inbox = Artifact::load(&contracts, "Inbox.sol/Inbox.json");
     inbox.assert_mirrored(
         "function",
+        "supportedOutboxes()",
+        &IInbox::supportedOutboxesCall::SELECTOR,
+    );
+    inbox.assert_mirrored(
+        "event",
+        IInbox::SupportedOutboxSet::SIGNATURE,
+        &IInbox::SupportedOutboxSet::SIGNATURE_HASH.0,
+    );
+    inbox.assert_mirrored(
+        "function",
         "deliverMessage(bytes32,address,address,uint64,bytes,bytes)",
         &IInbox::deliverMessageCall::SELECTOR,
     );
+    inbox.assert_output_tuple("deliverMessage", "bool");
     inbox.assert_mirrored(
         "function",
         "retryPendingMessage(bytes32)",
@@ -232,6 +244,11 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
         "function",
         "isPending(bytes32)",
         &IInbox::isPendingCall::SELECTOR,
+    );
+    inbox.assert_mirrored(
+        "function",
+        "processedAt(bytes32)",
+        &IInbox::processedAtCall::SELECTOR,
     );
     // #54: new view guarding retryFailedMessage against a guaranteed-revert call.
     inbox.assert_mirrored(
@@ -367,6 +384,18 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
         &contracts,
         "AcknowledgementValidator.sol/AcknowledgmentValidator.json",
     );
+    ackv.assert_mirrored(
+        "function",
+        "outbox()",
+        &IAcknowledgmentValidator::outboxCall::SELECTOR,
+    );
+    ackv.assert_mirrored(
+        "function",
+        "destinationChainKey()",
+        &IAcknowledgmentValidator::destinationChainKeyCall::SELECTOR,
+    );
+    ackv.assert_output_tuple("outbox", "address");
+    ackv.assert_output_tuple("destinationChainKey", "uint64");
     ackv.assert_mirrored(
         "function",
         "submitAcknowledgment(uint64,(uint8,bytes32,bytes),(bytes32,bytes32[]))",

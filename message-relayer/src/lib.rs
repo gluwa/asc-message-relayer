@@ -55,12 +55,13 @@ pub mod receipt;
 pub mod revert;
 pub mod rpc;
 pub mod set_update;
+pub mod work;
 
 pub use config::{
     AttestorSet, AttestorSource, ChainRoute, Config, DeliveryConfig, P2pConfig, VoteCacheConfig,
 };
 pub use delivery::DeliveryJob;
-pub use events::{DiscoveryResolver, IndexedMessage, OutboxResolver};
+pub use events::IndexedMessage;
 pub use p2p::MessageVote;
 pub use pool::{calculate_threshold, RouteAttestors};
 pub use prom::{Metrics, MetricsTrait, NoopMetrics, RelayerMetrics};
@@ -133,11 +134,6 @@ impl Server {
         // roles stop colliding. The two halves are only correct together; see `crate::broadcast`.
         let broadcast_locks = broadcast::BroadcastLocks::new();
 
-        // Outbox-cursor holdback: the pool reports its oldest unfinished message per route; the
-        // outbox watchers clamp their persisted checkpoints to it so restart-recovery always
-        // re-indexes undelivered messages (never lost to the lookback window).
-        let holdback = Arc::new(checkpoint::CursorHoldback::default());
-
         // Persistent block cursors (resume after restart instead of from the chain head). Disabled
         // when `checkpoint_path` is None.
         let checkpoint: Option<Arc<checkpoint::CheckpointStore>> =
@@ -157,6 +153,12 @@ impl Server {
                     None
                 }
             };
+
+        let work = self
+            .config
+            .checkpoint_path
+            .as_ref()
+            .map(|path| Arc::new(work::WorkStore::for_checkpoint(path)));
 
         // Resolve attestor sets up-front so the pool only sees concrete addresses.
         let mut route_attestors: Vec<RouteAttestors> = Vec::with_capacity(self.config.routes.len());
@@ -220,7 +222,7 @@ impl Server {
                     set_update_rx: set_rx,
                     reobs_tx,
                     query_rx,
-                    holdback: holdback.clone(),
+                    work: work.clone(),
                 },
                 metrics.clone(),
                 health.clone(),
@@ -228,37 +230,8 @@ impl Server {
             ),
         );
 
-        // One resolver per route, shared between its Outbox watcher and ack submitter below — both
-        // need to agree on the same live Outbox address. Every route uses the same
-        // `DiscoveryResolver`: it reads the discovery-registry address off the chain-info
-        // precompile and calls `defaultOutbox` on it, no fallback — a chain key with nothing
-        // registered in `OutboxDiscovery` fails closed instead of resolving from any spoofable
-        // source. `route.outbox_address` is the one operator-pinned exception (see
-        // `DiscoveryResolver::override_address`); flagged here at startup as well as on every
-        // resolve (`DiscoveryResolver::resolve`) since it bypasses that fail-closed default.
-        let resolvers: HashMap<u64, Arc<dyn OutboxResolver>> = self
-            .config
-            .routes
-            .iter()
-            .map(|route| {
-                if let Some(address) = route.outbox_address {
-                    tracing::warn!(
-                        chain_key = route.chain_key,
-                        %address,
-                        "⚠️ outbox_address is set for this route — Outbox resolution will bypass \
-                         the OutboxDiscovery registry entirely"
-                    );
-                }
-                let resolver: Arc<dyn OutboxResolver> = Arc::new(DiscoveryResolver {
-                    override_address: route.outbox_address,
-                });
-                (route.chain_key, resolver)
-            })
-            .collect();
-
         // Outbox watchers (per route).
         for route in &self.config.routes {
-            let resolver = resolvers[&route.chain_key].clone();
             spawn_worker(
                 &mut tasks,
                 format!("outbox watcher (chain_key {})", route.chain_key),
@@ -267,11 +240,10 @@ impl Server {
                     self.config.creditcoin_eth_rpc_url.clone(),
                     indexed_tx.clone(),
                     metrics.clone(),
-                    resolver,
                     checkpoint.clone(),
                     self.config.scan_lookback_blocks,
                     health.clone(),
-                    holdback.clone(),
+                    work.clone(),
                     cancel.clone(),
                 ),
             );
@@ -300,14 +272,12 @@ impl Server {
             );
         }
         for route in self.config.routes.iter().filter(|r| r.ack.is_some()) {
-            let resolver = resolvers[&route.chain_key].clone();
             spawn_worker(
                 &mut tasks,
                 format!("ack submitter (chain_key {})", route.chain_key),
                 ack::run(
                     route.clone(),
                     self.config.creditcoin_eth_rpc_url.clone(),
-                    resolver,
                     checkpoint.clone(),
                     self.config.scan_lookback_blocks,
                     metrics.clone(),

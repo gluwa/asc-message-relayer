@@ -80,12 +80,12 @@ pub struct Config {
     pub vote_cache: VoteCacheConfig,
     pub delivery: DeliveryConfig,
     pub routes: Vec<ChainRoute>,
-    /// Where to persist per-watcher block cursors so the relayer resumes from the last processed
-    /// block after a restart (never silently skips on-chain events emitted while it was down).
+    /// Where to persist per-watcher block cursors. Unfinished source messages are stored in the
+    /// sibling `<checkpoint_path>.messages` directory; keep both on persistent storage.
     /// `None` disables persistence (watchers start from the chain head).
     pub checkpoint_path: Option<PathBuf>,
-    /// Blocks to rewind persisted cursors on startup so in-flight work lost with the process
-    /// (pool votes, pending acks) is re-discovered. See [`DEFAULT_SCAN_LOOKBACK_BLOCKS`];
+    /// Blocks to rewind persisted cursors on startup (including memory-only pending acks).
+    /// Source delivery work is durable independently of this window. See [`DEFAULT_SCAN_LOOKBACK_BLOCKS`];
     /// 0 disables the rewind.
     pub scan_lookback_blocks: u64,
 }
@@ -97,11 +97,10 @@ pub struct ChainRoute {
     pub destination_rpc_url: String,
     pub inbox_address: Address,
     pub signer_key: Option<String>,
-    /// Operator-pinned Outbox address, honored before the on-chain `OutboxDiscovery` registry
-    /// lookup (`DiscoveryResolver::override_address`). The registry is the default and the only
-    /// source of truth resolution otherwise trusts; set this only for a network where the
-    /// chain-info precompile getter is missing or misconfigured, or to pin an Outbox during an
-    /// incident. Logged loudly (`WARN`) at startup and on every resolve while set.
+    /// Operator-pinned source Outbox, bypassing historical on-chain registry authorization.
+    /// Use only where the chain-info precompile is unavailable or to pin a source during an
+    /// incident. The source watcher warns while this override is active. Settlement still
+    /// resolves each message's original Outbox independently.
     pub outbox_address: Option<Address>,
     /// `RelayerContract(Lite)` on the *source* (Creditcoin) chain — the contract holding the
     /// per-message fee ledger (`getMessageInfo`) and `claimDelivery` since usc-contracts #23 moved
@@ -112,13 +111,13 @@ pub struct ChainRoute {
     /// submits `claimDelivery` for each delivered message. `None` falls back to gas estimation
     /// (fee not claimable).
     pub relayer_contract_address: Option<Address>,
-    /// Reorg guard in blocks. For the Creditcoin **Outbox scan** this is only the *fallback*
-    /// boundary: the watcher scans up to the finalized head (Creditcoin has deterministic
-    /// finality, and that is where the attestors sign) and uses `tip - depth` only when the
-    /// `finalized` tag is unavailable or finality has stalled (`events::finality`). The Outbox
-    /// factory scan and the destination-side workers still use it as a plain depth.
+    /// Reorg guard for destination settlement and completion. Execution remains durable until
+    /// `processedAt + depth <= head`; zero explicitly permits completion on an execution receipt.
+    /// Source publication discovery always requires Creditcoin's finalized head and pauses on
+    /// unavailable, regressed or stalled finality instead of falling back to this depth.
     pub block_confirmation_depth: u64,
-    /// First block to scan on first run when no persisted checkpoint exists.
+    /// First source block to scan when no checkpoint exists for the current scan scope. Defaults
+    /// to block 1, including migration from legacy single-Outbox checkpoints.
     pub start_block: Option<u64>,
     pub attestor_set: AttestorSet,
     pub threshold_override: Option<u32>,
@@ -211,7 +210,9 @@ pub struct AckConfig {
     /// Base URL of the proof-gen API server (e.g. `http://127.0.0.1:8080`). The submitter calls
     /// `GET {base}/api/v1/proof-by-tx/{chain_key}/{tx_hash}`.
     pub proof_gen_url: String,
-    /// `AcknowledgmentValidator` contract on the Creditcoin (source) chain — the submit target.
+    /// Primary `AcknowledgmentValidator` address used as an Outbox discovery hint. Settlement resolves the actual target
+    /// from each message's original Outbox so rotations and multiple active Outboxes are safe.
+    /// Retained for config compatibility; this address is not an acknowledgment routing override.
     pub validator_address: Address,
     /// EVM key used to sign `submitAcknowledgment` txs on the Creditcoin chain. Submission is
     /// permissionless (the proof is self-validating), so this only needs gas, not authority.

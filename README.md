@@ -9,7 +9,7 @@ authority**: everything it submits is either verified on-chain against attestor 
 against Creditcoin's native proving — a malicious relayer can censor (until another relayer picks
 the message up), but cannot forge.
 
-```
+```text
         Creditcoin L1                                        Destination chain (e.g. Sepolia)
   ┌─────────────────────────┐                             ┌──────────────────────────────────┐
   │ dApp ── publishMessage ─► Outbox                      │            Inbox ── receiveMessage ─► dApp
@@ -17,13 +17,13 @@ the message up), but cannot forge.
   └────────────┬────────────┘                             └──────────────│────────────────────┘
                │  eth_getLogs                                            │ deliverMessage(votes)
                ▼                                                         │ (EOAValidator checks
-  attestors (N) ── observe, ECDSA-sign messageHash ──┐                   │  2N/3+1 signatures)
+  attestors (N) ── observe, ECDSA-sign messageId ──┐                   │  2N/3+1 signatures)
                │                                     │                   │
                │        libp2p gossipsub             ▼                   │
                └──────► {chain_key}/message-votes/v1 ──► RELAYER: pool ──┘
                                                           (aggregate to threshold)
 
-  ack path (reverse):  Inbox MessageDelivered ──► RELAYER: fetch native USC proof from proof-gen
+  ack path (reverse):  Inbox MessageExecuted ──► RELAYER: fetch native USC proof from proof-gen
                         ──► AcknowledgmentValidator.submitAcknowledgment on Creditcoin
                         ──► Outbox.acknowledgeMessage  (proof is self-validating)
 ```
@@ -31,55 +31,47 @@ the message up), but cannot forge.
 ## How a message flows (outbound)
 
 1. **Publish** — a dApp on Creditcoin calls `Outbox.publishMessage(canAck, payload)`; the
-   Outbox emits `MessagePublished(messageId, emitter, canAck, payload)`.
-2. **Index** — the relayer's per-route *outbox watcher* polls Creditcoin EVM (`eth_getLogs`,
-   cursor + confirmation depth, 5 000-block chunks) and inserts an `IndexedMessage` into the vote
-   pool. Indexing establishes the **chain-first allowlist**: votes for a `messageHash` the relayer
-   has not seen on-chain are dropped on arrival.
-3. **Vote** — each attestor independently observes the same event (after its own confirmation
-   depth), signs the raw 32-byte `messageHash` with its EVM secp256k1 key (no EIP-191 prefix), and
-   gossips a `MessageVote` on `{chain_key}/message-votes/v1`.
-4. **Aggregate** — the pool validates every vote (decode → `ecrecover` → signer ∈ attestor
-   allowlist → dedup) and counts distinct signers. At threshold — `⌊2N/3⌋+1` — it encodes the
-   votes and dispatches a `DeliveryJob`.
-5. **Deliver** — the per-route *delivery worker* (optionally) simulates
-   `Inbox.deliverMessage(messageId, outbox, emitter, payload, votes)`, then sends it. Since
-   asc-contracts #36 the payload is an envelope `abi.encode(destination, nativeCoinValue,
-   gasLimit, payloadData)` and `deliverMessage` is `payable`: the relayer fronts `nativeCoinValue`
-   as `msg.value` (capped per route by `max_native_coin_value_wei`, default 0) and refuses
-   envelopes whose attested `gasLimit` exceeds `max_gas_limit` (default 5M — the router only
-   rejects zero, and an oversized one can never fit a block). The Inbox's `EOAValidator`
-   re-verifies every signature on-chain and hands the message to the `DispatcherRouter`, which
-   calls the destination with exactly the attested `gasLimit`. Three successful-tx shapes come
-   back in the receipt logs: `MessageDelivered` alone (executed); `MessagePending` (the dispatcher
-   deferred/queued it — stored for permissionless `retryPendingMessage`, which may itself revert
-   `RetryDeferred(retryAfter)`, honoured as the next attempt time); or `MessageExecutionFailed`
-   *with* `MessageDelivered` (the destination call failed and the message is consumed — no retry,
-   but the delivery still counts and is still paid).
-6. **Acknowledge & settle** (optional) — the *ack submitter* watches the destination for
-   `MessageDelivered`/`MessagePending`, fetches a **native USC proof** of that transaction from
-   the proof-gen API, and submits it to `AcknowledgmentValidator` on Creditcoin (verified against
-   the block-prover precompile) for `canAck=true` messages — and, when the route has a
-   `RelayerContract` configured, calls `RelayerContract.claimDelivery` to pay the relay fee to
-   whoever delivered. The claim proof is always built from the *original* `deliverMessage` tx —
-   `MessagePending` is itself a payable, provable outcome, so a message that ever goes pending
-   still settles its fee without waiting on (or requiring) a retry to succeed. Both settlements
-   are permissionless: the proof, not the sender, is what's trusted.
+   Outbox emits `MessagePublished(messageId, emitterAddress, sequence, canAck, payload)`.
+2. **Index** — the per-route source watcher scans finalized Creditcoin logs in bounded ranges,
+   authorizes each emitting Outbox against historical governance state, and persists the full
+   message before advancing its cursor. This establishes the chain-first allowlist: votes for a
+   message ID not indexed from an authorized publication are not counted.
+3. **Vote** — attestors independently authorize the source publication and sign the raw 32-byte
+   `messageId` with their EVM secp256k1 keys, without an EIP-191 prefix. Votes travel over
+   `{chain_key}/message-votes/v1`.
+4. **Aggregate** — the pool validates each vote (decode, recover signer, check current attestor
+   membership, deduplicate). At `⌊2N/3⌋+1` distinct signers, it dispatches a `DeliveryJob`.
+5. **Deliver and recover execution** — the delivery worker sends
+   `Inbox.deliverMessage(messageId, outbox, emitter, sequence, payload, votes)` after preflighting
+   the exact transaction gas limit. Optional early simulation provides an additional check.
+   The payload envelope is `abi.encode(destination, nativeCoinValue, gasLimit, payloadData)`:
+   the relayer fronts `nativeCoinValue` subject to route caps, and the dispatcher forwards the
+   attested execution gas. `MessageReceived` establishes acceptance; `MessageExecuted` confirms
+   execution. `MessageQueued`/`MessageDeferred` and `DestinationFailed` retain durable work for
+   permissionless `retryPendingMessage` or `retryFailedMessage`. Restart reconstructs this state
+   from the Inbox, and confirmed execution is required before removing the durable record.
+6. **Acknowledge and settle** (optional) — the ack worker proves destination `MessageExecuted`
+   logs and submits each proof to the original Outbox's current acknowledgment validator.
+   With a configured `RelayerContract`, it independently proves the original delivery's
+   `MessageReceived`, `MessageQueued`, or `MessageDeferred` outcome to claim relay fees, even
+   while execution needs recovery. A successful retry's execution log can settle the ack but
+   does not replace the original fee-claim proof. Both submissions are permissionless; finalized
+   source acknowledgment and fee state must confirm completion before work leaves the queue.
 
-### The messageHash
+### Message ID and signed digest
 
-Everything keys on one hash, computed identically by the Outbox-side contracts, the attestors,
-this relayer, and the destination Inbox (`computeMessageHash`):
+The Outbox computes the ID, and the Inbox verifies the same original-publication binding:
 
-```
-keccak256(abi.encode(messageId, emitterAddress, destinationChainKey, creditcoinChainId, payload))
+```text
+messageId = keccak256(abi.encode(outbox, emitter, sequence, keccak256(payload), sourceChainId))
 ```
 
-`destinationChainKey` is the route's `u64` chain key left-encoded into `bytes32`. The
-implementation lives in the shared [`write-ability`](write-ability/) crate and is pinned by
-golden-vector tests in **both** this repo and the attestor's (see
-[write-ability/README.md](write-ability/README.md) for the sync contract — read it before
-touching anything on the wire path).
+Here `outbox` and `emitter` are addresses, `sequence` is `uint64`, and `sourceChainId` is the
+Creditcoin EVM chain ID encoded as `uint256`. Attestors sign `messageId` directly; there is no
+second message hash or signing prefix. The destination chain key scopes the route, Outbox,
+validator, and gossip topic rather than adding another field to this digest. Shared wire and
+ABI bindings live in [`write-ability`](write-ability/); both attestor and relayer must agree on
+these formats.
 
 ## Worker inventory
 
@@ -88,45 +80,40 @@ shutdown, and any worker exiting tears the process down (fail-fast, restart by t
 Workers communicate over `mpsc` channels only — the pool owns all aggregation state, unshared.
 
 | Worker | Source | Purpose |
-|---|---|---|
-| Outbox watcher (per route) | `src/events/` | Resolve the route's Outbox (static or on-chain factory lookup, re-checked periodically), poll `MessagePublished`, feed the pool's allowlist |
+| --- | --- | --- |
+| Outbox watcher (per route) | `src/events/` | Scan finalized `MessagePublished` across historically authorized Outboxes, journal work, feed the pool |
 | Vote pool (one) | `src/pool/` | Validate + aggregate votes, dispatch deliveries, emit reobservation requests, serve `/votes` queries |
 | p2p worker (one swarm) | `src/p2p/` | gossipsub mesh with the attestors: receive votes, publish reobservation requests |
-| Delivery worker (per route) | `src/delivery/` | Simulate + send `deliverMessage`, classify outcomes, bounded retries |
-| Ack submitter (per route, opt-in) | `src/ack/` | `MessageDelivered`/`MessagePending` → proof-gen → `submitAcknowledgment` + `claimDelivery` |
+| Delivery worker (per route) | `src/delivery/` | Preflight delivery/retries, reconcile confirmed execution, retain retryable work |
+| Ack submitter (per route, opt-in) | `src/ack/` | Execution/acceptance logs → proof-gen → original-Outbox acknowledgment + independent fee claim |
 | Claim submitter (per route, opt-in) | `src/claim/` | bridge `Locked` → proof-gen → `CcBridge.claim` on Creditcoin ("relayer on both sides": users only send the lock tx) |
 | Attestor-set watcher (per on-chain route) | `src/attestor_set.rs` | Poll `EOAValidator.attestors()/threshold()` every 30 s, hot-reload the pool |
 | HTTP + metrics | `src/prom/` | `/health`, `/metrics`, `/votes/{message_hash}` |
 
 ## Liveness & failure semantics
 
-The relayer is designed to make **every failure either self-heal or terminate loudly** — never
-retry silently forever:
+Retryable work remains recoverable across outages and restarts. Capped backoff bounds RPC load,
+and repeated failures escalate in logs and metrics:
 
 - **Reobservation** (`{chain_key}/reobservation-requests/v1`) — a message stuck below quorum for
   60 s triggers a gossiped `ReobservationRequest` (rate-limited per message). Attestors re-fetch
-  the named transaction *from their own RPC*, re-verify against their own resolved Outbox, and
+  the named transaction *from their own RPC*, re-verify historical Outbox authorization, and
   re-sign — the request is unauthenticated and cannot make an attestor sign anything it can't
   independently confirm. This recovers votes lost to gossip partitions, attestor restarts, and
   observation-lag spread.
-- **Delivery retries** — RPC-level retries with exponential backoff inside the worker
-  (`delivery.max_retries`), then a bounded pool-level redispatch (5 attempts, 30 s → 5 min
-  backoff). Deterministic reverts are terminal immediately; `"Already validated"` (lost the race
-  to another relayer) is idempotent success.
-- **#36 outcome classification** — `relayer_deliver_tx{status=…}` gains `DestinationFailed`
-  (delivered + consumed, destination call failed; WARN, no retry), `RefusedNativeValue` /
-  `RefusedGasLimit` (envelope over the route caps; terminal before any tx), and
-  `ValidationFailedWithNativeValue` / `InvalidDispatcher` (the #36 hard reverts; ERROR, terminal).
-  A mined-but-reverted delivery is replayed at its block to learn why: `InsufficientGasForDestination`
-  (the destination failed and our tx gas was too low to prove the attested `gasLimit` was
-  forwarded) is resent with 25 % more gas per attempt up to `max_gas_limit`, within
-  `delivery.max_retries`. `retryPendingMessage` honours a `RetryDeferred(retryAfter)` hint
-  (plus a 5 s margin, capped at 6 h) instead of the fixed 15 s / 60 s / 240 s schedule, still
-  within the same three-attempt budget. A mined-and-reverted delivery whose revert shape
-  `classify_delivery_revert` doesn't recognize now gets its own
-  `relayer_deliver_tx{status="Unclassified"}` label, split out of the generic `Reverted` bucket it
-  used to fall into — **behavior change for dashboards/alerts**: anything keyed on
-  `status="Reverted"` will see that count drop correspondingly once this rolls out.
+- **Delivery retries** — RPC retries inside a worker attempt are bounded by
+  `delivery.max_retries`; unresolved work then returns to the supervised pool with capped
+  backoff. Five dispatch failures escalate warnings instead of abandoning the message.
+  Mutable-state reverts (pause, expired quorum, policy or validator changes) remain retryable.
+  `MessageAlreadyValidated` triggers confirmed Inbox-state reconciliation: it can mean executed,
+  queued, or failed, so acceptance alone is not success.
+- **Execution outcomes** — `MessageQueued`/`MessageDeferred` select `retryPendingMessage`, and
+  `DestinationFailed` selects `retryFailedMessage`. These obligations stay in the durable work
+  store until confirmed execution; scheduled retries do not consume a fixed lifetime budget.
+  `RetryDeferred(retryAfter)` controls the next attempt. Permanent envelope/cap failures remain
+  explicit refusal outcomes. Gas escalation stays within the route cap, and every broadcast
+  preflights the final transaction gas limit. `relayer_deliver_tx{status="Unclassified"}` identifies
+  mined reverts whose selector is not recognized; those remain retryable.
 - **Under-funded deliveries** — when the estimate exceeds the funded `gasLimit` the job waits
   for a `topUpGasLimit` (bounded by the delivery deadline / settlement). With
   `auto_request_top_up: true` the route additionally emits
@@ -136,47 +123,57 @@ retry silently forever:
 - **Revert classification is node-agnostic** (`src/revert.rs`) — nodes word reverts differently
   (geth: `execution reverted`; Creditcoin's EVM RPC: `VM Exception … revert, data: "0x<selector>"`),
   so classification extracts the raw 4-byte custom-error selector and compares against the shared
-  ABI's `SolError::SELECTOR` constants, with phrase and error-name fallbacks. String-matching
-  decoded names alone *will* misclassify deterministic reverts as transient and loop forever.
-- **Ack lifecycle** — a proof that is *not ready yet* (proof-gen 422 `BlockNotReady`: destination
-  block not attested; or 404: proof-gen's own chain view has not caught up with the tx) is
-  re-polled on a flat cadence without penalty — `ack.not_ready_poll_secs` (default 20 s) for
-  `ack.not_ready_poll_window_secs` (default 30 min) from first sighting, then the 30 s → 10 min
-  slow backoff, bounded by a 24 h give-up. `relayer_ack_proof_fetches{outcome=Ready|NotReady|Error}`
-  separates that wait from real proof-gen failures (a 404 used to take the error backoff, which
-  turned a six-minute attestation lag into a 17-minute ack on usc-devnet). Transient submit
-  failures back off 30 s → 10 min and escalate loudly after 20 attempts (the unfunded-signer
-  failure mode); reverts bubbling from the
-  Outbox (`MessageCannotBeAcknowledged`, `MessageAlreadyAcknowledged`, …) are terminal. A
-  **canAck pre-check** reads the Outbox state first, so bridge-style `canAck=false` traffic costs
-  a view call instead of a proof fetch + guaranteed-revert estimate — tagged per-message at
-  discovery time against whichever Outbox is currently resolved (next bullet), so it is immune to
-  a later Outbox rotation retroactively changing which contract an already-queued message is
-  checked against.
-- **Outbox resolution follows rotation** — every route resolves its Outbox from the chain key
-  alone: a chain-info precompile lookup for the `OutboxDiscovery` registry address, then
-  `defaultOutbox(chainKey)` on that registry (asc-contracts#38) — no operator-supplied address, no
-  factory log scan. Re-checked periodically, so a registry-level rotation (`setDefaultOutbox`) is
-  picked up without a restart. New discovery moves to the new address; already-indexed/pending
-  work is unaffected. A chain key with no discovery address registered fails closed.
-- **Checkpoints + startup lookback** — block cursors persist to `--checkpoint-path` so restarts
-  never skip events. Because votes and pending acks are memory-only, cursors are rewound by
-  `scan_lookback_blocks` (default 600) on startup: in-flight work is re-discovered, and
-  already-finished work resolves idempotently (delivered → `Already validated` at simulate,
-  acked → skipped by the pre-check). The Outbox watcher's checkpoint additionally records which
-  Outbox address it was scanned against, so a restart can tell a valid long-running cursor apart
-  from one left over from a since-rotated-away Outbox. Outbox resolution itself persists nothing —
-  a registry read is complete and authoritative on every call, so there is no scan cursor to
-  resume.
-- **Bounded everything** — vote cache (TTL + LRU cap), pending-ack queue (cap 10 000, oldest
-  evicted), per-tick ack batch (256) and concurrency (8), 5 000-block `eth_getLogs` chunks (an
-  over-large resume range would error on every tick forever on range-capped RPCs), 120 s receipt
-  timeouts (one stuck underpriced tx cannot wedge a route's serial worker).
+  ABI's `SolError::SELECTOR` constants, with phrase and error-name fallbacks. These selectors
+  distinguish retry outcomes, gas escalation, and cases needing on-chain state reconciliation.
+- **Ack lifecycle** — proofs that are not ready yet (proof-gen 422 or 404) are re-polled at
+  `ack.not_ready_poll_secs` (default 20 s) for `ack.not_ready_poll_window_secs` (default 30 min),
+  then back off to a capped 10 min cadence. After 24 h, overdue proofs trigger warnings and
+  remain pending. Transient submit failures similarly retain work and escalate after 20 attempts.
+  A full queue applies scan backpressure; the checkpoint stays behind unfinished settlements so
+  restart can recover them. A receipt or revert alone never releases an executed acknowledgment
+  or funded relay fee: source state must confirm settlement at `finalized`.
+- **Settlement across Outbox rotations** — recover every Outbox ever supported by the destination
+  Inbox, including removals, from bounded authorization-log scans back to genesis. Persist this
+  history beside the checkpoint independently of `ack.start_block`. Each message ID is bound to
+  its original source publication before checking `canAck` or selecting that Outbox's current
+  validator. One destination transaction can settle multiple validators independently; an unknown
+  route or failed RPC retains the obligation. The configured acknowledgment validator is only a
+  discovery hint. Fee ledgers remain explicitly configured per route.
+- **All historically authorized Outboxes** — source scans query every `MessagePublished` emitter,
+  then read the governance-selected Discovery and `isActiveOutbox(chainKey, emitter)` at that
+  message's finalized source block. Default changes, scheduled removal, cancellation,
+  re-registration and Discovery replacement do not reset the cursor or discard valid history.
+  The effective removal block is excluded, matching the attestor's block-end policy. Historical
+  `eth_call` support is required: missing state, RPC failures and malformed authorized events
+  stop progress for retry. Unregistered spoof emitters are ignored before decoding their data.
+  A result-limit error shrinks the log range; one dense block falls back to checked receipts.
+  Production source scans pause if finalized state is unavailable, regresses or stalls.
+- **Source checkpoint migration** — a new `outboxes:<chain-key>` checkpoint covers the complete
+  source scope. Legacy `outbox:<chain-key>` cursors only covered one default and cannot establish
+  this coverage, so upgrade replays from `start_block` or block 1 when no floor is configured.
+  An explicit `outbox_address` override bypasses Discovery and gets its own address-scoped key;
+  changing or clearing that override cannot reuse its partial cursor as complete history.
+- **Durable source work + checkpoints** — each source message is fsynced into
+  `<checkpoint-path>.messages` before the scan cursor advances. The bounded vote cache restores
+  unfinished work independently of cursor age or lookback. Keep the checkpoint file and sibling
+  directory together on persistent storage and in backups. Missing or corrupt work fails closed;
+  disk errors stop source progress. A cursor without a durable-work marker is replayed from
+  `start_block` or block 1, even if it already uses the all-Outbox scope key.
+  Startup still rewinds marked cursors by `scan_lookback_blocks` (default 600) for idempotent
+  rescanning and memory-only settlement recovery. Votes are recovered through reobservation.
+  Initial route recovery counts stored records once with constant memory; subsequent refill scans
+  inspect at most 4,096 directory entries, so a huge backlog can still lengthen startup/recovery.
+- **Bounded memory and supervised execution** — source backlog stays on disk until final delivery.
+  Stalled, non-inflight working-set entries rotate back to disk so later publications can progress;
+  accepted queued/failed work reconciles on-chain and retries without requiring fresh signatures.
+  Retry tasks run through the supervised delivery worker instead of detached memory-only loops.
+  With persistence disabled, source admission uses backpressure and retains unfinished entries.
+  Source log scans cover at most 2,000 blocks per request, shrinking further on provider limits.
 
 ## Trust & key model
 
 | Key | Chain | Needs | Notes |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `routes[].signer_key` | destination | gas | pays for `deliverMessage`; no authority — votes are what's verified |
 | `routes[].ack.signer_key` | Creditcoin | gas | pays for `submitAcknowledgment`; permissionless, proof is self-validating |
 | `p2p.identity` | — | stability only | ed25519 seed/mnemonic for a stable PeerId; ephemeral if unset |
@@ -209,7 +206,9 @@ message-relayer --single-route \
 
 Every flag has a `RELAYER_*` env twin (`--help` lists them); `.env` is loaded via dotenvy.
 Ack flags (`--ack-proof-gen-url`, `--ack-validator-address`, `--ack-signer-key`) must be set
-together or not at all. `--checkpoint-path ""` disables persistence (watchers start at head).
+together or not at all. `--checkpoint-path ""` disables persistence: source discovery replays from
+`start_block` or block 1 and uses memory backpressure; ack discovery starts from `ack.start_block`
+or the current destination head. Production restart recovery requires persistent storage.
 Per-route envelope policy (asc-contracts #36), YAML key = flag = env:
 `max_native_coin_value_wei` / `--max-native-coin-value-wei` / `RELAYER_MAX_NATIVE_COIN_VALUE_WEI`
 (decimal or 0x-hex string, default `0`: front no native value), `max_gas_limit` /
@@ -217,22 +216,20 @@ Per-route envelope policy (asc-contracts #36), YAML key = flag = env:
 `auto_request_top_up` / `--auto-request-top-up` / `RELAYER_AUTO_REQUEST_TOP_UP` (default `false`;
 needs `relayer_contract_address` and an ack or claim signer). The caps are logged at startup.
 `--verbose` switches `info` → `debug` logging. A few poll cadences are env-only (no CLI flag,
-sensible defaults): `RELAYER_ACK_POLL_SECS`, `RELAYER_CLAIM_POLL_SECS`,
-`RELAYER_OUTBOX_RESOLVE_POLL_SECS` (how often a route re-checks the discovery registry for an
-Outbox rotation, default 60 s).
+sensible defaults): `RELAYER_ACK_POLL_SECS` and `RELAYER_CLAIM_POLL_SECS`.
 
 ## HTTP API
 
 | Endpoint | Purpose |
-|---|---|
+| --- | --- |
 | `GET /health` | liveness (200 when the process is up) |
 | `GET /metrics` | Prometheus/OpenMetrics |
 | `GET /votes/{message_hash}` | vote bundle for a message: signers seen, threshold, delivered flag — lets an operator (or a sibling relayer) inspect aggregation state |
 
 Key metrics: `relayer_messages_indexed`, `relayer_votes_received` (by outcome),
 `relayer_votes_per_message`, `relayer_deliver_tx` (by status: submitted / succeeded /
-already-validated / pending / reverted / unclassified / …, see the #36 outcome classification
-bullet above), `relayer_time_to_threshold_seconds`, `relayer_time_to_deliver_seconds`,
+already-validated / pending / reverted / unclassified / …, see Execution outcomes
+above), `relayer_time_to_threshold_seconds`, `relayer_time_to_deliver_seconds`,
 `relayer_pool_messages_pending`, `relayer_attestor_set_size` / `relayer_attestor_set_reloads`,
 `relayer_p2p_peer_count`, `relayer_ack_submissions` / `relayer_claim_submissions` (by outcome:
 confirmed / terminal / failed — `submitAcknowledgment` and `claimDelivery` respectively; watch
@@ -250,9 +247,39 @@ cargo fmt --all                  # format
 taplo format                     # TOML format (config in .taplo.toml)
 ```
 
-Integration tests behind the `integration-tests` feature (`tests/e2e_anvil.rs`) expect a local
-anvil; the golden-vector tests (`tests/golden_hash.rs`) run everywhere and are the drift guard
-for the wire protocol.
+The `Full-stack recovery` workflow runs the candidate relayer commit with a real Creditcoin
+node, three attestors, Anvil and compiled contracts. It checks delivery, proof-based
+acknowledgment and fee settlement, then exercises durable recovery across a relayer restart.
+The workflow runs on every pull request and push to `main`. It reuses a verified
+`binary-for-testing-ci` artifact from a successful Creditcoin CI run and builds the candidate
+relayer. The reusable workflow definition, native source/run/artifact and contracts are pinned
+in [fullstack-recovery.yml](.github/workflows/fullstack-recovery.yml). The workflow definition
+SHA selects the test implementation; `creditcoin-ref` identifies the native producer's source
+checkout, which can be a pull request merge commit.
+
+Update all three native pins together: `creditcoin-ref`, `creditcoin-run-id` and
+`creditcoin-artifact-id`. A manual dispatch can override these pins and the contracts commit
+while retaining the selected relayer commit. The callee checks the artifact's source, run,
+build configuration and binary hashes before execution, and records the original compilation
+revision when the producer reused a verified cache. An unavailable or expired artifact fails
+the check; refresh it through Creditcoin CI and update the pins after the complete producer run
+succeeds. There is no native rebuild fallback. Inspect the run's provenance, logs and scenario
+results for the tested revisions and assertions.
+
+Full-stack CI requires the existing `GLUWA_BOT_TOKEN` secret to read private `asc-contracts`.
+If it is absent, including fork and Dependabot pull requests, the check fails explicitly;
+the run does not skip the required stack. The workflow uses GitHub-hosted runners and needs
+no Linode credentials. After building the binaries and installing the documented prerequisites
+in the pinned Creditcoin checkout, run:
+
+```bash
+cd usc-messaging
+npm run e2e -- --scenario happy-path,durable-restart --output-dir /tmp/relayer-fullstack
+```
+
+The historical `integration-tests` fixtures, including `tests/e2e_anvil.rs`, remain ignored
+placeholders and do not provide this coverage. The protocol golden-vector tests run as part
+of `cargo test --workspace` and guard wire compatibility.
 
 ### Docker
 
@@ -282,13 +309,12 @@ overrides the entrypoint so no other change is needed.
 
 ## Repository layout
 
-```
+```text
 message-relayer/         the relayer crate
   bin/relayer.rs         CLI entrypoint (clap; --config or --single-route)
   src/lib.rs             Server: worker wiring, channels, supervisor JoinSet
   src/config.rs          YAML schema + validation (see config.example.yaml)
-  src/events/            Outbox watcher + outbox resolver (discovery-registry resolution only;
-                         see events/factory.rs)
+  src/events/            finalized source scans + historical Outbox authorization
   src/pool/              vote aggregation state machine (allowlist, threshold, retries,
                          reobservation triggers, /votes queries, hot set-reload)
   src/p2p/               libp2p swarm: gossipsub topics, envelope codecs, peer metrics
@@ -312,25 +338,13 @@ Dockerfile               two-stage image build
   `CcBridge.claim`; when the reviewed `IUSCBridgeInbound.bridgeFromIntent` contracts deploy, the
   swap is an ABI + config change confined to `src/claim/` (identical proof arguments).
 - **Outbox resolution depends on an unmerged creditcoin3 branch** — the
-  `get_outbox_discovery_address` chain-info precompile getter `DiscoveryResolver` calls only exists
+  `get_outbox_discovery_address` chain-info precompile getter only exists
   on creditcoin3's `asc-dev` (the write-ability trunk, formerly `writeability-off-usc-dev`), not yet on `main`/`dev` (formerly `usc-dev`). **A route on a network without the
   precompile, or whose chain key has no discovery address registered via
-  `set_outbox_discovery_addr`, cannot resolve an Outbox at all** and fails closed by default.
+  `set_outbox_discovery_addr`, cannot authorize source publications** and fails closed by default.
   Confirm both are in place — precompile deployed, discovery address registered and pointing at
   the `OutboxDiscovery` proxy from asc-contracts#38 — before pointing this relayer at a network.
   `outbox_address` (route config / `--outbox-address`) is an operator-pinned escape hatch for
-  exactly that gap or an incident — see `events/factory.rs`'s module docs — but it bypasses the
+  exactly that gap or an incident — see `events/mod.rs`'s source watcher — but it bypasses the
   registry entirely, so treat it as temporary and logged (WARN) loudly while set, not a substitute
   for registering the chain key properly.
-- **A restart during a live Outbox rotation can permanently skip early messages on the new
-  Outbox** — `OutboxDiscovery.defaultOutbox` is a bare address with no history, so
-  `DiscoveryResolver` cannot report when it actually started serving. On a normal (running)
-  rotation this is mostly harmless (the scan cursor carries over unchanged); the sharp edge is a
-  restart that lands after governance rotated to a new Outbox but before a fresh checkpoint for
-  it exists — resolution then falls back to `start_block` or the chain head, and any
-  `MessagePublished` already emitted on the new Outbox below that point is dropped with no
-  recovery path (reobservation recovers missing votes, not messages never discovered at all).
-  Deliberately not patched as a standalone fix — the planned per-Outbox multi-watch work
-  (`activeOutboxes` + `OutboxRegistered`, tracked as the next piece after this PR) determines each
-  listener's start block from that same event as part of its own design. See `events/factory.rs`'s
-  module docs.

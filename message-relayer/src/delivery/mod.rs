@@ -7,9 +7,10 @@
 //!     `max_native_coin_value_wei`, or whose attested `gasLimit` exceeds `max_gas_limit`
 //!     (asc-contracts #36 — the router only rejects `gasLimit == 0`, so an oversized one would be
 //!     retried forever). Both are terminal with their own metric label.
-//!  2. (Optional) `eth_call` simulate to catch `validateVotes` reverts before paying gas.
-//!     Simulation distinguishes reverts (terminal / already-validated) from transport failures
-//!     (returned to the pool's bounded retry) — a mere RPC blip must not drop a message.
+//!  2. Optionally simulate early, then always preflight the exact gas limit before broadcasting.
+//!     Permanent envelope failures are terminal; pauses, quorum changes and other mutable-state
+//!     reverts stay retryable. Already-validated messages are reconciled against confirmed Inbox
+//!     execution state, since acceptance alone does not establish successful execution.
 //!  3. Send the transaction, watching for receipt (bounded by [`RECEIPT_TIMEOUT`] so a stuck
 //!     underpriced tx cannot wedge the route's serial worker).
 //!  4. Classify the outcome from the receipt logs. `MessageQueued`/`MessageDeferred` and
@@ -21,9 +22,9 @@
 //!     `MessageAlreadyValidated`; delivery still counts and is still paid via `MessageReceived`
 //!     either way). A mined-but-reverted tx is replayed to learn why: an
 //!     `InsufficientGasForDestination` revert is retried with 25% more gas up to `max_gas_limit`.
-//!  5. On `MessageQueued`/`MessageDeferred`, schedule bounded `retryPendingMessage` attempts; on
-//!     `DestinationFailed`, bounded `retryFailedMessage` attempts (both permissionless), honouring
-//!     a `RetryDeferred(retryAfter)` hint over the fixed backoff.
+//!  5. Keep queued/failed execution in the durable pool. Its serial worker reconciles the Inbox
+//!     and runs one permissionless retry per scheduled job, honoring `RetryDeferred(retryAfter)`.
+//!     Restart probes reconstruct execution state without requiring another committee quorum.
 //!  6. On RPC-level failure, retry up to `delivery.max_retries` with backoff.
 //!
 //! The worker processes one job at a time per route — serial nonce management is the simplest
@@ -128,10 +129,8 @@ const MAX_FUNDED_GAS: u64 = 100_000_000;
 /// extra retries, whereas being early would strand a message that could still have been rescued.
 const TOP_UP_DEADLINE_GRACE: Duration = Duration::from_secs(900);
 
-/// Bounded, permissionless retry schedule shared by `retryPendingMessage` (dispatcher
-/// deferred/queued the message) and, since asc-contracts #54, `retryFailedMessage` (destination
-/// call failed). Backoff gives the destination time to recover (e.g. a rate-limit window); anyone
-/// else may also retry, so this is best-effort. When the previous attempt reverted
+/// Capped backoff shared by pending and failed execution retries. The last delay repeats
+/// indefinitely while durable work remains unfinished. When the previous attempt reverted
 /// `RetryDeferred(retryAfter)` with a usable timestamp — the same error both entrypoints revert —
 /// that timestamp (plus [`RETRY_DEFERRED_MARGIN`]) replaces the fixed delay — see
 /// [`pending_retry_delay`].
@@ -146,10 +145,8 @@ const PENDING_RETRY_DELAYS: [Duration; 3] = [
 /// aiming exactly at the boundary would revert again on any skew.
 const RETRY_DEFERRED_MARGIN: Duration = Duration::from_secs(5);
 
-/// Longest the pending-retry task will honour a `retryAfter` hint for. A dispatcher hint is
-/// advisory and unauthenticated by us; a bogus far-future value must not park a detached task for
-/// days. Past this the attempt falls back to the fixed schedule (and, most likely, defers again
-/// and exhausts its bounded budget — the message stays retryable on-chain by anyone).
+/// Longest the pool honors a `retryAfter` hint before reconciling again. A far-future dispatcher
+/// hint must not suppress observation of execution by another party indefinitely.
 const MAX_RETRY_DEFERRED_WAIT: Duration = Duration::from_secs(6 * 3600);
 
 /// Job dispatched by the pool when a `messageId` (also the signed digest since asc-contracts #54)
@@ -168,6 +165,8 @@ pub struct DeliveryJob {
     pub votes_calldata: Vec<u8>,
     pub signer_count: usize,
     pub indexed_at: Instant,
+    /// Reconcile previously accepted execution (or probe restored work) without submitting votes.
+    pub reconcile_only: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -182,6 +181,12 @@ pub enum DeliveryResultKind {
     Delivered,
     Terminal,
     Retryable,
+    /// No on-chain acceptance was found; return to aggregation until a quorum is available.
+    AwaitingVotes,
+    /// Votes are already accepted. Keep retrying execution without requiring another quorum.
+    AwaitingExecution {
+        retry_after: Option<u64>,
+    },
 }
 
 /// Spawn the delivery worker for one route. Exits on `cancel` or unrecoverable channel close.
@@ -223,9 +228,9 @@ pub async fn run(
     let wallet = EthereumWallet::from(signer);
     // Chain-read nonces, so a broadcast that fails after `prepare` (RPC 502, SEND_TIMEOUT
     // abandonment, LB failover) does not consume a nonce the chain never saw and wedge the route
-    // until restart. Every send from this signer — this worker's, the detached
-    // `spawn_pending_retry` tasks holding provider clones, and the set-update submitter, which
-    // shares `route.signer_key` — serializes through `broadcast_locks` instead of through a
+    // until restart. Every send from this signer, including supervised execution retries and
+    // the set-update submitter sharing `route.signer_key`, serializes through `broadcast_locks`
+    // instead of through a
     // per-provider local counter. The two halves are only correct together; see `crate::broadcast`.
     let provider = crate::broadcast::chain_nonce_builder()
         .wallet(wallet)
@@ -338,8 +343,10 @@ pub async fn run(
                 // to estimation. The read is bounded by FUNDED_GAS_READ_TIMEOUT: it runs in this
                 // serial worker's critical path, so an unbounded await on a stalled source RPC would
                 // wedge the whole route (and starve the cancel branch) — the same hazard RECEIPT_TIMEOUT guards.
-                let funding = match (&source_provider, route.relayer_contract_address) {
-                    (Some(p), Some(relayer_contract)) => {
+                let funding = tokio::select! {
+                    () = cancel.cancelled() => return Ok(()),
+                    funding = async { match (&source_provider, route.relayer_contract_address) {
+                    (Some(p), Some(relayer_contract)) if !job.reconcile_only => {
                         match tokio::time::timeout(
                             FUNDED_GAS_READ_TIMEOUT,
                             read_message_funding(p, relayer_contract, job.message_id),
@@ -358,8 +365,11 @@ pub async fn run(
                         }
                     }
                     _ => MessageFunding::unknown(),
+                    }} => funding,
                 };
-                let outcome = match handle_job(
+                let result = tokio::select! {
+                    () = cancel.cancelled() => return Ok(()),
+                    result = handle_job(
                     &route,
                     &delivery_config,
                     &provider,
@@ -370,7 +380,9 @@ pub async fn run(
                     metrics.as_ref(),
                     top_up.as_mut(),
                     &outcomes,
-                ).await {
+                    ) => result,
+                };
+                let outcome = match result {
                     Ok(outcome) => {
                         // The job ran to a classified business outcome (delivered, terminal, or a
                         // deliberate retryable — e.g. a transport blip `handle_job` already caught
@@ -390,15 +402,15 @@ pub async fn run(
                     }
                 };
                 last_job_at = Some(Instant::now());
-                if result_tx
-                    .send(DeliveryResult {
+                let sent = tokio::select! {
+                    () = cancel.cancelled() => return Ok(()),
+                    sent = result_tx.send(DeliveryResult {
                         chain_key: job.chain_key,
                         message_id: job.message_id,
                         outcome,
-                    })
-                    .await
-                    .is_err()
-                {
+                    }) => sent,
+                };
+                if sent.is_err() {
                     warn!(chain_key, "delivery result channel closed; worker exiting");
                     return Ok(());
                 }
@@ -793,14 +805,14 @@ enum DeliveryRevert {
     /// The Inbox or the receiver already processed this message — idempotent success (lost a race
     /// to another relayer, or a previous stuck attempt mined).
     Duplicate,
-    /// #36: votes failed validation while native value was attached. Terminal for these votes.
+    /// Votes failed validation while native value was attached. Retry with the current committee.
     ValidationFailedWithNativeValue,
-    /// #36: the Inbox's dispatcher has no code (value attached). Terminal until reconfigured.
+    /// The Inbox's dispatcher has no code (value attached). Retry after reconfiguration.
     InvalidMessageDispatcher,
     /// #36: the destination call failed with too little gas to prove the attested `gasLimit` was
     /// forwarded. Retryable with a higher tx gas limit.
     InsufficientGasForDestination,
-    /// Any other deterministic revert: retrying would revert identically.
+    /// An unrecognized revert may depend on mutable contract state (pause, allowlists, votes).
     Other,
 }
 
@@ -876,11 +888,11 @@ fn revert_duplicate_delivery(err: &impl std::fmt::Display) -> bool {
 }
 
 /// What the logs of a **successful** `deliverMessage` receipt say happened. Precedence matters:
-/// `DestinationFailed` (asc-contracts #54) is emitted *together with* `MessageReceived`, so the
-/// plain success arm is only reached when neither of the two qualifying events is present.
+/// `DestinationFailed` is emitted together with `MessageReceived`; only the expected Inbox's
+/// `MessageExecuted` for this exact message proves completion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReceiptClass {
-    /// `MessageReceived` alone (paired with `MessageExecuted`): destination executed.
+    /// An authenticated `MessageExecuted` for the expected message: destination executed.
     Delivered,
     /// `DestinationFailed` + `MessageReceived`: NOT consumed, but also NOT re-deliverable via
     /// `deliverMessage` (Inbox marks it `isRetryable`; a second `deliverMessage` for the same id
@@ -892,15 +904,19 @@ enum ReceiptClass {
     /// applies to either (same shape, different topic0 — asc-contracts #54 split the old single
     /// `MessagePending`).
     Pending,
+    /// A successful EVM transaction is not itself evidence of message execution.
+    Unknown,
 }
 
 fn classify_success_logs<'a>(
     inbox: Address,
+    message_id: B256,
     logs: impl IntoIterator<Item = &'a Log>,
 ) -> ReceiptClass {
     let mut pending = false;
+    let mut executed = false;
     for log in logs {
-        if log.address() != inbox {
+        if log.address() != inbox || log.topics().get(1) != Some(&message_id) {
             continue;
         }
         match log.topics().first() {
@@ -922,13 +938,18 @@ fn classify_success_logs<'a>(
             {
                 pending = true;
             }
+            Some(t) if *t == IInbox::MessageExecuted::SIGNATURE_HASH => {
+                executed = IInbox::MessageExecuted::decode_log(&log.inner).is_ok();
+            }
             _ => {}
         }
     }
     if pending {
         ReceiptClass::Pending
-    } else {
+    } else if executed {
         ReceiptClass::Delivered
+    } else {
+        ReceiptClass::Unknown
     }
 }
 
@@ -949,7 +970,11 @@ fn bumped_gas_limit(current: Option<u64>, envelope_gas: Option<u64>, cap: u64) -
 /// reverted `RetryDeferred(retryAfter)` with a timestamp still in the future — then wait until
 /// that moment plus [`RETRY_DEFERRED_MARGIN`], capped by [`MAX_RETRY_DEFERRED_WAIT`]. `retryAfter
 /// == 0` (dispatcher exposes no schedule) and past timestamps fall back to the fixed schedule.
-fn pending_retry_delay(attempt: usize, retry_after: Option<u64>, now: Option<u64>) -> Duration {
+pub(crate) fn pending_retry_delay(
+    attempt: usize,
+    retry_after: Option<u64>,
+    now: Option<u64>,
+) -> Duration {
     let fixed = PENDING_RETRY_DELAYS[attempt.min(PENDING_RETRY_DELAYS.len() - 1)];
     match (retry_after, now) {
         (Some(ts), Some(now)) if ts > now => {
@@ -985,14 +1010,14 @@ enum Stage {
     Proceed,
 }
 
-/// Log + count a deterministic revert seen before the send (simulate / estimate) and decide the
+/// Log + count a revert seen before the send (simulate / estimate) and decide the
 /// job's fate. `InsufficientGasForDestination` is not terminal — the send loop bumps gas — so it
 /// proceeds; everything else that reverts is settled here.
 fn settle_pre_send_revert(
     route: &ChainRoute,
     job: &DeliveryJob,
     metrics: &dyn crate::prom::MetricsTrait,
-    outcomes: &OutcomeStore,
+    _outcomes: &OutcomeStore,
     stage: &str,
     revert: DeliveryRevert,
     err: &alloy::contract::Error,
@@ -1000,141 +1025,67 @@ fn settle_pre_send_revert(
     let chain_key = route.chain_key;
     let message_id = job.message_id;
     match revert {
-        DeliveryRevert::Duplicate => {
-            debug!(chain_key, %message_id, "{stage} detected already-validated; idempotent success");
-            metrics.inc_deliver_tx(chain_key, DeliveryStatus::AlreadyValidated);
-            outcomes.record(
-                message_id,
-                DeliveryOutcome::new(OutcomeKind::Delivered, chain_key).with_reason(format!(
-                    "already validated on the Inbox before {stage} (another relayer, or an earlier \
-                     attempt of ours mined)"
-                )),
-            );
-            Stage::Done(DeliveryResultKind::Delivered)
-        }
-        DeliveryRevert::ValidationFailedWithNativeValue => {
-            metrics.inc_deliver_tx(chain_key, revert_status(Some(revert)));
-            error!(chain_key, %message_id, %err,
-                "❌ {stage}(deliverMessage) reverted ValidationFailedWithNativeValue — the votes fail \
-                 validation and native value was attached; terminal for this vote bundle");
-            outcomes.record(
-                message_id,
-                DeliveryOutcome::new(OutcomeKind::Terminal, chain_key)
-                    .with_reason("ValidationFailedWithNativeValue: votes failed validation"),
-            );
-            Stage::Done(DeliveryResultKind::Terminal)
-        }
-        DeliveryRevert::InvalidMessageDispatcher => {
-            metrics.inc_deliver_tx(chain_key, revert_status(Some(revert)));
-            error!(chain_key, %message_id, inbox = %route.inbox_address, %err,
-                "❌ {stage}(deliverMessage) reverted InvalidMessageDispatcher — the Inbox's dispatcher \
-                 has no code; terminal until the Inbox is reconfigured");
-            outcomes.record(
-                message_id,
-                DeliveryOutcome::new(OutcomeKind::Terminal, chain_key)
-                    .with_reason("InvalidMessageDispatcher: the Inbox's dispatcher has no code"),
-            );
-            Stage::Done(DeliveryResultKind::Terminal)
-        }
+        // Duplicate callers reconcile execution asynchronously; its selector alone proves no completion.
+        DeliveryRevert::Duplicate => Stage::Done(DeliveryResultKind::Retryable),
         DeliveryRevert::InsufficientGasForDestination => {
             warn!(chain_key, %message_id, %err,
                 "{stage}(deliverMessage) reverted InsufficientGasForDestination; proceeding to send \
                  with a higher gas limit");
             Stage::Proceed
         }
-        DeliveryRevert::Other => {
-            metrics.inc_deliver_tx(chain_key, DeliveryStatus::Unclassified);
-            let detail = describe_unknown_revert(err, &job.payload);
-            warn!(chain_key, %message_id, %err, %detail,
-                "{stage}(deliverMessage) reverted; treating as terminal (undeliverable as published)");
-            outcomes.record(
-                message_id,
-                DeliveryOutcome::new(OutcomeKind::Undeliverable, chain_key)
-                    .with_reason(format!("{stage}(deliverMessage) reverted: {detail}")),
-            );
-            Stage::Done(DeliveryResultKind::Terminal)
-        }
+        _ => Stage::Done(retry_delivery_revert(
+            route,
+            job.message_id,
+            metrics,
+            Some(revert),
+            &format!("{stage}: {}", describe_unknown_revert(err, &job.payload)),
+        )),
     }
 }
 
-/// A `Duplicate` revert (`MessageAlreadyValidated`) used to mean only "someone already delivered
-/// this successfully" — safe to report `Delivered` outright. Since asc-contracts #54 it can ALSO
-/// mean the message was already validated by an earlier `deliverMessage` whose destination call
-/// then failed, leaving it `isRetryable`: a second `deliverMessage` for that id reverts the same
-/// way. Without this check, a checkpoint-lookback resend after a restart, or losing a race to
-/// another relayer, would report `Delivered` and never schedule `retryFailedMessage`, silently
-/// stranding a message that is still stuck on-chain (Bugbot, PR #70).
-///
-/// Returns `Some(Delivered)` when this was actually a stuck retryable message (outcome recorded,
-/// `retryFailedMessage` scheduled) — the caller should treat the job as done for the pool without
-/// its own "idempotent success" bookkeeping. Returns `None` only when `isRetryable` positively
-/// confirmed `false` (genuinely already-executed). A failed or timed-out read is NOT treated as
-/// `false`: on the exact restart / lost-race path this helper exists for, a destination RPC blip
-/// must not silently drop a message that might still be stuck — schedule `retryFailedMessage`
-/// defensively instead, since its own first `isRetryable` check cheaply self-resolves and returns
-/// if the message turns out not to need it (Bugbot, PR #70).
+/// A revert proves only that this attempt failed against the current state. Pauses, dispatcher
+/// configuration and validator membership can change without changing the publication. Even a
+/// seemingly permanent error can be bubbled up by a configurable validator/dispatcher; a selector
+/// alone does not prove a bad publication. Keep the work in the pool for capped backoff and fresh
+/// votes. Known local policy/funding limits are checked separately before sending.
+fn retry_delivery_revert(
+    route: &ChainRoute,
+    message_id: B256,
+    metrics: &dyn crate::prom::MetricsTrait,
+    revert: Option<DeliveryRevert>,
+    reason: &str,
+) -> DeliveryResultKind {
+    let chain_key = route.chain_key;
+    metrics.inc_deliver_tx(chain_key, revert_status(revert));
+    warn!(chain_key, %message_id, ?revert, %reason,
+        "delivery reverted; returning to pool for retry after contract state or votes change");
+    DeliveryResultKind::Retryable
+}
+
+/// Reconcile accepted execution instead of assuming that a duplicate was delivered.
 #[allow(clippy::too_many_arguments)]
 async fn settle_duplicate_revert<P: Provider + Clone + 'static>(
-    inbox: &IInbox::IInboxInstance<&P>,
     provider: &P,
     signer_address: Address,
     broadcast_locks: &Arc<crate::broadcast::BroadcastLocks>,
     route: &ChainRoute,
     message_id: B256,
     outcomes: &Arc<OutcomeStore>,
-    stage: &str,
-) -> Option<DeliveryResultKind> {
-    match tokio::time::timeout(
-        FUNDED_GAS_READ_TIMEOUT,
-        inbox.isRetryable(message_id).call(),
-    )
-    .await
-    {
-        Ok(Ok(false)) => return None,
-        Ok(Ok(true)) => {
-            warn!(
-                chain_key = route.chain_key,
-                %message_id,
-                "⚠️ {stage} detected MessageAlreadyValidated but the message is isRetryable — a \
-                 prior attempt's destination call failed; scheduling bounded retryFailedMessage \
-                 attempts"
-            );
-        }
-        Ok(Err(err)) => {
-            warn!(
-                chain_key = route.chain_key,
-                %message_id,
-                %err,
-                "isRetryable read failed after {stage} detected MessageAlreadyValidated; \
-                 assuming it may still be stuck and scheduling retryFailedMessage as a precaution"
-            );
-        }
-        Err(_elapsed) => {
-            warn!(
-                chain_key = route.chain_key,
-                %message_id,
-                "isRetryable read timed out after {stage} detected MessageAlreadyValidated; \
-                 assuming it may still be stuck and scheduling retryFailedMessage as a precaution"
-            );
-        }
-    }
-    outcomes.record(
-        message_id,
-        DeliveryOutcome::new(OutcomeKind::DestinationFailed, route.chain_key).with_reason(format!(
-            "{stage} detected MessageAlreadyValidated: a prior attempt's destination call may \
-             have failed; retryFailedMessage scheduled"
-        )),
-    );
-    spawn_failed_retry(
-        (*provider).clone(),
+) -> DeliveryResultKind {
+    let result = reconcile_execution(
+        provider,
         signer_address,
-        broadcast_locks.clone(),
-        *inbox.address(),
+        broadcast_locks,
+        route,
         message_id,
-        route.chain_key,
-        outcomes.clone(),
-    );
-    Some(DeliveryResultKind::Delivered)
+        outcomes,
+    )
+    .await;
+    // A duplicate with no observable execution state is ambiguous, never proof of delivery.
+    match result {
+        DeliveryResultKind::AwaitingVotes => DeliveryResultKind::Retryable,
+        result => result,
+    }
 }
 
 /// Make an unclassified pre-send revert readable. The RPC's error string carries the revert data
@@ -1194,6 +1145,17 @@ async fn handle_job<P: Provider + Clone + 'static>(
     outcomes: &Arc<OutcomeStore>,
 ) -> Result<DeliveryResultKind> {
     let inbox = IInbox::new(route.inbox_address, provider);
+    if job.reconcile_only {
+        return Ok(reconcile_execution(
+            provider,
+            signer_address,
+            broadcast_locks,
+            route,
+            job.message_id,
+            outcomes,
+        )
+        .await);
+    }
 
     // Since asc-contracts #36/#45 `deliverMessage` is `payable`: the relayer fronts the envelope's
     // `nativeCoinValue` as `msg.value` and recovers it through the fee claim. The router reverts
@@ -1253,50 +1215,46 @@ async fn handle_job<P: Provider + Clone + 'static>(
         // `validateVotes` logic reverts; constraining it to the funded gas would conflate an
         // under-funded message (out-of-gas) with a genuine revert and add head-vs-mined-block
         // boundary nondeterminism. Gas is pinned on the real send below.
-        if let Err(err) = inbox
-            .deliverMessage(
-                job.message_id,
-                job.outbox,
-                job.emitter,
-                job.sequence,
-                Bytes::from(job.payload.clone()),
-                Bytes::from(job.votes_calldata.clone()),
-            )
-            .value(native_value)
-            .call()
-            .await
-        {
+        let simulation = tokio::time::timeout(
+            FUNDED_GAS_READ_TIMEOUT,
+            inbox
+                .deliverMessage(
+                    job.message_id,
+                    job.outbox,
+                    job.emitter,
+                    job.sequence,
+                    Bytes::from(job.payload.clone()),
+                    Bytes::from(job.votes_calldata.clone()),
+                )
+                .value(native_value)
+                .call(),
+        )
+        .await;
+        let simulation = match simulation {
+            Ok(result) => result,
+            Err(_) => return Ok(DeliveryResultKind::Retryable),
+        };
+        if matches!(simulation, Ok(false)) {
+            warn!(chain_key = route.chain_key, message_id = %job.message_id,
+                "Inbox rejected votes without reverting; retaining work without broadcasting");
+            return Ok(DeliveryResultKind::Retryable);
+        }
+        if let Err(err) = simulation {
             // If the inbox already accepted this message we treat it as success (idempotent —
-            // PoC §6.5). Any other *revert* is deterministic, so we don't burn gas. A transport
-            // failure (RPC blip, timeout) is neither — the pool retries it with backoff; treating
-            // it as terminal would silently drop a deliverable message.
+            // PoC §6.5). Other reverts may be state-dependent; return to the pool
+            // without burning gas while the destination is paused or its configuration/committee
+            // is changing. Transport failures likewise preserve the message for retry.
             match classify_delivery_revert(&err) {
                 Some(DeliveryRevert::Duplicate) => {
-                    if let Some(kind) = settle_duplicate_revert(
-                        &inbox,
+                    return Ok(settle_duplicate_revert(
                         provider,
                         signer_address,
                         broadcast_locks,
                         route,
                         job.message_id,
                         outcomes,
-                        "simulate",
                     )
-                    .await
-                    {
-                        return Ok(kind);
-                    }
-                    if let Stage::Done(kind) = settle_pre_send_revert(
-                        route,
-                        job,
-                        metrics,
-                        outcomes,
-                        "simulate",
-                        DeliveryRevert::Duplicate,
-                        &err,
-                    ) {
-                        return Ok(kind);
-                    }
+                    .await);
                 }
                 Some(revert) => {
                     if let Stage::Done(kind) = settle_pre_send_revert(
@@ -1391,37 +1349,20 @@ async fn handle_job<P: Provider + Clone + 'static>(
             // Funded gas covers the estimate — proceed to send pinned at the funded gas.
             Ok(Ok(_)) => {}
             // The estimate itself failed. Classify like the simulate does: when
-            // `simulate_before_send` is off, this is where a deterministic revert first surfaces,
-            // and blanket-retrying a permanent revert would loop forever. Only genuine transport
-            // errors are retryable (we must not send unverified: an under-funded message would
-            // OOG and be dropped as terminal — the exact failure this guard exists to prevent).
+            // `simulate_before_send` is off, this is where a state-dependent revert first surfaces.
+            // Return recoverable failures to the pool rather than sending an unverified attempt
+            // or permanently discarding a publication during a temporary contract-state change.
             Ok(Err(err)) => match classify_delivery_revert(&err) {
                 Some(DeliveryRevert::Duplicate) => {
-                    if let Some(kind) = settle_duplicate_revert(
-                        &inbox,
+                    return Ok(settle_duplicate_revert(
                         provider,
                         signer_address,
                         broadcast_locks,
                         route,
                         job.message_id,
                         outcomes,
-                        "estimate",
                     )
-                    .await
-                    {
-                        return Ok(kind);
-                    }
-                    if let Stage::Done(kind) = settle_pre_send_revert(
-                        route,
-                        job,
-                        metrics,
-                        outcomes,
-                        "estimate",
-                        DeliveryRevert::Duplicate,
-                        &err,
-                    ) {
-                        return Ok(kind);
-                    }
+                    .await);
                 }
                 Some(revert) => {
                     if let Stage::Done(kind) = settle_pre_send_revert(
@@ -1478,34 +1419,55 @@ async fn handle_job<P: Provider + Clone + 'static>(
         if let Some(gas) = gas_limit {
             tx = tx.gas(gas);
         }
+        // A pinned gas limit bypasses the wallet's estimate. Check that exact limit before
+        // spending it, including every bump and every later pool retry. Otherwise reaching the
+        // cap once would repeatedly restart the same sequence of paid, reverting transactions.
+        // Keep failed work retryable: a dispatcher/configuration change can make it executable.
+        // Also decode the Inbox's boolean result when unpinned: estimation accepts a successful
+        // EVM call returning false, but paying for that transaction would never deliver anything.
+        let preflight = match tokio::time::timeout(
+            FUNDED_GAS_READ_TIMEOUT,
+            tx.clone().from(signer_address).call(),
+        )
+        .await
+        {
+            Ok(Ok(true)) => None,
+            Ok(Ok(false)) => break SendOutcome::Failed("Inbox rejected votes in preflight".into()),
+            Ok(Err(err)) => Some(Err(err)),
+            Err(_) => break SendOutcome::Failed("delivery preflight timed out".into()),
+        };
         // `send()` is several RPC round trips (gas, fee, nonce, `eth_sendRawTransaction`) and alloy's
         // HTTP transport sets no timeout, so on a black-holed endpoint this await never returns and
         // parks the route — the same hazard FUNDED_GAS_READ_TIMEOUT and RECEIPT_TIMEOUT guard.
         //
         // Serialized on the signer so the chain-read nonce this send is about to fetch already
-        // reflects every earlier broadcast from the same key — including the detached
-        // `retryPendingMessage` tasks and the set-update submitter. The guard covers only the
+        // reflects every earlier broadcast from the same key, including supervised execution
+        // retries and the set-update submitter. The guard covers only the
         // broadcast; the receipt is awaited below, outside it, or a single confirmation would block
         // every other sender on the key. Either stall is retryable and consumes no nonce.
-        let pending = match broadcast_locks
-            .broadcast(signer_address, SEND_TIMEOUT, tx.send())
-            .await
-        {
-            Ok(res) => res,
-            Err(stalled) => {
-                if attempts <= delivery_config.max_retries {
-                    warn!(
-                        chain_key = route.chain_key,
-                        message_id = %job.message_id,
-                        attempts,
-                        %stalled,
-                        "send did not complete; retrying"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
-                    continue;
+        let pending = if let Some(result) = preflight {
+            result
+        } else {
+            match broadcast_locks
+                .broadcast(signer_address, SEND_TIMEOUT, tx.send())
+                .await
+            {
+                Ok(res) => res,
+                Err(stalled) => {
+                    if attempts <= delivery_config.max_retries {
+                        warn!(
+                            chain_key = route.chain_key,
+                            message_id = %job.message_id,
+                            attempts,
+                            %stalled,
+                            "send did not complete; retrying"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                        continue;
+                    }
+                    break SendOutcome::Failed(stalled.to_string());
                 }
-                break SendOutcome::Failed(stalled.to_string());
             }
         };
 
@@ -1528,8 +1490,12 @@ async fn handle_job<P: Provider + Clone + 'static>(
                             // revert.
                             break match classify_success_logs(
                                 route.inbox_address,
+                                job.message_id,
                                 receipt.inner.logs(),
                             ) {
+                                ReceiptClass::Unknown => SendOutcome::Failed(
+                                    "receipt has no execution-state event for this message".into(),
+                                ),
                                 ReceiptClass::Delivered => SendOutcome::Succeeded {
                                     tx_hash: receipt.transaction_hash,
                                 },
@@ -1548,7 +1514,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
                         // Mined but reverted. Replay the exact call at that block to learn why: an
                         // `InsufficientGasForDestination` is ours to fix by resending with more gas;
                         // a duplicate means another relayer's tx landed in the same block (success);
-                        // anything else is a deterministic revert and terminal.
+                        // other reverts return to the pool because contract state may change.
                         let (class, reason) = replay_revert_reason(
                             &inbox,
                             job,
@@ -1652,9 +1618,9 @@ async fn handle_job<P: Provider + Clone + 'static>(
                         }
                     }
                 }
-                // Deterministic contract revert at send / gas-estimation time — retrying would
-                // revert identically, so don't burn the retry budget on it. The class travels with
-                // the outcome so the #36 errors get their own metric label, not `Reverted`.
+                // Contract revert at send / gas-estimation time. Hand it back to the pool
+                // instead of burning worker retries against unchanged contract state. The class
+                // also preserves specific metric labels for configuration and validation errors.
                 Some(revert) => {
                     break SendOutcome::Reverted {
                         revert: Some(revert),
@@ -1693,9 +1659,21 @@ async fn handle_job<P: Provider + Clone + 'static>(
             );
             outcomes.record(
                 job.message_id,
-                DeliveryOutcome::new(OutcomeKind::Delivered, route.chain_key).with_tx(tx_hash),
+                DeliveryOutcome::new(
+                    if route.block_confirmation_depth == 0 {
+                        OutcomeKind::Delivered
+                    } else {
+                        OutcomeKind::Pending
+                    },
+                    route.chain_key,
+                )
+                .with_tx(tx_hash),
             );
-            Ok(DeliveryResultKind::Delivered)
+            Ok(if route.block_confirmation_depth == 0 {
+                DeliveryResultKind::Delivered
+            } else {
+                DeliveryResultKind::AwaitingExecution { retry_after: None }
+            })
         }
         SendOutcome::DestinationFailed {
             dispatcher,
@@ -1706,10 +1684,8 @@ async fn handle_job<P: Provider + Clone + 'static>(
             // consumed — but it also does NOT leave the message re-deliverable via deliverMessage:
             // Inbox now marks it isRetryable and a second deliverMessage for the same id reverts
             // MessageAlreadyValidated. The permissionless retryFailedMessage takes over instead
-            // (no fresh votes needed). Votes are already consumed on-chain either way, so — like
-            // Pending below — this job is done from the pool's perspective; the retry itself is
-            // handed off to a detached task. MessageReceived still fired on this attempt, so
-            // relay-fee claimDelivery remains payable regardless of how the retry resolves.
+            // (no fresh votes needed). The pool retains ownership until execution succeeds.
+            // MessageReceived still fired, so fee settlement remains independent of execution.
             metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::DestinationFailed);
             metrics.observe_time_to_deliver(started.elapsed());
             // The receipt does not say why the dApp reverted (the dispatcher swallowed the revert
@@ -1738,7 +1714,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
                 signer_count = job.signer_count,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "⚠️ destination call FAILED (DestinationFailed) — not consumed on-chain; \
-                 scheduling bounded retryFailedMessage attempts"
+                 retaining work for supervised retryFailedMessage"
             );
             outcomes.record(
                 job.message_id,
@@ -1749,46 +1725,19 @@ async fn handle_job<P: Provider + Clone + 'static>(
                          retryFailedMessage scheduled"
                     )),
             );
-            spawn_failed_retry(
-                (*provider).clone(),
-                signer_address,
-                broadcast_locks.clone(),
-                *inbox.address(),
-                job.message_id,
-                route.chain_key,
-                outcomes.clone(),
-            );
-            Ok(DeliveryResultKind::Delivered)
+            Ok(DeliveryResultKind::AwaitingExecution { retry_after: None })
         }
         SendOutcome::AlreadyValidated => {
             metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::AlreadyValidated);
-            match settle_duplicate_revert(
-                &inbox,
+            Ok(settle_duplicate_revert(
                 provider,
                 signer_address,
                 broadcast_locks,
                 route,
                 job.message_id,
                 outcomes,
-                "post-send replay",
             )
-            .await
-            {
-                Some(kind) => Ok(kind),
-                None => {
-                    info!(
-                        chain_key = route.chain_key,
-                        message_id = %job.message_id,
-                        "↩️ another relayer already delivered — idempotent success"
-                    );
-                    outcomes.record(
-                        job.message_id,
-                        DeliveryOutcome::new(OutcomeKind::Delivered, route.chain_key)
-                            .with_reason("delivered by another relayer (AlreadyValidated)"),
-                    );
-                    Ok(DeliveryResultKind::Delivered)
-                }
-            }
+            .await)
         }
         SendOutcome::Pending { tx_hash } => {
             metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::Pending);
@@ -1796,7 +1745,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
                 chain_key = route.chain_key,
                 message_id = %job.message_id,
                 "⚠️ votes validated but the dispatcher deferred/queued the message — left pending; \
-                 scheduling bounded retryPendingMessage attempts"
+                 retaining work for supervised retryPendingMessage"
             );
             outcomes.record(
                 job.message_id,
@@ -1806,36 +1755,15 @@ async fn handle_job<P: Provider + Clone + 'static>(
                         "dispatcher queued/deferred the message (MessageQueued/MessageDeferred)",
                     ),
             );
-            // The votes are consumed on-chain (`validatedMessages[messageId] = true`), so from the
-            // pool's perspective delivery is complete — a re-dispatch would revert as a duplicate.
-            // The remaining `retryPendingMessage` work is permissionless best-effort.
-            spawn_pending_retry(
-                (*provider).clone(),
-                signer_address,
-                broadcast_locks.clone(),
-                *inbox.address(),
-                job.message_id,
-                route.chain_key,
-                outcomes.clone(),
-            );
-            Ok(DeliveryResultKind::Delivered)
+            Ok(DeliveryResultKind::AwaitingExecution { retry_after: None })
         }
-        SendOutcome::Reverted { revert, reason } => {
-            metrics.inc_deliver_tx(route.chain_key, revert_status(revert));
-            error!(
-                chain_key = route.chain_key,
-                message_id = %job.message_id,
-                revert = ?revert,
-                %reason,
-                "❌ delivery reverted; no further retries"
-            );
-            outcomes.record(
-                job.message_id,
-                DeliveryOutcome::new(OutcomeKind::Terminal, route.chain_key)
-                    .with_reason(format!("delivery reverted ({revert:?}): {reason}")),
-            );
-            Ok(DeliveryResultKind::Terminal)
-        }
+        SendOutcome::Reverted { revert, reason } => Ok(retry_delivery_revert(
+            route,
+            job.message_id,
+            metrics,
+            revert,
+            &reason,
+        )),
         SendOutcome::Failed(err_str) => {
             metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::Reverted);
             warn!(
@@ -1849,7 +1777,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
     }
 }
 
-/// The `relayer_deliver_tx` label for a terminal revert, whichever stage surfaced it (simulate,
+/// The `relayer_deliver_tx` label for a revert, whichever stage surfaced it (simulate,
 /// estimate, send, or the mined-revert replay). The #36 hard failures get their own series; a
 /// revert `classify_delivery_revert` could not recognize gets `Unclassified` (distinct from the
 /// generic `Reverted`, which also covers `InsufficientGasForDestination` and non-revert failures —
@@ -1868,7 +1796,7 @@ fn revert_status(revert: Option<DeliveryRevert>) -> DeliveryStatus {
     }
 }
 
-/// Human-readable reason for a terminal send-time revert, naming the #36 errors that would
+/// Human-readable reason for a send-time revert, naming the #36 errors that would
 /// otherwise only show as a selector on Creditcoin-style nodes.
 fn revert_summary(revert: DeliveryRevert, err: &alloy::contract::Error) -> String {
     match revert {
@@ -1891,8 +1819,8 @@ fn revert_summary(revert: DeliveryRevert, err: &alloy::contract::Error) -> Strin
 /// string dialects second — geth-style nodes put the selector only in the JSON-RPC error `data`,
 /// which a plain `to_string()` does not reliably carry; Bugbot, PR #63) plus the printable reason.
 /// Best-effort and bounded: `None` when the replay succeeds (state moved on) or cannot be made in
-/// time — the caller then falls back to a generic terminal revert, which is what it did before
-/// this existed.
+/// time — the caller keeps the message retryable rather than treating missing evidence as a
+/// permanent publication failure.
 async fn replay_revert_reason<P: Provider>(
     inbox: &IInbox::IInboxInstance<P>,
     job: &DeliveryJob,
@@ -1953,362 +1881,1232 @@ enum SendOutcome {
     Failed(String),
 }
 
-/// Bounded, detached best-effort `retryPendingMessage` attempts. Detached because it must not
-/// block the route's serial delivery worker; bounded ([`PENDING_RETRY_DELAYS`]) because the call
-/// is permissionless — anyone (including a future relayer restart) can retry a message that is
-/// still pending, so giving up here strands nothing. A `RetryDeferred(retryAfter)` revert (#36)
-/// moves the next attempt to `retryAfter` instead of the fixed backoff (still counted against the
-/// same bounded budget).
-fn spawn_pending_retry<P: Provider + Clone + 'static>(
-    provider: P,
-    signer_address: Address,
-    broadcast_locks: Arc<crate::broadcast::BroadcastLocks>,
-    inbox_address: Address,
-    message_id: B256,
-    chain_key: u64,
-    outcomes: Arc<OutcomeStore>,
-) {
-    tokio::spawn(async move {
-        let inbox = IInbox::new(inbox_address, &provider);
-        // `retryAfter` from the previous attempt's `RetryDeferred`, if any.
-        let mut retry_after: Option<u64> = None;
-        for attempt in 0..PENDING_RETRY_DELAYS.len() {
-            let delay = pending_retry_delay(attempt, retry_after, now_unix());
-            if let Some(ts) = retry_after {
-                info!(chain_key, %message_id, attempt, retry_after = ts, delay_secs = delay.as_secs(),
-                    "⏳ retryPendingMessage deferred by the dispatcher; waiting for retryAfter");
-            }
-            retry_after = None;
-            tokio::time::sleep(delay).await;
-            // Someone (a dApp user, another relayer) may have completed the retry meanwhile.
-            match inbox.isPending(message_id).call().await {
-                Ok(ret) if !ret => {
-                    // Consumed by someone else's `retryPendingMessage` (or a dApp user's, or our
-                    // own retry whose receipt we never saw). `isPending == false` says only that
-                    // it is no longer pending — asc-contracts #54 also clears it on
-                    // `DestinationFailed` (retryable via `retryFailedMessage`, not
-                    // `deliverMessage`) — so check `isRetryable` before giving up: an unobserved
-                    // or third-party `retryPendingMessage` can land it there just as our own
-                    // receipt-based handoff below does, and without this check it would strand.
-                    // A failed/timed-out read is NOT treated as `Ok(false)`: on this exact
-                    // unobserved-resolution path, a destination RPC blip must not silently drop a
-                    // message that might still be stuck — hand off defensively instead, since
-                    // `spawn_failed_retry`'s own first `isRetryable` check cheaply self-resolves
-                    // if it turns out not to be needed (Bugbot, PR #70).
-                    let handoff = match inbox.isRetryable(message_id).call().await {
-                        Ok(true) => true,
-                        Ok(false) => false,
-                        Err(err) => {
-                            warn!(chain_key, %message_id, %err,
-                                "isRetryable check failed after isPending resolved to false; \
-                                 assuming it may still be stuck and handing off to \
-                                 retryFailedMessage as a precaution");
-                            true
-                        }
-                    };
-                    if handoff {
-                        info!(chain_key, %message_id, "♻️ pending message resolved to \
-                            DestinationFailed (unobserved) — handing off to retryFailedMessage");
-                        outcomes.record(
-                            message_id,
-                            DeliveryOutcome::new(OutcomeKind::DestinationFailed, chain_key)
-                                .with_reason(
-                                    "no longer pending on-chain and possibly isRetryable \
-                                     (resolved by another party or an unobserved \
-                                     retryPendingMessage attempt); retryFailedMessage \
-                                     scheduled",
-                                ),
-                        );
-                        spawn_failed_retry(
-                            provider.clone(),
-                            signer_address,
-                            broadcast_locks.clone(),
-                            inbox_address,
-                            message_id,
-                            chain_key,
-                            outcomes.clone(),
-                        );
-                    } else {
-                        info!(chain_key, %message_id, "♻️ pending message already resolved");
-                        // Confirmed not retryable either — keep the `Pending` verdict and its
-                        // original tx hash, and say the final result was not observed.
-                        if let Some(prev) = outcomes.get(&message_id) {
-                            outcomes.record(
-                                message_id,
-                                DeliveryOutcome {
-                                    reason: Some(
-                                        "no longer pending on-chain (resolved by another \
-                                         party or an unobserved retry); final destination \
-                                         result not observed — check the Inbox's \
-                                         MessageExecuted / DestinationFailed logs"
-                                            .into(),
-                                    ),
-                                    ..prev
-                                },
-                            );
-                        }
-                    }
-                    return;
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    warn!(chain_key, %message_id, %err, "isPending check failed; attempting retry anyway");
-                }
-            }
-            // Serialized and bounded like the delivery send: this task runs detached but signs with
-            // the same key as the worker that spawned it, so an unserialized broadcast here would
-            // race the worker for the same chain-read nonce.
-            let sent = match broadcast_locks
-                .broadcast(
-                    signer_address,
-                    SEND_TIMEOUT,
-                    inbox.retryPendingMessage(message_id).send(),
-                )
-                .await
-            {
-                Ok(res) => res,
-                Err(stalled) => {
-                    warn!(chain_key, %message_id, attempt, %stalled, "retryPendingMessage send did not complete");
-                    continue;
-                }
-            };
-            match sent {
-                Ok(builder) => {
-                    match tokio::time::timeout(
-                        RECEIPT_TIMEOUT,
-                        crate::receipt::await_receipt(&builder),
-                    )
-                    .await
-                    {
-                        Ok(Ok(receipt)) if receipt.status() => {
-                            // Executed, or (asc-contracts #54) the destination call failed again:
-                            // either way the message is no longer *pending*, so this bounded
-                            // retryPendingMessage loop is done with it. A destination failure here
-                            // does NOT terminate the message on-chain — Inbox stores it isRetryable
-                            // — and unlike the old shape, this detached task CAN drive that retry
-                            // itself: retryFailedMessage takes only `message_id`, no payload/votes.
-                            let tx_hash = receipt.transaction_hash;
-                            match classify_success_logs(inbox_address, receipt.inner.logs()) {
-                                ReceiptClass::DestinationFailed { dispatcher } => {
-                                    warn!(chain_key, %message_id, %dispatcher, tx = %tx_hash,
-                                        "♻️ retryPendingMessage cleared pending state but the destination call FAILED AGAIN (DestinationFailed) — \
-                                         handing off to retryFailedMessage");
-                                    outcomes.record(
-                                        message_id,
-                                        DeliveryOutcome::new(OutcomeKind::DestinationFailed, chain_key)
-                                            .with_tx(tx_hash)
-                                            .with_reason(format!(
-                                                "DestinationFailed on retryPendingMessage (dispatcher {dispatcher}); \
-                                                 retryFailedMessage scheduled"
-                                            )),
-                                    );
-                                    spawn_failed_retry(
-                                        provider.clone(),
-                                        signer_address,
-                                        broadcast_locks.clone(),
-                                        inbox_address,
-                                        message_id,
-                                        chain_key,
-                                        outcomes.clone(),
-                                    );
-                                }
-                                _ => {
-                                    info!(chain_key, %message_id, tx = %tx_hash, "♻️ retryPendingMessage succeeded");
-                                    outcomes.record(
-                                        message_id,
-                                        DeliveryOutcome::new(OutcomeKind::Delivered, chain_key)
-                                            .with_tx(tx_hash)
-                                            .with_reason("delivered by retryPendingMessage"),
-                                    );
-                                }
-                            }
-                            return;
-                        }
-                        Ok(Ok(_)) => {
-                            warn!(chain_key, %message_id, attempt, "retryPendingMessage tx reverted");
-                        }
-                        Ok(Err(err)) => {
-                            warn!(chain_key, %message_id, attempt, %err, "retryPendingMessage receipt failed");
-                        }
-                        Err(_) => {
-                            warn!(chain_key, %message_id, attempt, "retryPendingMessage receipt timed out");
-                        }
-                    }
-                }
-                Err(err) => {
-                    // The node's gas estimation reverted before anything was broadcast. A
-                    // `RetryDeferred` carries the dispatcher's next-available hint: honour it.
-                    match decode_retry_deferred(&err) {
-                        Some(ts) => {
-                            retry_after = Some(ts);
-                            debug!(chain_key, %message_id, attempt, retry_after = ts, %err,
-                                "retryPendingMessage reverted RetryDeferred");
-                        }
-                        None => {
-                            warn!(chain_key, %message_id, attempt, %err, "retryPendingMessage send failed");
-                        }
-                    }
-                }
-            }
-        }
-        warn!(
-            chain_key,
-            %message_id,
-            "retryPendingMessage attempts exhausted; message stays retryable on-chain \
-             (permissionless retryPendingMessage)"
-        );
-    });
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecutionState {
+    Executed,
+    Confirming,
+    Pending,
+    Failed,
+    Unaccepted,
 }
 
-/// Bounded, detached best-effort `retryFailedMessage` attempts after a delivery lands in the
-/// `DestinationFailed` state (asc-contracts #54). Mirrors [`spawn_pending_retry`]'s shape —
-/// same bounded schedule, same `RetryDeferred` handling — but against `isRetryable`/
-/// `retryFailedMessage` instead of `isPending`/`retryPendingMessage`. Unlike the retired
-/// `MessageExecutionFailed` shape (terminal, no retry possible), and unlike `retryPendingMessage`
-/// (which needs the original payload/votes/sequence to resubmit `deliverMessage`),
-/// `retryFailedMessage` takes only `message_id` — Inbox already has the payload stored — so this
-/// detached task, spawned with nothing but the message_id, can drive the retry to completion
-/// itself.
-fn spawn_failed_retry<P: Provider + Clone + 'static>(
-    provider: P,
+/// One supervised execution attempt. The pool owns durable retention and scheduling. All RPCs
+/// are bounded; accepted work survives outages, gas-cap refusals and destination reorganizations.
+async fn reconcile_execution<P: Provider>(
+    provider: &P,
     signer_address: Address,
-    broadcast_locks: Arc<crate::broadcast::BroadcastLocks>,
-    inbox_address: Address,
+    broadcast_locks: &Arc<crate::broadcast::BroadcastLocks>,
+    route: &ChainRoute,
     message_id: B256,
-    chain_key: u64,
-    outcomes: Arc<OutcomeStore>,
-) {
-    tokio::spawn(async move {
-        let inbox = IInbox::new(inbox_address, &provider);
-        // `retryAfter` from the previous attempt's `RetryDeferred`, if any.
-        let mut retry_after: Option<u64> = None;
-        for attempt in 0..PENDING_RETRY_DELAYS.len() {
-            let delay = pending_retry_delay(attempt, retry_after, now_unix());
-            if let Some(ts) = retry_after {
-                info!(chain_key, %message_id, attempt, retry_after = ts, delay_secs = delay.as_secs(),
-                    "⏳ retryFailedMessage deferred by the dispatcher; waiting for retryAfter");
-            }
-            retry_after = None;
-            tokio::time::sleep(delay).await;
-            // Someone (another relayer, or our own earlier attempt whose receipt we never saw)
-            // may have already resolved this.
-            match inbox.isRetryable(message_id).call().await {
-                Ok(ret) if !ret => {
-                    info!(chain_key, %message_id, "♻️ destination-failed message already resolved");
-                    if let Some(prev) = outcomes.get(&message_id) {
-                        outcomes.record(
-                            message_id,
-                            DeliveryOutcome {
-                                reason: Some(
-                                    "no longer retryable on-chain (resolved by another party or an \
-                                     unobserved retry) — check the Inbox's MessageExecuted log"
-                                        .into(),
-                                ),
-                                ..prev
-                            },
-                        );
-                    }
-                    return;
+    outcomes: &OutcomeStore,
+) -> DeliveryResultKind {
+    let chain_key = route.chain_key;
+    let inbox_address = route.inbox_address;
+    let inbox = IInbox::new(inbox_address, provider);
+    let retry = DeliveryResultKind::AwaitingExecution { retry_after: None };
+    let state = tokio::time::timeout(FUNDED_GAS_READ_TIMEOUT, async {
+        let processed_at = inbox.processedAt(message_id).call().await?;
+        if !processed_at.is_zero() {
+            if route.block_confirmation_depth > 0 {
+                let tip = provider.get_block_number().await?;
+                let confirmed = tip.saturating_sub(route.block_confirmation_depth);
+                if processed_at > U256::from(confirmed) {
+                    return Ok::<_, anyhow::Error>(ExecutionState::Confirming);
                 }
-                Ok(_) => {}
-                Err(err) => {
-                    warn!(chain_key, %message_id, %err, "isRetryable check failed; attempting retry anyway");
+                // Latest-state and head reads can straddle a reorg. Require the execution in
+                // the explicit confirmed block state before deleting its durable publication.
+                if inbox
+                    .processedAt(message_id)
+                    .block(BlockId::number(confirmed))
+                    .call()
+                    .await?
+                    .is_zero()
+                {
+                    return Ok(ExecutionState::Confirming);
                 }
             }
-            // Serialized and bounded like the delivery send: this task runs detached but signs with
-            // the same key as the worker that spawned it, so an unserialized broadcast here would
-            // race the worker for the same chain-read nonce.
-            let sent = match broadcast_locks
-                .broadcast(
-                    signer_address,
-                    SEND_TIMEOUT,
-                    inbox.retryFailedMessage(message_id).send(),
-                )
+            return Ok(ExecutionState::Executed);
+        }
+        if inbox.isPending(message_id).call().await? {
+            return Ok(ExecutionState::Pending);
+        }
+        if inbox.isRetryable(message_id).call().await? {
+            return Ok(ExecutionState::Failed);
+        }
+        Ok(ExecutionState::Unaccepted)
+    })
+    .await;
+    let state = match state {
+        Ok(Ok(ExecutionState::Executed)) => {
+            outcomes.record(
+                message_id,
+                DeliveryOutcome::new(OutcomeKind::Delivered, chain_key).with_reason(
+                    "Inbox processedAt confirms execution at the configured confirmation depth",
+                ),
+            );
+            return DeliveryResultKind::Delivered;
+        }
+        Ok(Ok(ExecutionState::Confirming)) => return retry,
+        Ok(Ok(ExecutionState::Unaccepted)) => return DeliveryResultKind::AwaitingVotes,
+        Ok(Ok(state)) => state,
+        Ok(Err(err)) => {
+            warn!(chain_key, %message_id, %err, "execution-state read failed; retaining work");
+            return DeliveryResultKind::Retryable;
+        }
+        Err(_) => {
+            warn!(chain_key, %message_id, "execution-state read timed out; retaining work");
+            return DeliveryResultKind::Retryable;
+        }
+    };
+    let pending = state == ExecutionState::Pending;
+    let estimate = tokio::time::timeout(FUNDED_GAS_READ_TIMEOUT, async {
+        if pending {
+            inbox
+                .retryPendingMessage(message_id)
+                .from(signer_address)
+                .estimate_gas()
                 .await
-            {
-                Ok(res) => res,
-                Err(stalled) => {
-                    warn!(chain_key, %message_id, attempt, %stalled, "retryFailedMessage send did not complete");
-                    continue;
-                }
-            };
-            match sent {
-                Ok(builder) => {
-                    match tokio::time::timeout(
-                        RECEIPT_TIMEOUT,
-                        crate::receipt::await_receipt(&builder),
-                    )
-                    .await
-                    {
-                        Ok(Ok(receipt)) if receipt.status() => {
-                            let tx_hash = receipt.transaction_hash;
-                            match classify_success_logs(inbox_address, receipt.inner.logs()) {
-                                ReceiptClass::DestinationFailed { dispatcher } => {
-                                    warn!(chain_key, %message_id, %dispatcher, tx = %tx_hash, attempt,
-                                        "♻️ retryFailedMessage cleared retryable state but the destination call FAILED AGAIN (DestinationFailed) — \
-                                         still retryable on-chain, continuing the bounded schedule");
-                                    outcomes.record(
-                                        message_id,
-                                        DeliveryOutcome::new(OutcomeKind::DestinationFailed, chain_key)
-                                            .with_tx(tx_hash)
-                                            .with_reason(format!(
-                                                "DestinationFailed on retryFailedMessage attempt {attempt} (dispatcher {dispatcher})"
-                                            )),
-                                    );
-                                }
-                                _ => {
-                                    info!(chain_key, %message_id, tx = %tx_hash, "♻️ retryFailedMessage succeeded");
-                                    outcomes.record(
-                                        message_id,
-                                        DeliveryOutcome::new(OutcomeKind::Delivered, chain_key)
-                                            .with_tx(tx_hash)
-                                            .with_reason("delivered by retryFailedMessage"),
-                                    );
-                                    return;
-                                }
-                            }
-                        }
-                        Ok(Ok(_)) => {
-                            warn!(chain_key, %message_id, attempt, "retryFailedMessage tx reverted");
-                        }
-                        Ok(Err(err)) => {
-                            warn!(chain_key, %message_id, attempt, %err, "retryFailedMessage receipt failed");
-                        }
-                        Err(_) => {
-                            warn!(chain_key, %message_id, attempt, "retryFailedMessage receipt timed out");
-                        }
-                    }
-                }
-                Err(err) => {
-                    // The node's gas estimation reverted before anything was broadcast. A
-                    // `RetryDeferred` carries the dispatcher's next-available hint: honour it.
-                    match decode_retry_deferred(&err) {
-                        Some(ts) => {
-                            retry_after = Some(ts);
-                            debug!(chain_key, %message_id, attempt, retry_after = ts, %err,
-                                "retryFailedMessage reverted RetryDeferred");
-                        }
-                        None => {
-                            warn!(chain_key, %message_id, attempt, %err, "retryFailedMessage send failed");
-                        }
-                    }
-                }
+        } else {
+            inbox
+                .retryFailedMessage(message_id)
+                .from(signer_address)
+                .estimate_gas()
+                .await
+        }
+    })
+    .await;
+    let gas = match estimate {
+        Ok(Ok(gas)) if gas <= route.max_gas_limit => {
+            gas.saturating_add(gas / 4).min(route.max_gas_limit)
+        }
+        Ok(Ok(gas)) => {
+            warn!(chain_key, %message_id, gas, cap = route.max_gas_limit,
+                "execution retry exceeds the route gas cap; retaining work");
+            return retry;
+        }
+        Ok(Err(err)) => {
+            return DeliveryResultKind::AwaitingExecution {
+                retry_after: decode_retry_deferred(&err),
             }
         }
-        warn!(
-            chain_key,
-            %message_id,
-            "retryFailedMessage attempts exhausted; message stays retryable on-chain \
-             (permissionless retryFailedMessage)"
-        );
-    });
+        Err(_) => return retry,
+    };
+    // Pin and preflight the exact gas limit so a low estimate or changing dispatcher cannot
+    // repeatedly burn the cap on known-reverting retries. Stored native value is not fronted again.
+    let preflight = tokio::time::timeout(FUNDED_GAS_READ_TIMEOUT, async {
+        if pending {
+            inbox
+                .retryPendingMessage(message_id)
+                .from(signer_address)
+                .gas(gas)
+                .call()
+                .await
+                .map(|_| ())
+        } else {
+            inbox
+                .retryFailedMessage(message_id)
+                .from(signer_address)
+                .gas(gas)
+                .call()
+                .await
+                .map(|_| ())
+        }
+    })
+    .await;
+    match preflight {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            return DeliveryResultKind::AwaitingExecution {
+                retry_after: decode_retry_deferred(&err),
+            }
+        }
+        Err(_) => return retry,
+    }
+    let sent = broadcast_locks
+        .broadcast(signer_address, SEND_TIMEOUT, async {
+            if pending {
+                inbox
+                    .retryPendingMessage(message_id)
+                    .from(signer_address)
+                    .gas(gas)
+                    .send()
+                    .await
+            } else {
+                inbox
+                    .retryFailedMessage(message_id)
+                    .from(signer_address)
+                    .gas(gas)
+                    .send()
+                    .await
+            }
+        })
+        .await;
+    let builder = match sent {
+        Ok(Ok(builder)) => builder,
+        Ok(Err(err)) => {
+            return DeliveryResultKind::AwaitingExecution {
+                retry_after: decode_retry_deferred(&err),
+            }
+        }
+        Err(err) => {
+            warn!(chain_key, %message_id, %err, "execution retry broadcast timed out; retaining work");
+            return retry;
+        }
+    };
+    match tokio::time::timeout(RECEIPT_TIMEOUT, crate::receipt::await_receipt(&builder)).await {
+        Ok(Ok(receipt)) if receipt.status() => {
+            let (kind, result) =
+                match classify_success_logs(inbox_address, message_id, receipt.inner.logs()) {
+                    ReceiptClass::Delivered if route.block_confirmation_depth == 0 => {
+                        (OutcomeKind::Delivered, DeliveryResultKind::Delivered)
+                    }
+                    ReceiptClass::Delivered | ReceiptClass::Pending => {
+                        (OutcomeKind::Pending, retry)
+                    }
+                    ReceiptClass::DestinationFailed { .. } => {
+                        (OutcomeKind::DestinationFailed, retry)
+                    }
+                    ReceiptClass::Unknown => return retry,
+                };
+            outcomes.record(
+                message_id,
+                DeliveryOutcome::new(kind, chain_key)
+                    .with_tx(receipt.transaction_hash)
+                    .with_reason(
+                        "execution retry observed; completion follows configured confirmations",
+                    ),
+            );
+            result
+        }
+        Ok(Ok(receipt)) => {
+            let retry_after = tokio::time::timeout(FUNDED_GAS_READ_TIMEOUT, async {
+                let block = receipt
+                    .block_number
+                    .map(BlockId::number)
+                    .unwrap_or_default();
+                let replay = if pending {
+                    inbox
+                        .retryPendingMessage(message_id)
+                        .from(signer_address)
+                        .gas(gas)
+                        .block(block)
+                        .call()
+                        .await
+                        .map(|_| ())
+                } else {
+                    inbox
+                        .retryFailedMessage(message_id)
+                        .from(signer_address)
+                        .gas(gas)
+                        .block(block)
+                        .call()
+                        .await
+                        .map(|_| ())
+                };
+                replay.err().and_then(|err| decode_retry_deferred(&err))
+            })
+            .await
+            .ok()
+            .flatten();
+            DeliveryResultKind::AwaitingExecution { retry_after }
+        }
+        _ => retry,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pool::{DELIVERY_RETRY_MAX, PRUNE_TICK_INTERVAL};
+    use crate::prom::NoopMetrics;
     use alloy::primitives::LogData;
+    use alloy::transports::mock::Asserter;
+    fn execution_job_fixture() -> (ChainRoute, DeliveryJob) {
+        let route = ChainRoute {
+            chain_key: 2,
+            creditcoin_chain_id: 42,
+            destination_rpc_url: "http://unused.invalid".into(),
+            inbox_address: Address::repeat_byte(0x11),
+            signer_key: Some(format!("{:064x}", 1)),
+            outbox_address: None,
+            relayer_contract_address: None,
+            block_confirmation_depth: 0,
+            start_block: None,
+            attestor_set: crate::config::AttestorSet::Static(vec![Address::repeat_byte(0x22)]),
+            threshold_override: None,
+            ack: None,
+            claim: None,
+            max_native_coin_value_wei: U256::ZERO,
+            max_gas_limit: 5_000_000,
+            auto_request_top_up: false,
+        };
+        let job = DeliveryJob {
+            chain_key: 2,
+            message_id: B256::repeat_byte(1),
+            emitter: Address::repeat_byte(2),
+            outbox: Address::repeat_byte(3),
+            sequence: 1,
+            payload: envelope(0, 100_000),
+            votes_calldata: vec![],
+            signer_count: 0,
+            indexed_at: Instant::now(),
+            reconcile_only: true,
+        };
+        (route, job)
+    }
+
+    fn mock_state(rpc: &Asserter, pending: bool, failed: bool) {
+        rpc.push_success(&Bytes::from(U256::ZERO.abi_encode()));
+        rpc.push_success(&Bytes::from(pending.abi_encode()));
+        if !pending {
+            rpc.push_success(&Bytes::from(failed.abi_encode()));
+        }
+    }
+
+    fn mock_execution_receipt(rpc: &Asserter, logs: Vec<Log>, status: bool) {
+        let hash = B256::repeat_byte(0x44);
+        rpc.push_success(&hash);
+        rpc.push_success(&serde_json::json!({
+            "status": if status { "0x1" } else { "0x0" },
+            "cumulativeGasUsed": "0x1",
+            "logsBloom": format!("0x{}", "00".repeat(256)), "logs": logs,
+            "transactionHash": hash, "transactionIndex": "0x0",
+            "blockHash": B256::repeat_byte(0x55), "blockNumber": "0x1",
+            "gasUsed": "0x1", "effectiveGasPrice": "0x1",
+            "from": Address::repeat_byte(4), "to": Address::repeat_byte(0x11), "type": "0x2",
+        }));
+    }
+
+    fn mock_retry_receipt(rpc: &Asserter, logs: Vec<Log>, status: bool) {
+        rpc.push_success(&"0x186a0");
+        rpc.push_success(&Bytes::new());
+        mock_execution_receipt(rpc, logs, status);
+    }
+
+    #[tokio::test]
+    async fn restart_reconciles_queued_and_failed_without_fresh_votes_or_retry_budget() {
+        for pending in [true, false] {
+            let rpc = Asserter::new();
+            let provider = ProviderBuilder::new()
+                .disable_recommended_fillers()
+                .connect_mocked_client(rpc.clone());
+            let (route, job) = execution_job_fixture();
+            let outcomes = Arc::new(OutcomeStore::new(8));
+            let locks = crate::broadcast::BroadcastLocks::new();
+            for attempt in 0..5 {
+                mock_state(&rpc, pending, !pending);
+                rpc.push_failure_msg("execution reverted: EnforcedPause()");
+                let result = handle_job(
+                    &route,
+                    &DeliveryConfig::default(),
+                    &provider,
+                    Address::repeat_byte(4),
+                    &locks,
+                    &job,
+                    MessageFunding::unknown(),
+                    NoopMetrics::new().as_ref(),
+                    None,
+                    &outcomes,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    result,
+                    DeliveryResultKind::AwaitingExecution { retry_after: None },
+                    "lost accepted execution on attempt {attempt}"
+                );
+                assert!(outcomes.get(&job.message_id).is_none());
+            }
+            // Another relayer eventually executes it. Only processedAt is necessary to settle;
+            // there is no new submit/nonce/vote read and no fresh committee quorum.
+            rpc.push_success(&Bytes::from(U256::from(123).abi_encode()));
+            assert_eq!(
+                handle_job(
+                    &route,
+                    &DeliveryConfig::default(),
+                    &provider,
+                    Address::repeat_byte(4),
+                    &locks,
+                    &job,
+                    MessageFunding::unknown(),
+                    NoopMetrics::new().as_ref(),
+                    None,
+                    &outcomes
+                )
+                .await
+                .unwrap(),
+                DeliveryResultKind::Delivered
+            );
+            assert_eq!(
+                outcomes.get(&job.message_id).unwrap().kind,
+                OutcomeKind::Delivered
+            );
+            assert!(rpc.read_q().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_of_queued_message_retains_execution_work() {
+        let rpc = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_mocked_client(rpc.clone());
+        let (route, mut job) = execution_job_fixture();
+        job.reconcile_only = false;
+        rpc.push_failure_msg("execution reverted: MessageAlreadyValidated");
+        mock_state(&rpc, true, false);
+        rpc.push_failure_msg("execution reverted: RetryDeferred");
+        let outcomes = Arc::new(OutcomeStore::new(8));
+        assert_eq!(
+            handle_job(
+                &route,
+                &DeliveryConfig {
+                    simulate_before_send: true,
+                    ..Default::default()
+                },
+                &provider,
+                Address::repeat_byte(4),
+                &crate::broadcast::BroadcastLocks::new(),
+                &job,
+                MessageFunding::unknown(),
+                NoopMetrics::new().as_ref(),
+                None,
+                &outcomes
+            )
+            .await
+            .unwrap(),
+            DeliveryResultKind::AwaitingExecution { retry_after: None }
+        );
+        assert!(outcomes.get(&job.message_id).is_none());
+        assert!(rpc.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn retry_pending_can_become_failed_then_execute() {
+        let rpc = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_mocked_client(rpc.clone());
+        let (route, job) = execution_job_fixture();
+        let outcomes = Arc::new(OutcomeStore::new(8));
+        let locks = crate::broadcast::BroadcastLocks::new();
+        mock_state(&rpc, true, false);
+        mock_retry_receipt(
+            &rpc,
+            vec![inbox_event_log(
+                route.inbox_address,
+                IInbox::DestinationFailed {
+                    messageId: job.message_id,
+                    emitterAddress: job.emitter,
+                    destination: Address::repeat_byte(5),
+                    dispatcher: Address::repeat_byte(6),
+                    relayer: Address::repeat_byte(4),
+                    messagePayload: Bytes::new(),
+                }
+                .encode_log_data(),
+            )],
+            true,
+        );
+        assert_eq!(
+            handle_job(
+                &route,
+                &DeliveryConfig::default(),
+                &provider,
+                Address::repeat_byte(4),
+                &locks,
+                &job,
+                MessageFunding::unknown(),
+                NoopMetrics::new().as_ref(),
+                None,
+                &outcomes
+            )
+            .await
+            .unwrap(),
+            DeliveryResultKind::AwaitingExecution { retry_after: None }
+        );
+        assert_eq!(
+            outcomes.get(&job.message_id).unwrap().kind,
+            OutcomeKind::DestinationFailed
+        );
+        mock_state(&rpc, false, true);
+        mock_retry_receipt(
+            &rpc,
+            vec![inbox_event_log(
+                route.inbox_address,
+                IInbox::MessageExecuted {
+                    messageId: job.message_id,
+                    emitterAddress: job.emitter,
+                    destination: Address::repeat_byte(5),
+                    dispatcher: Address::repeat_byte(6),
+                    relayer: Address::repeat_byte(4),
+                    messagePayload: Bytes::new(),
+                }
+                .encode_log_data(),
+            )],
+            true,
+        );
+        assert_eq!(
+            handle_job(
+                &route,
+                &DeliveryConfig::default(),
+                &provider,
+                Address::repeat_byte(4),
+                &locks,
+                &job,
+                MessageFunding::unknown(),
+                NoopMetrics::new().as_ref(),
+                None,
+                &outcomes
+            )
+            .await
+            .unwrap(),
+            DeliveryResultKind::Delivered
+        );
+        assert!(rpc.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconciliation_distinguishes_unaccepted_from_unavailable_and_honors_deferral() {
+        let rpc = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_mocked_client(rpc.clone());
+        let (route, job) = execution_job_fixture();
+        let outcomes = OutcomeStore::new(8);
+        let locks = crate::broadcast::BroadcastLocks::new();
+        mock_state(&rpc, false, false);
+        assert_eq!(
+            reconcile_execution(
+                &provider,
+                Address::repeat_byte(4),
+                &locks,
+                &route,
+                job.message_id,
+                &outcomes
+            )
+            .await,
+            DeliveryResultKind::AwaitingVotes
+        );
+        rpc.push_failure_msg("gateway unavailable");
+        assert_eq!(
+            reconcile_execution(
+                &provider,
+                Address::repeat_byte(4),
+                &locks,
+                &route,
+                job.message_id,
+                &outcomes
+            )
+            .await,
+            DeliveryResultKind::Retryable
+        );
+        mock_state(&rpc, true, false);
+        let deferred = IInbox::RetryDeferred {
+            messageId: job.message_id,
+            retryAfter: 1_900_000_000,
+        }
+        .abi_encode();
+        rpc.push_failure_msg(cc_style(&deferred));
+        assert_eq!(
+            reconcile_execution(
+                &provider,
+                Address::repeat_byte(4),
+                &locks,
+                &route,
+                job.message_id,
+                &outcomes
+            )
+            .await,
+            DeliveryResultKind::AwaitingExecution {
+                retry_after: Some(1_900_000_000)
+            }
+        );
+        mock_state(&rpc, false, true);
+        mock_retry_receipt(&rpc, vec![], false);
+        rpc.push_failure_msg(cc_style(&deferred));
+        assert_eq!(
+            reconcile_execution(
+                &provider,
+                Address::repeat_byte(4),
+                &locks,
+                &route,
+                job.message_id,
+                &outcomes
+            )
+            .await,
+            DeliveryResultKind::AwaitingExecution {
+                retry_after: Some(1_900_000_000)
+            }
+        );
+        assert!(outcomes.get(&job.message_id).is_none());
+        assert!(rpc.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn execution_confirmations_preserve_work_through_reorg() {
+        let rpc = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_mocked_client(rpc.clone());
+        let (mut route, job) = execution_job_fixture();
+        route.block_confirmation_depth = 12;
+        let locks = crate::broadcast::BroadcastLocks::new();
+        let outcomes = OutcomeStore::new(8);
+        rpc.push_success(&Bytes::from(U256::from(100).abi_encode()));
+        rpc.push_success(&"0x69"); // head 105: execution has only five blocks of depth
+        assert_eq!(
+            reconcile_execution(
+                &provider,
+                Address::repeat_byte(4),
+                &locks,
+                &route,
+                job.message_id,
+                &outcomes
+            )
+            .await,
+            DeliveryResultKind::AwaitingExecution { retry_after: None }
+        );
+        assert!(outcomes.get(&job.message_id).is_none());
+        assert!(
+            rpc.read_q().is_empty(),
+            "unconfirmed execution must not be rebroadcast"
+        );
+        // The destination reorg removes the execution; the durable publication returns to voting.
+        mock_state(&rpc, false, false);
+        assert_eq!(
+            reconcile_execution(
+                &provider,
+                Address::repeat_byte(4),
+                &locks,
+                &route,
+                job.message_id,
+                &outcomes
+            )
+            .await,
+            DeliveryResultKind::AwaitingVotes
+        );
+        // A reorg between latest-state and head reads must not combine unrelated evidence.
+        rpc.push_success(&Bytes::from(U256::from(200).abi_encode()));
+        rpc.push_success(&"0xd4");
+        rpc.push_success(&Bytes::from(U256::ZERO.abi_encode()));
+        assert_eq!(
+            reconcile_execution(
+                &provider,
+                Address::repeat_byte(4),
+                &locks,
+                &route,
+                job.message_id,
+                &outcomes
+            )
+            .await,
+            DeliveryResultKind::AwaitingExecution { retry_after: None }
+        );
+        assert!(outcomes.get(&job.message_id).is_none());
+        rpc.push_success(&Bytes::from(U256::from(200).abi_encode()));
+        rpc.push_success(&"0xd4"); // head 212: replacement execution reaches the configured depth
+        rpc.push_success(&Bytes::from(U256::from(200).abi_encode()));
+        assert_eq!(
+            reconcile_execution(
+                &provider,
+                Address::repeat_byte(4),
+                &locks,
+                &route,
+                job.message_id,
+                &outcomes
+            )
+            .await,
+            DeliveryResultKind::Delivered
+        );
+        assert!(rpc.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn initial_and_retry_execution_receipts_wait_for_confirmations() {
+        for retry in [false, true] {
+            let rpc = Asserter::new();
+            let provider = ProviderBuilder::new()
+                .disable_recommended_fillers()
+                .connect_mocked_client(rpc.clone());
+            let (mut route, mut job) = execution_job_fixture();
+            route.block_confirmation_depth = 2;
+            job.reconcile_only = retry;
+            let log = inbox_event_log(
+                route.inbox_address,
+                IInbox::MessageExecuted {
+                    messageId: job.message_id,
+                    emitterAddress: job.emitter,
+                    destination: Address::repeat_byte(5),
+                    dispatcher: Address::repeat_byte(6),
+                    relayer: Address::repeat_byte(4),
+                    messagePayload: job.payload.clone().into(),
+                }
+                .encode_log_data(),
+            );
+            if retry {
+                mock_state(&rpc, true, false);
+                mock_retry_receipt(&rpc, vec![log], true);
+            } else {
+                rpc.push_success(&Bytes::from(true.abi_encode()));
+                mock_execution_receipt(&rpc, vec![log], true);
+            }
+            let outcomes = Arc::new(OutcomeStore::new(8));
+            assert_eq!(
+                handle_job(
+                    &route,
+                    &DeliveryConfig {
+                        simulate_before_send: false,
+                        ..Default::default()
+                    },
+                    &provider,
+                    Address::repeat_byte(4),
+                    &crate::broadcast::BroadcastLocks::new(),
+                    &job,
+                    MessageFunding::unknown(),
+                    NoopMetrics::new().as_ref(),
+                    None,
+                    &outcomes
+                )
+                .await
+                .unwrap(),
+                DeliveryResultKind::AwaitingExecution { retry_after: None }
+            );
+            assert_eq!(
+                outcomes.get(&job.message_id).unwrap().kind,
+                OutcomeKind::Pending
+            );
+            assert!(rpc.read_q().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_retry_gas_cap_and_preflight_never_broadcast_known_failure() {
+        for pending in [true, false] {
+            let rpc = Asserter::new();
+            let provider = ProviderBuilder::new()
+                .disable_recommended_fillers()
+                .connect_mocked_client(rpc.clone());
+            let (mut route, job) = execution_job_fixture();
+            route.max_gas_limit = 100_000;
+            let locks = crate::broadcast::BroadcastLocks::new();
+            let outcomes = OutcomeStore::new(8);
+            mock_state(&rpc, pending, !pending);
+            rpc.push_success(&"0x186a1"); // one gas above the configured cap
+            assert_eq!(
+                reconcile_execution(
+                    &provider,
+                    Address::repeat_byte(4),
+                    &locks,
+                    &route,
+                    job.message_id,
+                    &outcomes
+                )
+                .await,
+                DeliveryResultKind::AwaitingExecution { retry_after: None }
+            );
+            assert!(rpc.read_q().is_empty());
+            mock_state(&rpc, pending, !pending);
+            rpc.push_success(&"0x186a0");
+            rpc.push_failure_msg("execution reverted: InsufficientGasForDestination()");
+            assert_eq!(
+                reconcile_execution(
+                    &provider,
+                    Address::repeat_byte(4),
+                    &locks,
+                    &route,
+                    job.message_id,
+                    &outcomes
+                )
+                .await,
+                DeliveryResultKind::AwaitingExecution { retry_after: None }
+            );
+            assert!(outcomes.get(&job.message_id).is_none());
+            assert!(rpc.read_q().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_worker_cancels_while_rpc_is_blackholed() {
+        for wait_for_timeout in [false, true] {
+            use tokio::io::AsyncReadExt;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (mut route, job) = execution_job_fixture();
+            route.destination_rpc_url = format!("http://{}", listener.local_addr().unwrap());
+            let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0; 1024];
+                assert!(stream.read(&mut buf).await.unwrap() > 0);
+                let _ = request_tx.send(());
+                std::future::pending::<()>().await;
+            });
+            let (job_tx, job_rx) = mpsc::channel(1);
+            job_tx.send(job).await.unwrap();
+            let (result_tx, mut result_rx) = mpsc::channel(1);
+            let cancel = CancellationToken::new();
+            let worker = tokio::spawn(run(
+                route,
+                DeliveryConfig::default(),
+                "unused".into(),
+                job_rx,
+                result_tx,
+                NoopMetrics::new(),
+                crate::health::Health::new(crate::health::PROGRESS_DEADLINE),
+                crate::broadcast::BroadcastLocks::new(),
+                Arc::new(OutcomeStore::new(8)),
+                cancel.clone(),
+            ));
+            tokio::time::timeout(Duration::from_secs(5), request_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            if wait_for_timeout {
+                tokio::time::pause();
+                tokio::time::advance(FUNDED_GAS_READ_TIMEOUT + Duration::from_secs(1)).await;
+                let result = tokio::time::timeout(Duration::from_secs(1), result_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(result.outcome, DeliveryResultKind::Retryable);
+                tokio::time::resume();
+            }
+            cancel.cancel();
+            tokio::time::timeout(Duration::from_secs(1), worker)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            server.abort();
+        }
+    }
+
+    fn delivery_fixture() -> (ChainRoute, DeliveryJob) {
+        let route = ChainRoute {
+            chain_key: 2,
+            creditcoin_chain_id: 42,
+            destination_rpc_url: "http://unused.invalid".into(),
+            inbox_address: Address::repeat_byte(0x11),
+            signer_key: None,
+            outbox_address: None,
+            relayer_contract_address: None,
+            block_confirmation_depth: 0,
+            start_block: None,
+            attestor_set: crate::config::AttestorSet::Static(vec![Address::repeat_byte(0x22)]),
+            threshold_override: None,
+            ack: None,
+            claim: None,
+            max_native_coin_value_wei: U256::ZERO,
+            max_gas_limit: 5_000_000,
+            auto_request_top_up: false,
+        };
+        let job = DeliveryJob {
+            chain_key: route.chain_key,
+            message_id: B256::repeat_byte(1),
+            emitter: Address::repeat_byte(2),
+            outbox: Address::repeat_byte(3),
+            sequence: 1,
+            payload: envelope(0, 100_000),
+            votes_calldata: vec![],
+            signer_count: 1,
+            indexed_at: Instant::now(),
+            reconcile_only: false,
+        };
+        (route, job)
+    }
+
+    /// Exercise the worker's simulate, funded estimate, send and mined-replay paths. A pause is
+    /// reversible even though every one of those RPC responses is a deterministic EVM revert.
+    #[tokio::test]
+    async fn paused_inbox_is_retryable_at_every_delivery_stage() {
+        for stage in ["simulate", "estimate", "send", "mined"] {
+            let rpc = Asserter::new();
+            let (route, job) = delivery_fixture();
+            let config = DeliveryConfig {
+                simulate_before_send: stage == "simulate",
+                max_retries: 0,
+                ..Default::default()
+            };
+            let funding = if stage == "estimate" {
+                MessageFunding {
+                    gas: Some(200_000),
+                    ..MessageFunding::unknown()
+                }
+            } else {
+                MessageFunding::unknown()
+            };
+            if stage == "send" || stage == "mined" {
+                rpc.push_success(&Bytes::from(true.abi_encode())); // preflight before sending
+            }
+            if stage == "mined" {
+                let hash = B256::repeat_byte(0x44);
+                rpc.push_success(&hash);
+                rpc.push_success(&serde_json::json!({
+                    "status": "0x0", "cumulativeGasUsed": "0x1",
+                    "logsBloom": format!("0x{}", "00".repeat(256)), "logs": [],
+                    "transactionHash": hash, "transactionIndex": "0x0",
+                    "blockHash": B256::repeat_byte(0x55), "blockNumber": "0x1",
+                    "gasUsed": "0x1", "effectiveGasPrice": "0x1",
+                    "from": Address::repeat_byte(4), "to": route.inbox_address, "type": "0x2",
+                }));
+            }
+            rpc.push_failure_msg("execution reverted: EnforcedPause()");
+            let provider = ProviderBuilder::new()
+                .disable_recommended_fillers()
+                .connect_mocked_client(rpc.clone());
+            let outcomes = Arc::new(OutcomeStore::new(8));
+            let result = handle_job(
+                &route,
+                &config,
+                &provider,
+                Address::repeat_byte(4),
+                &crate::broadcast::BroadcastLocks::new(),
+                &job,
+                funding,
+                NoopMetrics::new().as_ref(),
+                None,
+                &outcomes,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, DeliveryResultKind::Retryable, "{stage}");
+            assert!(
+                outcomes.get(&job.message_id).is_none(),
+                "{stage} recorded a final outcome"
+            );
+            assert!(
+                rpc.read_q().is_empty(),
+                "{stage} did not exercise the intended RPC path"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn validator_false_never_broadcasts_and_true_later_recovers() {
+        for mode in ["simulate", "funded preflight", "unfunded preflight"] {
+            let rpc = Asserter::new();
+            let provider = ProviderBuilder::new()
+                .disable_recommended_fillers()
+                .connect_mocked_client(rpc.clone());
+            let (route, job) = delivery_fixture();
+            let funding = if mode == "funded preflight" {
+                MessageFunding {
+                    gas: Some(100_000),
+                    ..MessageFunding::unknown()
+                }
+            } else {
+                MessageFunding::unknown()
+            };
+            let config = DeliveryConfig {
+                simulate_before_send: mode == "simulate",
+                ..Default::default()
+            };
+            let locks = crate::broadcast::BroadcastLocks::new();
+            let outcomes = Arc::new(OutcomeStore::new(8));
+            if funding.gas.is_some() {
+                rpc.push_success(&"0x186a0");
+            }
+            rpc.push_success(&Bytes::from(false.abi_encode()));
+            assert_eq!(
+                handle_job(
+                    &route,
+                    &config,
+                    &provider,
+                    Address::repeat_byte(4),
+                    &locks,
+                    &job,
+                    funding,
+                    NoopMetrics::new().as_ref(),
+                    None,
+                    &outcomes
+                )
+                .await
+                .unwrap(),
+                DeliveryResultKind::Retryable,
+                "{mode}"
+            );
+            assert!(outcomes.get(&job.message_id).is_none());
+            assert!(rpc.read_q().is_empty(), "{mode}");
+            if config.simulate_before_send {
+                rpc.push_success(&Bytes::from(true.abi_encode()));
+            }
+            if funding.gas.is_some() {
+                rpc.push_success(&"0x186a0");
+            }
+            rpc.push_success(&Bytes::from(true.abi_encode()));
+            mock_execution_receipt(
+                &rpc,
+                vec![inbox_event_log(
+                    route.inbox_address,
+                    IInbox::MessageExecuted {
+                        messageId: job.message_id,
+                        emitterAddress: job.emitter,
+                        destination: Address::repeat_byte(5),
+                        dispatcher: Address::repeat_byte(6),
+                        relayer: Address::repeat_byte(4),
+                        messagePayload: job.payload.clone().into(),
+                    }
+                    .encode_log_data(),
+                )],
+                true,
+            );
+            assert_eq!(
+                handle_job(
+                    &route,
+                    &config,
+                    &provider,
+                    Address::repeat_byte(4),
+                    &locks,
+                    &job,
+                    funding,
+                    NoopMetrics::new().as_ref(),
+                    None,
+                    &outcomes
+                )
+                .await
+                .unwrap(),
+                DeliveryResultKind::Delivered,
+                "{mode}"
+            );
+            assert!(rpc.read_q().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_gas_cap_failures_do_not_broadcast_and_recover_after_state_changes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Mutex;
+
+        let (mut route, job) = delivery_fixture();
+        route.max_gas_limit = 100_000;
+        let signer = Address::repeat_byte(4);
+        let recovered = Arc::new(AtomicBool::new(false));
+        let requests = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let hash = B256::repeat_byte(0x44);
+        let event = IInbox::MessageExecuted {
+            messageId: job.message_id,
+            emitterAddress: job.emitter,
+            destination: Address::repeat_byte(5),
+            dispatcher: Address::repeat_byte(6),
+            relayer: signer,
+            messagePayload: job.payload.clone().into(),
+        };
+        let log = Log {
+            inner: alloy::primitives::Log {
+                address: route.inbox_address,
+                data: event.encode_log_data(),
+            },
+            ..Default::default()
+        };
+        let receipt = serde_json::json!({
+            "status": "0x1", "cumulativeGasUsed": "0x1",
+            "logsBloom": format!("0x{}", "00".repeat(256)), "logs": [log],
+            "transactionHash": hash, "transactionIndex": "0x0",
+            "blockHash": B256::repeat_byte(0x55), "blockNumber": "0x1",
+            "gasUsed": "0x1", "effectiveGasPrice": "0x1",
+            "from": signer, "to": route.inbox_address, "type": "0x2",
+        });
+        let app = axum::Router::new().route("/", axum::routing::post({
+            let recovered = recovered.clone();
+            let requests = requests.clone();
+            move |axum::Json(request): axum::Json<serde_json::Value>| {
+                let recovered = recovered.clone();
+                let requests = requests.clone();
+                let receipt = receipt.clone();
+                async move {
+                    requests.lock().unwrap().push(request.clone());
+                    let mut response = serde_json::json!({"jsonrpc": "2.0", "id": request["id"]});
+                    if request["method"] == "eth_call" && !recovered.load(Ordering::SeqCst) {
+                        response["error"] = serde_json::json!({
+                            "code": 3, "message": "execution reverted: InsufficientGasForDestination()"
+                        });
+                    } else {
+                        response["result"] = match request["method"].as_str().unwrap() {
+                            "eth_estimateGas" => serde_json::json!("0x186a0"),
+                            "eth_call" => serde_json::json!(Bytes::from(true.abi_encode())),
+                            "eth_sendTransaction" => serde_json::json!(hash),
+                            "eth_getTransactionReceipt" => receipt,
+                            method => panic!("unexpected RPC method {method}"),
+                        };
+                    }
+                    axum::Json(response)
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect(&url)
+            .await
+            .unwrap();
+        let outcomes = Arc::new(OutcomeStore::new(8));
+        let config = DeliveryConfig {
+            simulate_before_send: false,
+            max_retries: 1,
+            ..Default::default()
+        };
+        for attempt in 0..4 {
+            if attempt == 3 {
+                recovered.store(true, Ordering::SeqCst);
+            }
+            let result = handle_job(
+                &route,
+                &config,
+                &provider,
+                signer,
+                &crate::broadcast::BroadcastLocks::new(),
+                &job,
+                MessageFunding {
+                    gas: Some(100_000),
+                    ..MessageFunding::unknown()
+                },
+                NoopMetrics::new().as_ref(),
+                None,
+                &outcomes,
+            )
+            .await
+            .unwrap();
+            let requests = requests.lock().unwrap();
+            let sends = requests
+                .iter()
+                .filter(|r| r["method"] == "eth_sendTransaction")
+                .count();
+            if attempt < 3 {
+                assert_eq!(result, DeliveryResultKind::Retryable);
+                assert_eq!(sends, 0, "a known gas-cap failure was broadcast");
+                assert!(outcomes.get(&job.message_id).is_none());
+            } else {
+                assert_eq!(result, DeliveryResultKind::Delivered);
+                assert_eq!(sends, 1);
+            }
+            for call in requests.iter().filter(|r| r["method"] == "eth_call") {
+                assert_eq!(call["params"][0]["gas"], "0x186a0");
+                assert_eq!(call["params"][0]["from"], serde_json::json!(signer));
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn locally_verified_publication_limits_remain_terminal_without_sending() {
+        let (route, mut job) = delivery_fixture();
+        for payload in [envelope(1, 100_000), envelope(0, route.max_gas_limit + 1)] {
+            job.payload = payload;
+            let rpc = Asserter::new();
+            let provider = ProviderBuilder::new().connect_mocked_client(rpc);
+            let outcomes = Arc::new(OutcomeStore::new(8));
+            assert_eq!(
+                handle_job(
+                    &route,
+                    &DeliveryConfig::default(),
+                    &provider,
+                    Address::repeat_byte(4),
+                    &crate::broadcast::BroadcastLocks::new(),
+                    &job,
+                    MessageFunding::unknown(),
+                    NoopMetrics::new().as_ref(),
+                    None,
+                    &outcomes,
+                )
+                .await
+                .unwrap(),
+                DeliveryResultKind::Terminal,
+            );
+            assert_eq!(
+                outcomes.get(&job.message_id).unwrap().kind,
+                OutcomeKind::Undeliverable
+            );
+        }
+    }
+
+    #[test]
+    fn state_dependent_and_unknown_reverts_keep_work() {
+        let (route, job) = delivery_fixture();
+        let metrics = NoopMetrics::new();
+        let outcomes = OutcomeStore::new(8);
+        for error in [
+            structured_revert(
+                "execution reverted: InvalidAttestor",
+                &[0x12, 0x34, 0x56, 0x78],
+            ),
+            structured_revert("execution reverted: ThresholdNotMet", &[]),
+            structured_revert(
+                "execution reverted",
+                &IInbox::InvalidMessageDispatcher {
+                    dispatcher: Address::ZERO,
+                }
+                .abi_encode(),
+            ),
+            structured_revert(
+                "execution reverted",
+                &IInbox::ValidationFailedWithNativeValue {
+                    messageId: job.message_id,
+                    value: U256::from(1),
+                }
+                .abi_encode(),
+            ),
+        ] {
+            let class = classify_delivery_revert(&error).unwrap();
+            assert!(matches!(
+                settle_pre_send_revert(
+                    &route,
+                    &job,
+                    metrics.as_ref(),
+                    &outcomes,
+                    "simulate",
+                    class,
+                    &error,
+                ),
+                Stage::Done(DeliveryResultKind::Retryable)
+            ));
+            assert_eq!(
+                retry_delivery_revert(
+                    &route,
+                    job.message_id,
+                    metrics.as_ref(),
+                    Some(class),
+                    "send or mined",
+                ),
+                DeliveryResultKind::Retryable
+            );
+        }
+        assert_eq!(
+            retry_delivery_revert(
+                &route,
+                job.message_id,
+                metrics.as_ref(),
+                None,
+                "replay unavailable",
+            ),
+            DeliveryResultKind::Retryable
+        );
+        assert!(outcomes.get(&job.message_id).is_none());
+
+        let error = structured_revert(
+            "execution reverted",
+            &IInbox::MessageIdMismatch {
+                messageId: job.message_id,
+            }
+            .abi_encode(),
+        );
+        let class = classify_delivery_revert(&error).unwrap();
+        // Inbox bubbles dispatcher/validator errors, so even this selector cannot prove a bad
+        // publication independently of the mutable contracts that emitted it.
+        assert_eq!(class, DeliveryRevert::Other);
+        assert!(matches!(
+            settle_pre_send_revert(
+                &route,
+                &job,
+                metrics.as_ref(),
+                &outcomes,
+                "simulate",
+                class,
+                &error,
+            ),
+            Stage::Done(DeliveryResultKind::Retryable)
+        ));
+        assert!(outcomes.get(&job.message_id).is_none());
+    }
 
     /// Matches the grace period `run` actually computes: see the comment above its `error_grace_period` binding.
     const ERROR_GRACE_PERIOD: Duration =
@@ -2488,33 +3286,70 @@ mod tests {
         );
 
         assert_eq!(
-            classify_success_logs(inbox, [&received]),
-            ReceiptClass::Delivered
+            classify_success_logs(inbox, id, [&received]),
+            ReceiptClass::Unknown
         );
         assert_eq!(
-            classify_success_logs(inbox, [&failed, &received]),
+            classify_success_logs(inbox, id, [&failed, &received]),
             ReceiptClass::DestinationFailed { dispatcher }
         );
         // Order-independent.
         assert_eq!(
-            classify_success_logs(inbox, [&received, &failed]),
+            classify_success_logs(inbox, id, [&received, &failed]),
             ReceiptClass::DestinationFailed { dispatcher }
         );
         assert_eq!(
-            classify_success_logs(inbox, [&queued]),
+            classify_success_logs(inbox, id, [&queued]),
             ReceiptClass::Pending
         );
         assert_eq!(
-            classify_success_logs(inbox, [&deferred]),
+            classify_success_logs(inbox, id, [&deferred]),
             ReceiptClass::Pending
         );
         assert_eq!(
-            classify_success_logs(inbox, [&foreign_failed, &received]),
+            classify_success_logs(inbox, id, [&foreign_failed, &received]),
+            ReceiptClass::Unknown
+        );
+        assert_eq!(
+            classify_success_logs(inbox, id, std::iter::empty()),
+            ReceiptClass::Unknown
+        );
+    }
+
+    #[test]
+    fn success_receipt_requires_execution_for_the_exact_message() {
+        let inbox = Address::repeat_byte(1);
+        let id = B256::repeat_byte(2);
+        let executed = inbox_event_log(
+            inbox,
+            IInbox::MessageExecuted {
+                messageId: id,
+                emitterAddress: Address::repeat_byte(3),
+                destination: Address::repeat_byte(4),
+                dispatcher: Address::repeat_byte(5),
+                relayer: Address::repeat_byte(6),
+                messagePayload: Bytes::new(),
+            }
+            .encode_log_data(),
+        );
+        assert_eq!(
+            classify_success_logs(inbox, id, [&executed]),
             ReceiptClass::Delivered
         );
         assert_eq!(
-            classify_success_logs(inbox, std::iter::empty()),
-            ReceiptClass::Delivered
+            classify_success_logs(inbox, B256::repeat_byte(9), [&executed]),
+            ReceiptClass::Unknown
+        );
+        let validation_failed = inbox_log(
+            inbox,
+            vec![
+                alloy::primitives::keccak256("ValidationFailed(bytes32)"),
+                id,
+            ],
+        );
+        assert_eq!(
+            classify_success_logs(inbox, id, [&validation_failed]),
+            ReceiptClass::Unknown
         );
     }
 
