@@ -1,6 +1,7 @@
 ---
 name: Full-stack recovery
 
+# checkov:skip=CKV_GHA_7:Manual inputs select immutable source commits for tests only; the callee validates full SHAs and publishes no deployment artifacts.
 "on":
   pull_request:
   push:
@@ -28,9 +29,9 @@ jobs:
   recovery:
     name: Real stack / delivery and durable restart
     # Pin the reusable workflow and its default source together; update deliberately.
-    uses: gluwa/creditcoin3/.github/workflows/write-ability-e2e.yml@1cb4ffbcaad726e216475c5ceff7a51fe71184e9
+    uses: gluwa/creditcoin3/.github/workflows/write-ability-e2e.yml@7bf0f8007a173a033261da3548ee538f35d1df04
     with:
-      creditcoin-ref: ${{ inputs.creditcoin-ref || '1cb4ffbcaad726e216475c5ceff7a51fe71184e9' }}
+      creditcoin-ref: ${{ inputs.creditcoin-ref || '7bf0f8007a173a033261da3548ee538f35d1df04' }}
       relayer-repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
       # Exercise the candidate itself, rather than a moving branch or the synthetic merge SHA.
       relayer-ref: ${{ github.event.pull_request.head.sha || github.sha }}

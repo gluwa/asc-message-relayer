@@ -9,7 +9,7 @@ authority**: everything it submits is either verified on-chain against attestor 
 against Creditcoin's native proving — a malicious relayer can censor (until another relayer picks
 the message up), but cannot forge.
 
-```
+```text
         Creditcoin L1                                        Destination chain (e.g. Sepolia)
   ┌─────────────────────────┐                             ┌──────────────────────────────────┐
   │ dApp ── publishMessage ─► Outbox                      │            Inbox ── receiveMessage ─► dApp
@@ -80,7 +80,7 @@ shutdown, and any worker exiting tears the process down (fail-fast, restart by t
 Workers communicate over `mpsc` channels only — the pool owns all aggregation state, unshared.
 
 | Worker | Source | Purpose |
-|---|---|---|
+| --- | --- | --- |
 | Outbox watcher (per route) | `src/events/` | Scan finalized `MessagePublished` across historically authorized Outboxes, journal work, feed the pool |
 | Vote pool (one) | `src/pool/` | Validate + aggregate votes, dispatch deliveries, emit reobservation requests, serve `/votes` queries |
 | p2p worker (one swarm) | `src/p2p/` | gossipsub mesh with the attestors: receive votes, publish reobservation requests |
@@ -173,7 +173,7 @@ and repeated failures escalate in logs and metrics:
 ## Trust & key model
 
 | Key | Chain | Needs | Notes |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `routes[].signer_key` | destination | gas | pays for `deliverMessage`; no authority — votes are what's verified |
 | `routes[].ack.signer_key` | Creditcoin | gas | pays for `submitAcknowledgment`; permissionless, proof is self-validating |
 | `p2p.identity` | — | stability only | ed25519 seed/mnemonic for a stable PeerId; ephemeral if unset |
@@ -221,7 +221,7 @@ sensible defaults): `RELAYER_ACK_POLL_SECS` and `RELAYER_CLAIM_POLL_SECS`.
 ## HTTP API
 
 | Endpoint | Purpose |
-|---|---|
+| --- | --- |
 | `GET /health` | liveness (200 when the process is up) |
 | `GET /metrics` | Prometheus/OpenMetrics |
 | `GET /votes/{message_hash}` | vote bundle for a message: signers seen, threshold, delivered flag — lets an operator (or a sibling relayer) inspect aggregation state |
@@ -300,7 +300,7 @@ overrides the entrypoint so no other change is needed.
 
 ## Repository layout
 
-```
+```text
 message-relayer/         the relayer crate
   bin/relayer.rs         CLI entrypoint (clap; --config or --single-route)
   src/lib.rs             Server: worker wiring, channels, supervisor JoinSet
