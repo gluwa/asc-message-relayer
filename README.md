@@ -250,12 +250,21 @@ taplo format                     # TOML format (config in .taplo.toml)
 The `Full-stack recovery` workflow runs the candidate relayer commit with a real Creditcoin
 node, three attestors, Anvil and compiled contracts. It checks delivery, proof-based
 acknowledgment and fee settlement, then exercises durable recovery across a relayer restart.
-The workflow runs on every pull request and push to `main`; its reusable workflow and
-Creditcoin/contracts dependencies are pinned in
-[fullstack-recovery.yml](.github/workflows/fullstack-recovery.yml). A manual dispatch can
-override either dependency with a full commit SHA while retaining the selected relayer commit.
-Update the pins deliberately when a companion change is needed, and inspect the run's logs
-and scenario results for the tested revisions and assertions.
+The workflow runs on every pull request and push to `main`. It reuses a verified
+`binary-for-testing-ci` artifact from a successful Creditcoin CI run and builds the candidate
+relayer. The reusable workflow definition, native source/run/artifact and contracts are pinned
+in [fullstack-recovery.yml](.github/workflows/fullstack-recovery.yml). The workflow definition
+SHA selects the test implementation; `creditcoin-ref` identifies the native producer's source
+checkout, which can be a pull request merge commit.
+
+Update all three native pins together: `creditcoin-ref`, `creditcoin-run-id` and
+`creditcoin-artifact-id`. A manual dispatch can override these pins and the contracts commit
+while retaining the selected relayer commit. The callee checks the artifact's source, run,
+build configuration and binary hashes before execution, and records the original compilation
+revision when the producer reused a verified cache. An unavailable or expired artifact fails
+the check; refresh it through Creditcoin CI and update the pins after the complete producer run
+succeeds. There is no native rebuild fallback. Inspect the run's provenance, logs and scenario
+results for the tested revisions and assertions.
 
 Full-stack CI requires the existing `GLUWA_BOT_TOKEN` secret to read private `asc-contracts`.
 If it is absent, including fork and Dependabot pull requests, the check fails explicitly;
