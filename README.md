@@ -247,9 +247,30 @@ cargo fmt --all                  # format
 taplo format                     # TOML format (config in .taplo.toml)
 ```
 
-Integration tests behind the `integration-tests` feature (`tests/e2e_anvil.rs`) expect a local
-anvil; the golden-vector tests (`tests/golden_hash.rs`) run everywhere and are the drift guard
-for the wire protocol.
+The `Full-stack recovery` workflow runs the candidate relayer commit with a real Creditcoin
+node, three attestors, Anvil and compiled contracts. It checks delivery, proof-based
+acknowledgment and fee settlement, then exercises durable recovery across a relayer restart.
+The workflow runs on every pull request and push to `main`; its reusable workflow and
+Creditcoin/contracts dependencies are pinned in
+[fullstack-recovery.yml](.github/workflows/fullstack-recovery.yml). A manual dispatch can
+override either dependency with a full commit SHA while retaining the selected relayer commit.
+Update the pins deliberately when a companion change is needed, and inspect the run's logs
+and scenario results for the tested revisions and assertions.
+
+Full-stack CI requires the existing `GLUWA_BOT_TOKEN` secret to read private `asc-contracts`.
+If it is absent, including fork and Dependabot pull requests, the check fails explicitly;
+the run does not skip the required stack. The workflow uses GitHub-hosted runners and needs
+no Linode credentials. After building the binaries and installing the documented prerequisites
+in the pinned Creditcoin checkout, run:
+
+```bash
+cd usc-messaging
+npm run e2e -- --scenario happy-path,durable-restart --output-dir /tmp/relayer-fullstack
+```
+
+The historical `integration-tests` fixtures, including `tests/e2e_anvil.rs`, remain ignored
+placeholders and do not provide this coverage. The protocol golden-vector tests run as part
+of `cargo test --workspace` and guard wire compatibility.
 
 ### Docker
 

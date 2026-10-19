@@ -1,0 +1,42 @@
+---
+name: Full-stack recovery
+
+"on":
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      creditcoin-ref:
+        description: "Optional full Creditcoin commit SHA; empty uses the tested pin"
+        required: false
+        type: string
+      contracts-ref:
+        description: "Optional full asc-contracts commit SHA; empty uses the tested pin"
+        required: false
+        type: string
+
+permissions: read-all
+
+concurrency:
+  # A reusable workflow inherits github.workflow from this caller. Keep this prefix
+  # distinct from the callee's concurrency group so a run cannot cancel itself.
+  group: relayer-fullstack-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  recovery:
+    name: Real stack / delivery and durable restart
+    # Pin the reusable workflow and its default source together; update deliberately.
+    uses: gluwa/creditcoin3/.github/workflows/write-ability-e2e.yml@1cb4ffbcaad726e216475c5ceff7a51fe71184e9
+    with:
+      creditcoin-ref: ${{ inputs.creditcoin-ref || '1cb4ffbcaad726e216475c5ceff7a51fe71184e9' }}
+      relayer-repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+      # Exercise the candidate itself, rather than a moving branch or the synthetic merge SHA.
+      relayer-ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      contracts-ref: ${{ inputs.contracts-ref || '9e8a9e603d964b598b0d74bb8f4e5966ef75d17e' }}
+      scenarios: happy-path,durable-restart
+    secrets:
+      # Private contracts are a required dependency. The callee fails explicitly if this
+      # secret is unavailable, including forks and Dependabot; it never reports a skipped pass.
+      GLUWA_BOT_TOKEN: ${{ secrets.GLUWA_BOT_TOKEN }}
