@@ -37,6 +37,23 @@ pub(super) struct RouteHistory {
 }
 
 impl RouteHistory {
+    /// Use the same live source identity as publication indexing. Include it in the cache path
+    /// so legacy history labeled with a configured (possibly incorrect) chain id cannot wedge
+    /// settlement after an upgrade. Rebuilding this derived cache never releases pending work.
+    pub(super) async fn load_from_source<P: Provider>(
+        path: Option<PathBuf>,
+        inbox: Address,
+        source_provider: &P,
+    ) -> Result<Self> {
+        let source_chain_id =
+            tokio::time::timeout(HINT_READ_TIMEOUT, source_provider.get_chain_id())
+                .await
+                .context("settlement source chain ID lookup timed out")?
+                .context("reading settlement source chain ID")?;
+        let path = path.map(|path| path.with_extension(format!("source-{source_chain_id}.json")));
+        Self::load(path, inbox, source_chain_id)
+    }
+
     pub(super) fn load(
         path: Option<PathBuf>,
         inbox: Address,
@@ -78,6 +95,10 @@ impl RouteHistory {
 
     pub(super) fn outboxes(&self) -> &BTreeSet<Address> {
         &self.state.outboxes
+    }
+
+    pub(super) fn source_chain_id(&self) -> u64 {
+        self.state.source_chain_id
     }
 
     /// Seed current support as a fast path while full history catches up. These hints never
@@ -501,6 +522,89 @@ mod tests {
             log_index: Some(0),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn live_source_identity_recovers_legacy_mismatch_and_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routes.json");
+        let inbox = address(9);
+        let outbox = address(1);
+        let authority = address(11);
+        let configured_chain_id = SOURCE + 1;
+        let legacy = History {
+            inbox,
+            source_chain_id: configured_chain_id,
+            scanned: Some((0, 5_000)),
+            outboxes: BTreeSet::from([address(2)]),
+        };
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        std::fs::write(&path, &legacy_bytes).unwrap();
+        let rpc = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(rpc.clone());
+        rpc.push_success(&U64::from(SOURCE));
+        let mut history = RouteHistory::load_from_source(Some(path.clone()), inbox, &provider)
+            .await
+            .unwrap();
+        assert_eq!(history.source_chain_id(), SOURCE);
+        assert!(history.state.scanned.is_none());
+        assert!(history.outboxes().is_empty());
+        rpc.push_success(&Bytes::from(vec![outbox].abi_encode()));
+        history.seed(&provider).await.unwrap();
+        drop(history);
+
+        // Restart reads the live identity again and retains the rebuilt candidates. The old
+        // config-keyed cache stays untouched and cannot reintroduce its wrong scanned range.
+        rpc.push_success(&U64::from(SOURCE));
+        let history = RouteHistory::load_from_source(Some(path.clone()), inbox, &provider)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), legacy_bytes);
+        assert_eq!(history.source_chain_id(), SOURCE);
+        assert_eq!(history.outboxes(), &BTreeSet::from([outbox]));
+        assert!(history.state.scanned.is_none());
+        let message = record(true);
+        let id = message_id(outbox, &message, SOURCE);
+        assert_ne!(id, message_id(outbox, &message, configured_chain_id));
+        push_record(&rpc, &message);
+        push_authority(&rpc, outbox, authority);
+        assert_eq!(
+            resolved(
+                &provider,
+                history.source_chain_id(),
+                DESTINATION,
+                history.outboxes(),
+                &[id],
+            )
+            .await
+            .unwrap(),
+            BTreeSet::from([authority]),
+        );
+
+        // A corrupt cache for the actual source still fails closed; only legacy history is
+        // rebuilt. Never treat corruption as permission to skip authorization history.
+        std::fs::write(history.path.unwrap(), "not json").unwrap();
+        rpc.push_success(&U64::from(SOURCE));
+        assert!(RouteHistory::load_from_source(Some(path), inbox, &provider)
+            .await
+            .is_err());
+        assert!(rpc.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn source_identity_failure_does_not_fall_back_to_configured_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routes.json");
+        let rpc = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(rpc.clone());
+        rpc.push_failure_msg("source RPC unavailable");
+        let error = RouteHistory::load_from_source(Some(path), address(9), &provider)
+            .await
+            .err()
+            .expect("source identity is required before settlement routing");
+        assert!(format!("{error:#}").contains("reading settlement source chain ID"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert!(rpc.read_q().is_empty());
     }
 
     #[tokio::test]
