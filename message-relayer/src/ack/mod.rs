@@ -247,7 +247,8 @@ pub async fn run(
         ))
     });
     let mut route_history =
-        routes::RouteHistory::load(history_path, route.inbox_address, route.creditcoin_chain_id)?;
+        routes::RouteHistory::load_from_source(history_path, route.inbox_address, &source_provider)
+            .await?;
     if let Err(err) = route_history.seed(&dest_provider).await {
         warn!(chain_key, %err, "current Outbox hints unavailable; recovering complete support history");
     }
@@ -400,7 +401,7 @@ pub async fn run(
                     chain_key,
                     &ack,
                     &mode,
-                    route.creditcoin_chain_id,
+                    route_history.source_chain_id(),
                     route_history.outboxes(),
                     &client,
                     &source_provider,
