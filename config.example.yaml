@@ -13,12 +13,12 @@ bind_host: "0.0.0.0"
 bind_port: 3200
 
 # Vote source (pick one):
-#  * `spy` — subscribe to a spy node's WebSocket instead of embedding a libp2p swarm (target
-#    architecture; the spy must run allow_publish: true so this relayer can gossip reobservation
-#    requests through it). The `p2p` section is ignored when `spy` is set.
+#  * `observer` — subscribe to an observer node's WebSocket instead of embedding a libp2p swarm (target
+#    architecture; the observer must run allow_publish: true so this relayer can gossip reobservation
+#    requests through it). The `p2p` section is ignored when `observer` is set.
 #  * `p2p` — embedded swarm (standalone deployments and local dev).
-# spy:
-#   ws_url: "ws://cc3-usc-dev-spy-node:9190/ws"
+# observer:
+#   ws_url: "ws://cc3-usc-dev-observer-node:9190/ws"
 
 p2p:
   # libp2p (QUIC+TCP) port for the gossipsub mesh shared with the attestors.

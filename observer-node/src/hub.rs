@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
-use crate::events::SpyEvent;
+use crate::events::ObserverEvent;
 
 /// Capacity of the hub's broadcast ring. Sized for bursts (catch-up gossip after a mesh join can
 /// deliver a few thousand votes at once); a consumer that can't drain this fast gets disconnected.
@@ -18,7 +18,7 @@ const HUB_CAPACITY: usize = 8_192;
 
 #[derive(Clone)]
 pub struct Hub {
-    tx: broadcast::Sender<Arc<SpyEvent>>,
+    tx: broadcast::Sender<Arc<ObserverEvent>>,
 }
 
 impl Default for Hub {
@@ -35,17 +35,17 @@ impl Hub {
     }
 
     /// Publish an event to all current subscribers. A send with zero subscribers is not an
-    /// error — the spy observes the mesh whether or not anyone is listening.
-    pub fn publish(&self, event: SpyEvent) {
+    /// error — the observer observes the mesh whether or not anyone is listening.
+    pub fn publish(&self, event: ObserverEvent) {
         let _ = self.tx.send(Arc::new(event));
     }
 
     #[must_use]
-    pub fn subscribe(&self) -> broadcast::Receiver<Arc<SpyEvent>> {
+    pub fn subscribe(&self) -> broadcast::Receiver<Arc<ObserverEvent>> {
         self.tx.subscribe()
     }
 
-    /// Current subscriber count (drives the `spy_ws_clients` gauge).
+    /// Current subscriber count (drives the `observer_ws_clients` gauge).
     #[must_use]
     pub fn subscriber_count(&self) -> usize {
         self.tx.receiver_count()
@@ -60,10 +60,10 @@ mod tests {
     async fn publish_reaches_subscribers_and_zero_subscribers_is_fine() {
         let hub = Hub::new();
         // No subscribers: must not error or panic.
-        hub.publish(SpyEvent::peer_status(1, 0));
+        hub.publish(ObserverEvent::peer_status(1, 0));
 
         let mut rx = hub.subscribe();
-        hub.publish(SpyEvent::peer_status(102, 3));
+        hub.publish(ObserverEvent::peer_status(102, 3));
         let got = rx.recv().await.unwrap();
         assert_eq!(got.chain_key(), 102);
     }

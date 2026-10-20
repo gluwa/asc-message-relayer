@@ -64,6 +64,17 @@ pub trait MetricsTrait: Send + Sync + Debug {
     /// Native-token balance (in ether units) of the signer funding `role` on `chain_key`. Polled
     /// by `crate::balance`; the low-balance dashboard threshold hangs off this.
     fn set_signer_balance(&self, chain_key: u64, role: &'static str, address: Address, ether: f64);
+    /// A watcher's checkpoint write (`CheckpointStore::set`/`set_with_outbox`) failed for
+    /// `chain_key` (disk full, permissions, …). The checkpoint is what makes a restart resume
+    /// instead of re-scanning from the chain head or losing the cursor holdback on an in-flight
+    /// message, so a write failure degrading silently into "only visible in logs" would hide a
+    /// real durability regression. A rising count with no matching recovery is worth paging on.
+    fn inc_checkpoint_write_failure(&self, chain_key: u64);
+    /// A message's delivery-attempt count crossed `DELIVERY_MAX_DISPATCH_ATTEMPTS` and is still
+    /// being retried (uncapped by design — see `crate::pool`). Previously only a `warn!` log line;
+    /// a message stuck here for a persistently misbehaving destination (bad gas limit, dead
+    /// signer) is now dashboard-visible instead of log-grep-only.
+    fn inc_delivery_retries_exceeded(&self, chain_key: u64);
 }
 
 /// Shared trait object — used to plumb metrics through services without leaking the concrete type.
@@ -102,6 +113,8 @@ impl MetricsTrait for NoopMetrics {
         _ether: f64,
     ) {
     }
+    fn inc_checkpoint_write_failure(&self, _chain_key: u64) {}
+    fn inc_delivery_retries_exceeded(&self, _chain_key: u64) {}
 }
 
 /// Concrete metrics container.
@@ -129,6 +142,11 @@ pub struct RelayerMetrics {
     #[allow(dead_code)]
     start_time_seconds: Gauge<f64, AtomicU64>,
     worker_last_success: Family<LabelWorker, Gauge<f64, AtomicU64>>,
+    worker_degraded: Family<LabelWorker, Gauge<i64, AtomicI64>>,
+    checkpoint_write_failures: Family<LabelChain, Counter<u64, AtomicU64>>,
+    delivery_retries_exceeded: Family<LabelChain, Counter<u64, AtomicU64>>,
+    outcome_store_size: Gauge<i64, AtomicI64>,
+    outcome_store_evictions: Gauge<i64, AtomicI64>,
 }
 
 impl RelayerMetrics {
@@ -290,6 +308,58 @@ impl RelayerMetrics {
             worker_last_success.clone(),
         );
 
+        let worker_degraded = Family::default();
+        registry.register(
+            "relayer_worker_degraded",
+            "1 while the worker has made no successful poll within the health deadline but is \
+             still ticking and erroring (upstream outage, rate limit) — alive, retrying and \
+             rebuilding its provider, so /health stays 200 and no restart happens; 0 otherwise. A \
+             worker that is silent (neither success nor error) is not degraded but stale, which \
+             fails /health — see relayer_worker_last_success_timestamp_seconds. Synced at scrape \
+             time from the /health registry.",
+            worker_degraded.clone(),
+        );
+
+        let checkpoint_write_failures = Family::default();
+        registry.register(
+            "relayer_checkpoint_write_failures",
+            "Failed CheckpointStore writes per chain_key (disk full, permissions, …). The \
+             checkpoint is what lets a restart resume instead of re-scanning from the chain head \
+             or losing cursor-holdback protection for an in-flight message, so this should stay \
+             at zero.",
+            checkpoint_write_failures.clone(),
+        );
+
+        let delivery_retries_exceeded = Family::default();
+        registry.register(
+            "relayer_delivery_retries_exceeded",
+            "Delivery attempts on a message past DELIVERY_MAX_DISPATCH_ATTEMPTS, per chain_key. \
+             Retries are uncapped by design, so this is not an error budget — it flags a message \
+             stuck retrying against a persistently misbehaving destination (bad gas limit, dead \
+             signer) that was previously visible only via log-grep.",
+            delivery_retries_exceeded.clone(),
+        );
+
+        let outcome_store_size = Gauge::default();
+        registry.register(
+            "relayer_outcome_store_size",
+            "Current number of entries in the bounded per-message outcome store. Synced at \
+             scrape time.",
+            outcome_store_size.clone(),
+        );
+
+        let outcome_store_evictions = Gauge::default();
+        registry.register(
+            "relayer_outcome_store_evictions",
+            "Cumulative count of outcomes evicted from the bounded store past its capacity. A \
+             rising count means /outcomes/{id} 404s can no longer be assumed to mean \"never \
+             recorded\" — the id may have aged out. This is a scrape-time gauge synced from the \
+             store's own counter (mirrors `outcome_store_size`), not a `Counter` metric, so it \
+             deliberately carries no `_total` suffix — that suffix is Prometheus/OpenMetrics' \
+             reserved marker for the `Counter` type.",
+            outcome_store_evictions.clone(),
+        );
+
         registry.register(
             "relayer_server",
             "Relayer information",
@@ -324,6 +394,11 @@ impl RelayerMetrics {
             thread_count,
             start_time_seconds,
             worker_last_success,
+            worker_degraded,
+            checkpoint_write_failures,
+            delivery_retries_exceeded,
+            outcome_store_size,
+            outcome_store_evictions,
         }
     }
 
@@ -334,12 +409,32 @@ impl RelayerMetrics {
     /// unincremented counter family would emit nothing and absence is indistinguishable from
     /// health, the exact trap this metric closes).
     pub fn sync_worker_progress(&self, health: &crate::health::Health) {
+        let report = health.status();
         for (worker, last_ms) in health.snapshot() {
+            let degraded = i64::from(report.degraded.contains(&worker));
             #[allow(clippy::cast_precision_loss)] // unix millis fit f64 exactly until year 287396
             self.worker_last_success
-                .get_or_create(&LabelWorker { worker })
+                .get_or_create(&LabelWorker {
+                    worker: worker.clone(),
+                })
                 .set(last_ms as f64 / 1000.0);
+            self.worker_degraded
+                .get_or_create(&LabelWorker { worker })
+                .set(degraded);
         }
+    }
+
+    /// Publish the outcome store's size and cumulative eviction count. Called at scrape time,
+    /// mirroring [`Self::sync_worker_progress`]: the store is the single source of truth and stays
+    /// free of a metrics-crate dependency, rather than threading a `Metrics` handle into it just to
+    /// push two numbers.
+    pub fn sync_outcome_store(&self, outcomes: &crate::outcome::OutcomeStore) {
+        #[allow(clippy::cast_possible_wrap)]
+        // bounded by OutcomeStore's cap, nowhere near i64::MAX
+        self.outcome_store_size.set(outcomes.len() as i64);
+        #[allow(clippy::cast_possible_wrap)]
+        self.outcome_store_evictions
+            .set(outcomes.evictions() as i64);
     }
 
     pub fn encode(&self) -> String {
@@ -501,75 +596,173 @@ impl MetricsTrait for RelayerMetrics {
             })
             .set(ether);
     }
+
+    fn inc_checkpoint_write_failure(&self, chain_key: u64) {
+        self.checkpoint_write_failures
+            .get_or_create(&LabelChain { chain_key })
+            .inc();
+    }
+
+    fn inc_delivery_retries_exceeded(&self, chain_key: u64) {
+        self.delivery_retries_exceeded
+            .get_or_create(&LabelChain { chain_key })
+            .inc();
+    }
 }
 
-/// Build the HTTP surface (`/metrics` + `/health` + `/votes/{message_hash}`). `query_tx` reaches the
-/// vote pool so the votes endpoint can serve the live accumulated bundle for a message.
+/// Build the HTTP surface (`/metrics` + `/health` + `/votes/{message_id}` + `/outcomes`).
+/// `query_tx` reaches the vote pool so the votes endpoint can serve the live accumulated bundle for
+/// a message; `outcomes` is the delivery workers' record of terminal verdicts.
 pub fn build_router(
     metrics: Arc<RelayerMetrics>,
     query_tx: tokio::sync::mpsc::Sender<crate::pool::PoolQuery>,
     health: Arc<crate::health::Health>,
+    outcomes: Arc<crate::outcome::OutcomeStore>,
 ) -> axum::Router {
     use axum::routing::get;
     use axum::Extension;
 
     axum::Router::new()
         .route("/health", get(health_handler))
+        .route("/outcomes/{message_id}", get(outcome_handler))
+        .route("/outcomes", get(outcomes_handler))
         .route(
             "/metrics",
             get(
                 |Extension(m): Extension<Arc<RelayerMetrics>>,
-                 Extension(health): Extension<Arc<crate::health::Health>>| async move {
+                 Extension(health): Extension<Arc<crate::health::Health>>,
+                 Extension(outcomes): Extension<Arc<crate::outcome::OutcomeStore>>| async move {
                     m.sync_worker_progress(&health);
+                    m.sync_outcome_store(&outcomes);
                     m.build_metrics_response()
                 },
             ),
         )
-        .route("/votes/{message_hash}", get(votes_handler))
+        .route("/votes/{message_id}", get(votes_handler))
         .layer(Extension(metrics))
         .layer(Extension(query_tx))
         .layer(Extension(health))
+        .layer(Extension(outcomes))
 }
 
-/// `GET /health` — `200 ok` when every registered worker has reported progress within the deadline,
-/// `503` naming the stale worker(s) otherwise, so the k8s liveness probe restarts a wedged relayer.
+/// `GET /outcomes/{message_id}` — the delivery worker's terminal verdict for one message
+/// (`delivered` with the destination tx, `destination_failed`, `pending`, `undeliverable`,
+/// `terminal`). 404 when the relayer reached no verdict: never seen, still in flight (ask
+/// `/votes`), or evicted from the bounded store.
+async fn outcome_handler(
+    axum::extract::Path(id_str): axum::extract::Path<String>,
+    axum::Extension(outcomes): axum::Extension<Arc<crate::outcome::OutcomeStore>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Ok(message_id) = id_str.parse::<alloy::primitives::B256>() else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "message_id must be 0x-prefixed 32-byte hex",
+        )
+            .into_response();
+    };
+    match outcomes.get(&message_id) {
+        Some(outcome) => axum::Json(outcome).into_response(),
+        None => (axum::http::StatusCode::NOT_FOUND, "no outcome recorded").into_response(),
+    }
+}
+
+/// Upper bound on ids per `/outcomes?ids=` request — one dashboard page of messages.
+const OUTCOMES_BATCH_MAX: usize = 256;
+
+#[derive(serde::Deserialize)]
+struct OutcomesQuery {
+    /// Comma-separated 0x-prefixed 32-byte message ids.
+    ids: String,
+}
+
+/// `GET /outcomes?ids=0x…,0x…` — batch form of [`outcome_handler`]: a JSON object keyed by message
+/// id holding the verdict for every id that has one. Ids without a verdict are simply absent, so
+/// one round trip answers a whole table. 400 on a malformed id or more than
+/// [`OUTCOMES_BATCH_MAX`] ids.
+async fn outcomes_handler(
+    axum::extract::Query(q): axum::extract::Query<OutcomesQuery>,
+    axum::Extension(outcomes): axum::Extension<Arc<crate::outcome::OutcomeStore>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let mut ids = Vec::new();
+    for part in q.ids.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match part.parse::<alloy::primitives::B256>() {
+            Ok(id) => ids.push(id),
+            Err(_) => {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    format!("bad message id: {part}"),
+                )
+                    .into_response();
+            }
+        }
+    }
+    if ids.len() > OUTCOMES_BATCH_MAX {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("at most {OUTCOMES_BATCH_MAX} ids per request"),
+        )
+            .into_response();
+    }
+    let found: std::collections::BTreeMap<String, crate::outcome::DeliveryOutcome> = outcomes
+        .get_many(&ids)
+        .into_iter()
+        .map(|(id, o)| (format!("{id:#x}"), o))
+        .collect();
+    axum::Json(found).into_response()
+}
+
+/// `GET /health` — `200 ok` when every registered worker has reported progress within the deadline;
+/// `200` naming the *degraded* worker(s) when some are erroring without progress (alive, retrying,
+/// not restart-worthy — see `crate::health`); `503` naming the *stale* worker(s) when one has gone
+/// silent, so the k8s liveness probe restarts a wedged relayer. Uses `Health::report`, which logs
+/// each transition, so the probe failure is attributable from the pod log.
 async fn health_handler(
     axum::Extension(health): axum::Extension<Arc<crate::health::Health>>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    match health.status() {
-        (true, _) => (axum::http::StatusCode::OK, "ok").into_response(),
-        (false, stale) => (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            format!("stale workers: {}", stale.join(", ")),
-        )
-            .into_response(),
+    let report = health.report();
+    let degraded = if report.degraded.is_empty() {
+        String::new()
+    } else {
+        format!("degraded workers: {}", report.degraded.join(", "))
+    };
+    if !report.is_alive() {
+        let mut body = format!("stale workers: {}", report.stale.join(", "));
+        if !degraded.is_empty() {
+            body.push_str("; ");
+            body.push_str(&degraded);
+        }
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response();
+    }
+    if degraded.is_empty() {
+        (axum::http::StatusCode::OK, "ok").into_response()
+    } else {
+        (axum::http::StatusCode::OK, degraded).into_response()
     }
 }
 
-/// `GET /votes/{message_hash}` — return the votes the relayer has accumulated for a message, so it
-/// acts as a queryable spy node (an operator or sibling relayer can ask what we have and act on it).
-/// `message_hash` is a 0x-prefixed 32-byte hex string. 404 if we have not indexed it.
+/// `GET /votes/{message_id}` — return the votes the relayer has accumulated for a message, so it
+/// acts as a queryable observer node (an operator or sibling relayer can ask what we have and act on it).
+/// `message_id` is a 0x-prefixed 32-byte hex string. 404 if we have not indexed it.
 async fn votes_handler(
-    axum::extract::Path(hash_str): axum::extract::Path<String>,
+    axum::extract::Path(id_str): axum::extract::Path<String>,
     axum::Extension(query_tx): axum::Extension<tokio::sync::mpsc::Sender<crate::pool::PoolQuery>>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    let Ok(message_hash) = hash_str.parse::<alloy::primitives::B256>() else {
+    let Ok(message_id) = id_str.parse::<alloy::primitives::B256>() else {
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            "message_hash must be 0x-prefixed 32-byte hex",
+            "message_id must be 0x-prefixed 32-byte hex",
         )
             .into_response();
     };
 
     let (reply, rx) = tokio::sync::oneshot::channel();
     if query_tx
-        .send(crate::pool::PoolQuery {
-            message_hash,
-            reply,
-        })
+        .send(crate::pool::PoolQuery { message_id, reply })
         .await
         .is_err()
     {
@@ -621,9 +814,11 @@ pub enum DeliveryStatus {
     AlreadyValidated,
     /// Votes validated, dApp callback deferred/reverted — stored for `retryPendingMessage`.
     Pending,
-    /// asc-contracts #36: delivered AND consumed, but the destination call failed
-    /// (`MessageExecutionFailed` alongside `MessageDelivered`). Not retryable; the relayer is still
-    /// paid on claim. A rising count here is a destination-dApp problem, not a relayer one.
+    /// asc-contracts #54: the destination call failed on this attempt (`DestinationFailed`
+    /// alongside `MessageReceived`). NOT consumed — the delivery worker hands it to a bounded
+    /// `retryFailedMessage` loop instead of resubmitting `deliverMessage` (which would now revert
+    /// `MessageAlreadyValidated`); the relayer is still paid on claim regardless. A rising count
+    /// here is a destination-dApp problem, not a relayer one.
     DestinationFailed,
     /// The envelope asked the relayer to front more native value than the route's
     /// `max_native_coin_value_wei`. Terminal (quoter/publisher-side fix).
@@ -637,6 +832,14 @@ pub enum DeliveryStatus {
     /// `deliverMessage` reverted `InvalidMessageDispatcher`: the Inbox's dispatcher has no code
     /// and value was attached. Terminal until the Inbox is reconfigured.
     InvalidDispatcher,
+    /// `deliverMessage` reverted with a shape `classify_delivery_revert` does not recognize —
+    /// distinct from the generic `Reverted` bucket (which also covers non-revert failures and
+    /// `InsufficientGasForDestination`) on purpose: the classifier's string/selector matching is
+    /// known to be fragile across node-client dialects (see the `MessageAlreadyProcessed` incident
+    /// documented on `revert_duplicate_delivery`), so a rising count here — as opposed to a rising
+    /// `Reverted` count — is the signal that a revert shape needs a new classifier arm, not just a
+    /// misbehaving publisher.
+    Unclassified,
 }
 
 /// Outcome of one settlement attempt (`submitAcknowledgment` or `claimDelivery`) — shared shape
@@ -785,6 +988,32 @@ mod tests {
         );
     }
 
+    /// The 2026-09-17 shape on the wire: a Base worker erroring past the deadline must show as
+    /// `relayer_worker_degraded{worker="ack:9"} 1` while a healthy worker on the same scrape is
+    /// present at 0 — present, so `absent()` alerting cannot confuse "healthy" with "never
+    /// registered".
+    #[test]
+    fn degraded_worker_reaches_the_scrape_body() {
+        let m = RelayerMetrics::new(&[8, 9]);
+        let h = crate::health::Health::new(Duration::from_secs(5 * 60));
+        h.set_for_test(
+            "ack:9",
+            Duration::from_secs(6 * 60),
+            Some(Duration::from_secs(20)),
+        );
+        h.heartbeat("ack:8");
+        m.sync_worker_progress(&h);
+        let body = m.encode();
+        assert!(
+            body.contains("relayer_worker_degraded{worker=\"ack:9\"} 1"),
+            "erroring-without-progress worker must be degraded=1:\n{body}"
+        );
+        assert!(
+            body.contains("relayer_worker_degraded{worker=\"ack:8\"} 0"),
+            "healthy worker must be present at degraded=0:\n{body}"
+        );
+    }
+
     /// 0 still encodes; an unincremented counter family emits nothing) and the no-op outcome to
     /// carry its own label value.
     #[test]
@@ -874,5 +1103,71 @@ mod tests {
         m.inc_ack_submission(1, SettlementOutcome::Terminal);
         m.inc_ack_proof_fetch(1, ProofFetchOutcome::Ready);
         m.inc_claim_submission(1, SettlementOutcome::Confirmed);
+        m.inc_checkpoint_write_failure(1);
+        m.inc_delivery_retries_exceeded(1);
+    }
+
+    /// A checkpoint write failure must be attributable to a chain_key, not just a log line — the
+    /// checkpoint is load-bearing for restart safety (see `crate::checkpoint`).
+    #[test]
+    fn checkpoint_write_failure_is_labeled_by_chain() {
+        let m = RelayerMetrics::new(&[8]);
+        m.inc_checkpoint_write_failure(8);
+        m.inc_checkpoint_write_failure(8);
+        let body = m.encode();
+        assert!(
+            body.contains("relayer_checkpoint_write_failures_total{chain_key=\"8\"} 2"),
+            "{body}"
+        );
+    }
+
+    /// A message stuck past the retry-exceeded threshold must be a countable series, not just a
+    /// `warn!` line — see `pool::State::note_delivery_result`.
+    #[test]
+    fn delivery_retries_exceeded_is_labeled_by_chain() {
+        let m = RelayerMetrics::new(&[8]);
+        m.inc_delivery_retries_exceeded(8);
+        let body = m.encode();
+        assert!(
+            body.contains("relayer_delivery_retries_exceeded_total{chain_key=\"8\"} 1"),
+            "{body}"
+        );
+    }
+
+    /// The outcome store's size and cumulative evictions must reach the scrape body, synced from
+    /// the store rather than pushed on every record/evict — mirrors `sync_worker_progress`.
+    #[test]
+    fn outcome_store_stats_reach_the_scrape_body() {
+        let m = RelayerMetrics::new(&[8]);
+        let store = crate::outcome::OutcomeStore::new(2);
+        for n in 1..=3u8 {
+            store.record(
+                alloy::primitives::B256::repeat_byte(n),
+                crate::outcome::DeliveryOutcome::new(crate::outcome::OutcomeKind::Delivered, 8),
+            );
+        }
+        m.sync_outcome_store(&store);
+        let body = m.encode();
+        assert!(
+            body.contains("relayer_outcome_store_size 2"),
+            "store is capped at 2:\n{body}"
+        );
+        assert!(
+            body.contains("relayer_outcome_store_evictions 1"),
+            "one of the three records must have evicted the oldest:\n{body}"
+        );
+    }
+
+    /// `Unclassified` must be its own label value on the existing `relayer_deliver_tx` family, not
+    /// folded into the generic `Reverted` bucket — see the `DeliveryStatus::Unclassified` doc.
+    #[test]
+    fn unclassified_revert_is_a_distinct_label() {
+        let m = RelayerMetrics::new(&[8]);
+        m.inc_deliver_tx(8, DeliveryStatus::Unclassified);
+        let body = m.encode();
+        assert!(
+            body.contains("relayer_deliver_tx_total{chain_key=\"8\",status=\"Unclassified\"} 1"),
+            "{body}"
+        );
     }
 }

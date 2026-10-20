@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{keccak256, Address, B256};
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::Provider;
 use alloy::rpc::types::Filter;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
@@ -45,6 +45,7 @@ use tracing::{debug, info, warn};
 use crate::checkpoint::CheckpointStore;
 use crate::config::{ChainRoute, ClaimConfig};
 use crate::pending::{BoundedSeen, PendingTxs};
+use crate::prom::Metrics;
 use crate::proofgen::{ProofFetch, ProofGenClient};
 
 /// Poll cadence for the client-chain intent watcher and the pending-proof retry queue.
@@ -167,11 +168,13 @@ fn claim_key(
 /// Spawn the claim submitter for one route. Returns immediately when the route has no `claim`
 /// config; otherwise loops until `cancel` fires. `scan_lookback_blocks` rewinds the persisted
 /// cursor on startup so claims in flight when the process died are re-discovered.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     route: ChainRoute,
     creditcoin_eth_rpc_url: String,
     checkpoint: Option<Arc<CheckpointStore>>,
     scan_lookback_blocks: u64,
+    metrics: Metrics,
     health: Arc<crate::health::Health>,
     broadcast_locks: Arc<crate::broadcast::BroadcastLocks>,
     cancel: CancellationToken,
@@ -190,16 +193,23 @@ pub async fn run(
     // RPC await). Must stay *after* the `route.claim` guard above.
     health.heartbeat(&health_key);
 
-    // Read-only provider on the client chain (where the intent events are emitted).
-    let client_provider = ProviderBuilder::new()
-        .connect(&route.destination_rpc_url)
+    // Read-only provider on the client chain (where the intent events are emitted). Held in a
+    // rebuilding slot — re-dialed after `rpc::REBUILD_AFTER_FAILURES` failed scans — so a dead
+    // transport heals in-process rather than through a liveness restart (see `crate::health`).
+    let mut client_rpc = crate::rpc::Reconnecting::new(
+        format!("claim:{chain_key} client chain"),
+        route.destination_rpc_url.clone(),
+    );
+    let client_provider = client_rpc
+        .connect()
         .await
         .with_context(|| {
             format!(
                 "chain_key {chain_key}: claim submitter failed to connect to client-chain RPC at {}",
                 route.destination_rpc_url
             )
-        })?;
+        })?
+        .clone();
 
     // Wallet-bearing provider on Creditcoin, where the claim is submitted. Permissionless: the
     // signer needs gas only — payouts go to the recipients proven in the Locked logs.
@@ -289,17 +299,25 @@ pub async fn run(
                     continue;
                 }
                 let mut rate_limited = false;
-                match discover_locks(
-                    chain_key,
-                    claim.source_bridge_address,
-                    claim.confirmation_depth,
-                    &client_provider,
-                    &mut last_seen,
-                    &mut pending,
-                    &done,
-                ).await {
+                let scan = match client_rpc.connect().await {
+                    Ok(provider) => {
+                        let provider = provider.clone();
+                        discover_locks(
+                            chain_key,
+                            claim.source_bridge_address,
+                            claim.confirmation_depth,
+                            &provider,
+                            &mut last_seen,
+                            &mut pending,
+                            &done,
+                        ).await
+                    }
+                    Err(err) => Err(err),
+                };
+                match scan {
                     Ok(()) => {
                         // Successful client-chain scan = loop progress (C2r).
+                        client_rpc.note_ok();
                         health.heartbeat(&health_key);
                         if let Some(cp) = &checkpoint {
                             // Never persist the cursor past a still-pending lock: a restart then
@@ -311,12 +329,16 @@ pub async fn run(
                                 .oldest_pending_block()
                                 .map_or(last_seen, |b| last_seen.min(b.saturating_sub(1)));
                             if let Err(err) = cp.set(&checkpoint_key, persist) {
+                                metrics.inc_checkpoint_write_failure(chain_key);
                                 warn!(chain_key, %err, "failed to persist claim checkpoint");
                             }
                         }
                     }
                     Err(err) => {
                         rate_limited = crate::pacing::error_looks_rate_limited(&format!("{err:#}"));
+                        // Degraded, not stale (see `crate::health`); re-dial after a failure streak.
+                        health.error(&health_key);
+                        client_rpc.note_err();
                         warn!(chain_key, %err, "claim discovery iteration failed; will retry");
                     }
                 }

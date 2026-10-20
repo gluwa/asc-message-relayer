@@ -194,6 +194,7 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
         &IOutbox::getMessageCall::SELECTOR,
     );
     outbox.assert_output_tuple("getMessage", "(address,uint64,uint64,bool,bool,bytes32)");
+    outbox.assert_mirrored("function", "validator()", &IOutbox::validatorCall::SELECTOR);
     outbox.assert_mirrored(
         "error",
         "MessageCannotBeAcknowledged(bytes32)",
@@ -214,13 +215,30 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
     let inbox = Artifact::load(&contracts, "Inbox.sol/Inbox.json");
     inbox.assert_mirrored(
         "function",
-        "deliverMessage(bytes32,address,address,bytes,bytes)",
+        "supportedOutboxes()",
+        &IInbox::supportedOutboxesCall::SELECTOR,
+    );
+    inbox.assert_mirrored(
+        "event",
+        IInbox::SupportedOutboxSet::SIGNATURE,
+        &IInbox::SupportedOutboxSet::SIGNATURE_HASH.0,
+    );
+    inbox.assert_mirrored(
+        "function",
+        "deliverMessage(bytes32,address,address,uint64,bytes,bytes)",
         &IInbox::deliverMessageCall::SELECTOR,
     );
+    inbox.assert_output_tuple("deliverMessage", "bool");
     inbox.assert_mirrored(
         "function",
         "retryPendingMessage(bytes32)",
         &IInbox::retryPendingMessageCall::SELECTOR,
+    );
+    // #54: new entrypoint driving retries after a DestinationFailed. No fresh votes taken.
+    inbox.assert_mirrored(
+        "function",
+        "retryFailedMessage(bytes32)",
+        &IInbox::retryFailedMessageCall::SELECTOR,
     );
     inbox.assert_mirrored(
         "function",
@@ -228,26 +246,66 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
         &IInbox::isPendingCall::SELECTOR,
     );
     inbox.assert_mirrored(
+        "function",
+        "processedAt(bytes32)",
+        &IInbox::processedAtCall::SELECTOR,
+    );
+    // #54: new view guarding retryFailedMessage against a guaranteed-revert call.
+    inbox.assert_mirrored(
+        "function",
+        "isRetryable(bytes32)",
+        &IInbox::isRetryableCall::SELECTOR,
+    );
+    // #54 renamed MessageDelivered -> MessageReceived (3-arg shape unchanged): it now fires on
+    // every accepted delivery attempt, success or destination-failure alike.
+    inbox.assert_mirrored(
         "event",
-        IInbox::MessageDelivered::SIGNATURE,
-        &IInbox::MessageDelivered::SIGNATURE_HASH.0,
+        IInbox::MessageReceived::SIGNATURE,
+        &IInbox::MessageReceived::SIGNATURE_HASH.0,
+    );
+    // #54 split the old single MessagePending into MessageQueued/MessageDeferred (same 3-indexed-
+    // arg shape, different topic0 each) — both must be mirrored or receipt-log classification
+    // silently misses whichever one drifted.
+    inbox.assert_mirrored(
+        "event",
+        IInbox::MessageQueued::SIGNATURE,
+        &IInbox::MessageQueued::SIGNATURE_HASH.0,
     );
     inbox.assert_mirrored(
         "event",
-        IInbox::MessagePending::SIGNATURE,
-        &IInbox::MessagePending::SIGNATURE_HASH.0,
+        IInbox::MessageDeferred::SIGNATURE,
+        &IInbox::MessageDeferred::SIGNATURE_HASH.0,
     );
-    // #36: emitted alongside MessageDelivered for a consumed-but-failed destination call. A moved
-    // topic0 would silently relabel every destination failure as a plain success.
+    // #54 replaced MessageExecutionFailed (terminal) with MessageExecuted (success-only, read by
+    // the ack path) and DestinationFailed (retryable, paired with MessageReceived). A moved topic0
+    // on either would silently relabel a retryable failure as a completed, acknowledgeable delivery
+    // or vice versa.
     inbox.assert_mirrored(
         "event",
-        IInbox::MessageExecutionFailed::SIGNATURE,
-        &IInbox::MessageExecutionFailed::SIGNATURE_HASH.0,
+        IInbox::MessageExecuted::SIGNATURE,
+        &IInbox::MessageExecuted::SIGNATURE_HASH.0,
+    );
+    inbox.assert_mirrored(
+        "event",
+        IInbox::DestinationFailed::SIGNATURE,
+        &IInbox::DestinationFailed::SIGNATURE_HASH.0,
     );
     inbox.assert_mirrored(
         "error",
         "MessageAlreadyValidated(bytes32)",
         &IInbox::MessageAlreadyValidated::SELECTOR,
+    );
+    inbox.assert_mirrored(
+        "error",
+        "MessageIdMismatch(bytes32)",
+        &IInbox::MessageIdMismatch::SELECTOR,
+    );
+    // #54: retryFailedMessage's isRetryable guard. Expected to fire only on a race with someone
+    // else's retry landing first, since callers check isRetryable before calling.
+    inbox.assert_mirrored(
+        "error",
+        "MessageNotRetryable(bytes32)",
+        &IInbox::MessageNotRetryable::SELECTOR,
     );
     // #36 reverts the delivery/pending-retry classifiers key on. The selectors are matched from raw
     // revert data (Creditcoin-style nodes decode no names), so a drifted one is dead code that
@@ -328,6 +386,18 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
     );
     ackv.assert_mirrored(
         "function",
+        "outbox()",
+        &IAcknowledgmentValidator::outboxCall::SELECTOR,
+    );
+    ackv.assert_mirrored(
+        "function",
+        "destinationChainKey()",
+        &IAcknowledgmentValidator::destinationChainKeyCall::SELECTOR,
+    );
+    ackv.assert_output_tuple("outbox", "address");
+    ackv.assert_output_tuple("destinationChainKey", "uint64");
+    ackv.assert_mirrored(
+        "function",
         "submitAcknowledgment(uint64,(uint8,bytes32,bytes),(bytes32,bytes32[]))",
         &IAcknowledgmentValidator::submitAcknowledgmentCall::SELECTOR,
     );
@@ -341,15 +411,16 @@ fn mirrored_abi_surface_matches_compiled_contracts() {
         IAcknowledgmentValidator::AckFeeClaimed::SIGNATURE,
         &IAcknowledgmentValidator::AckFeeClaimed::SIGNATURE_HASH.0,
     );
+    // #54 renamed both from NoMessageDeliveredLogs/MalformedMessageDeliveredLog.
     ackv.assert_mirrored(
         "error",
-        "NoMessageDeliveredLogs()",
-        &IAcknowledgmentValidator::NoMessageDeliveredLogs::SELECTOR,
+        "NoMessageExecutedLogs()",
+        &IAcknowledgmentValidator::NoMessageExecutedLogs::SELECTOR,
     );
     ackv.assert_mirrored(
         "error",
-        "MalformedMessageDeliveredLog()",
-        &IAcknowledgmentValidator::MalformedMessageDeliveredLog::SELECTOR,
+        "MalformedMessageExecutedLog()",
+        &IAcknowledgmentValidator::MalformedMessageExecutedLog::SELECTOR,
     );
     ackv.assert_mirrored(
         "error",

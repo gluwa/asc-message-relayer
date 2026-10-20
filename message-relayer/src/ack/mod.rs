@@ -3,31 +3,50 @@
 //! Trust-minimized acknowledgment is **proof-based, not vote-based**. For each route that opts in
 //! (`route.ack = Some(..)`), this worker:
 //!
-//!  1. Watches the **destination** Inbox for `MessageDelivered(bytes32 indexed messageId)` —
-//!     evidence that a message was delivered to the destination dApp.
+//!  1. Watches the **destination** Inbox for `MessageReceived(bytes32 indexed messageId)` —
+//!     evidence that a relay attempt reached the destination dApp (asc-contracts #54: this fires
+//!     on every accepted delivery attempt, success or destination-failure alike — see below for
+//!     why the watcher discovers on it in ADDITION to, not instead of, the success-only
+//!     `MessageExecuted`).
 //!  2. For the transaction that emitted it, fetches a native USC delivery proof from the proof-gen
 //!     API (`GET {proof_gen_url}/api/v1/proof-by-tx/{chain_key}/{tx_hash}`): the prover `txBytes`
 //!     plus the merkle-inclusion and continuity proofs.
 //!  3. Submits that proof to the source-chain `AcknowledgmentValidator.submitAcknowledgment(..)`.
 //!     The contract verifies the proof against the block-prover precompile, decodes the
-//!     `MessageDelivered` logs, and calls `Outbox.acknowledgeMessage` for each — so the relayer
-//!     never needs acknowledge authority; the proof is self-validating.
+//!     `MessageExecuted` logs, and calls `Outbox.acknowledgeMessage` for each — so the relayer
+//!     never needs acknowledge authority; the proof is self-validating. `MessageExecuted` only
+//!     fires on a successful destination call, so a proof built from a destination-failure-only
+//!     tx correctly reverts `NoMessageExecutedLogs` here (handled the same way a
+//!     `MessageQueued`/`MessageDeferred` tx already is — see below) without ever falsely
+//!     acknowledging a retryable failure. Conversely, a message that failed at the destination and
+//!     later succeeded via `retryFailedMessage`/`retryPendingMessage` emits `MessageExecuted`
+//!     ALONE on that later tx — no `MessageReceived` — so the watcher discovers `MessageExecuted`
+//!     directly too; without it, a retried-then-succeeded message's ack (and ack-fee bounty) would
+//!     never be submitted, since the only tx that could ever prove `MessageExecuted` is the one no
+//!     filter ever surfaced.
 //!
 //! ## Relay-fee claiming (`AckAndClaim` mode)
 //!
 //! When the route has a `RelayerContract` configured (`route.relayer_contract_address = Some(..)`),
 //! this same watcher ALSO settles the relay fee: from the same delivery proof it calls
 //! `RelayerContract.claimDelivery(messageId, ..)` per delivered message, which pays the relay fee
-//! (+ any unexpired tip) to the relayer proven in the destination `MessageDelivered` event.
+//! (+ any unexpired tip) to the relayer proven in the destination `MessageReceived` event — this
+//! is *why* the watcher discovers on `MessageReceived` as well as `MessageExecuted`: relay-fee
+//! settlement is for relay work done, not destination success, so a destination-failure retry
+//! must still be discoverable for the claim even though it is not ack-eligible. `MessageExecuted`
+//! from a retry has no `MessageReceived` on its own tx and offers no fee-claim proof of its own —
+//! the fee was already claimable from the original `MessageReceived` tx, discovered separately.
 //!
-//! The discovery scan also watches `MessagePending` (dApp callback reverted; message stored for
-//! `retryPendingMessage`): `EVMDeliveryDecoder` accepts a proof over a `MessagePending`-emitting
-//! tx as payable, but only from the *original* `deliverMessage` tx — a later `retryPendingMessage`
-//! tx carries the wrong call selector and the decoder rejects it. Without this, a message that
-//! ever goes pending strands its relay fee forever: the originating tx is never enqueued, and a
-//! successful retry's tx is unusable as a claim proof. A `MessagePending` tx has no
-//! `submitAcknowledgment` proof to offer — `acknowledge_tx`'s existing terminal classification
-//! already handles that, skipping straight to the claim.
+//! The discovery scan also watches `MessageQueued`/`MessageDeferred` (dApp callback reverted or
+//! dispatcher queued it; message stored for `retryPendingMessage`): `EVMDeliveryDecoder` accepts a
+//! proof over a `MessageQueued`/`MessageDeferred`-emitting tx as payable, but only from the
+//! *original* `deliverMessage` tx — a later `retryPendingMessage` tx carries the wrong call
+//! selector and the decoder rejects it. Without this, a message that ever goes pending strands its
+//! relay fee forever: the originating tx is never enqueued, and a successful retry's tx is unusable
+//! as a claim proof. Like a destination-failure-only tx (see above), a
+//! `MessageQueued`/`MessageDeferred` tx has no `submitAcknowledgment` proof to offer —
+//! `acknowledge_tx`'s existing terminal classification already handles that, skipping straight to
+//! the claim.
 //!
 //! Since usc-contracts #23 the claim does NOT acknowledge — ack settlement lives solely on the
 //! `AcknowledgmentValidator` — so the two submissions are independent and BOTH run here, ack first:
@@ -38,21 +57,21 @@
 //! fetch, checkpointing, dedup, and backoff — is shared verbatim between the two settlements.
 //!
 //! Submission is keyed (and deduped) by destination **transaction hash**: one transaction may
-//! contain several `MessageDelivered` logs and the validator acknowledges all of them in a single
+//! contain several `MessageExecuted` logs and the validator acknowledges all of them in a single
 //! call. A transaction whose proof is not available *yet* — HTTP 422 (`BlockNotReady`: block not
 //! attested) or 404 (proof-gen's own view of the destination chain has not caught up with the tx)
 //! from the proof-gen API — is re-polled on a flat, short cadence for a bounded window and only
 //! then slides into the slow backoff; see [`crate::pending::NotReadyPolicy`] and
 //! [`crate::proofgen`] for why a 404 is "not yet" rather than an error.
 
-use std::collections::HashMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy::network::{Ethereum, EthereumWallet};
 use alloy::primitives::{Address, B256, U256};
-use alloy::providers::{PendingTransactionBuilder, Provider, ProviderBuilder};
-use alloy::rpc::types::Filter;
+use alloy::providers::{PendingTransactionBuilder, Provider};
+use alloy::rpc::types::{BlockNumberOrTag, Filter};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::{SolError, SolEvent};
 use anyhow::{anyhow, Context, Result};
@@ -60,15 +79,24 @@ use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::abi::{IInbox, IOutbox};
+use crate::abi::IInbox;
 use crate::checkpoint::CheckpointStore;
 use crate::config::{AckConfig, ChainRoute};
-use crate::events::{OutboxResolver, DEFAULT_RESOLVE_POLL_INTERVAL_SECS};
 use crate::pending::{BoundedSeen, PendingTxs};
 use crate::prom::{Metrics, ProofFetchOutcome, SettlementOutcome};
 use crate::proofgen::{ProofFetch, ProofGenClient, ProofNotReady};
 
-/// Poll cadence for the destination `MessageDelivered` watcher and the pending-proof retry queue.
+mod routes;
+
+/// Execution qualifies for acknowledgment; received/queued/deferred qualify only for fee claims.
+/// Retain both when the same transaction emits multiple event kinds for a message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeliveryEvent {
+    message_id: B256,
+    executed: bool,
+}
+
+/// Poll cadence for the destination `MessageReceived` watcher and the pending-proof retry queue.
 pub const ACK_POLL_INTERVAL_SECS: u64 = 6;
 
 /// Maximum `encodedTransaction` size accepted on-chain by
@@ -79,8 +107,8 @@ pub const ACK_POLL_INTERVAL_SECS: u64 = 6;
 pub const MAX_ENCODED_TRANSACTION_BYTES: usize = 500_000;
 
 /// Hard cap on the unacknowledged-tx queue. Without it a prolonged proof-gen outage (or a delivery
-/// whose block never attests) would grow `pending` without bound. On overflow the oldest entry is
-/// given up (logged) so newer deliveries keep flowing.
+/// whose block never attests) would grow `pending` without bound. At capacity discovery pauses
+/// before advancing its cursor; pending work is never evicted.
 const MAX_PENDING_ACKS: usize = 10_000;
 
 /// Hard cap on the set of recently-finished tx hashes kept for in-session dedup. The destination
@@ -114,18 +142,11 @@ const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
 /// attempt can hold the signer's broadcast slot.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Give up on a tx whose proof never becomes ready (e.g. its block is never attested, or the tx
-/// hash proof-gen keeps answering 404 for does not exist). Generous: far beyond any healthy
-/// finality + attestation latency. The re-poll cadence *before* this point is the route's
-/// [`crate::pending::NotReadyPolicy`] (`ack.not_ready_poll_secs` /
-/// `ack.not_ready_poll_window_secs`): flat and short while the proof is expected to appear on its
-/// own, slow backoff once it is overdue. Not ready never counts against the transient-failure
-/// budget.
-const MAX_ACK_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Escalate prolonged proof unavailability without abandoning settlement or releasing the
+/// checkpoint holdback. The not-ready policy caps retries after its fast-poll window.
+const ACK_OVERDUE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Give up loudly after this many *transient* submit failures (RPC down, timeout, nonce) — a
-/// permanently failing submit (e.g. unfunded ack signer) must not hammer the RPC forever. The
-/// per-attempt exponential backoff lives in [`crate::pending`].
+/// Escalate the log after this many transient submit failures. Retries continue at capped backoff.
 const MAX_ACK_TRANSIENT_ATTEMPTS: u32 = 20;
 
 /// Spawn the acknowledgment submitter for one route. Returns immediately when the route has no
@@ -136,7 +157,6 @@ const MAX_ACK_TRANSIENT_ATTEMPTS: u32 = 20;
 pub async fn run(
     route: ChainRoute,
     creditcoin_eth_rpc_url: String,
-    resolver: Arc<dyn OutboxResolver>,
     checkpoint: Option<Arc<CheckpointStore>>,
     scan_lookback_blocks: u64,
     metrics: Metrics,
@@ -174,16 +194,23 @@ pub async fn run(
     // report on, and registering one would make it go stale forever.
     health.heartbeat(&health_key);
 
-    // Read-only provider on the destination chain (where MessageDelivered is emitted).
-    let dest_provider = ProviderBuilder::new()
-        .connect(&route.destination_rpc_url)
+    // Read-only provider on the destination chain (where MessageReceived is emitted). Held in a
+    // rebuilding slot: after `rpc::REBUILD_AFTER_FAILURES` failed scans it is re-dialed, so a dead
+    // transport heals in-process rather than through a liveness restart (see `crate::health`).
+    let mut dest_rpc = crate::rpc::Reconnecting::new(
+        format!("ack:{chain_key} destination"),
+        route.destination_rpc_url.clone(),
+    );
+    let dest_provider = dest_rpc
+        .connect()
         .await
         .with_context(|| {
             format!(
                 "chain_key {chain_key}: ack submitter failed to connect to destination RPC at {}",
                 route.destination_rpc_url
             )
-        })?;
+        })?
+        .clone();
 
     // Wallet-bearing provider on the source (Creditcoin) chain, where we submit the ack.
     let signer: PrivateKeySigner = ack
@@ -211,27 +238,32 @@ pub async fn run(
 
     let client = ProofGenClient::new(&ack.proof_gen_url)?;
 
-    // Best-effort source Outbox address for `acknowledge_tx`'s `canAck`/already-acked pre-check —
-    // a pure cost-saving shortcut, so failure to resolve here is not fatal: the pre-check just
-    // fails open until a resolution succeeds.
-    let dyn_provider = source_provider.clone().erased();
-    let mut outbox = match resolver.resolve(&route, &dyn_provider).await {
-        Ok(resolved) => Some(resolved.address),
-        Err(err) => {
-            debug!(
-                chain_key,
-                %err,
-                "source Outbox not resolved yet; canAck pre-check fails open until it is"
-            );
-            None
-        }
-    };
+    // Routing history is independent of the delivery cursor and includes retired Outboxes.
+    // In particular, ack.start_block must not skip support events preceding a late retry.
+    let history_path = checkpoint.as_ref().map(|cp| {
+        cp.path().with_extension(format!(
+            "ack-routes-{chain_key}-{}.json",
+            route.inbox_address
+        ))
+    });
+    let mut route_history =
+        routes::RouteHistory::load_from_source(history_path, route.inbox_address, &source_provider)
+            .await?;
+    if let Err(err) = route_history.seed(&dest_provider).await {
+        warn!(chain_key, %err, "current Outbox hints unavailable; recovering complete support history");
+    }
+    if let Err(err) = route_history
+        .seed_validator(&source_provider, ack.validator_address)
+        .await
+    {
+        debug!(chain_key, %err, "configured validator's Outbox hint unavailable; using Inbox history");
+    }
 
     match &mode {
         SettlementMode::Ack => info!(
             chain_key,
             inbox = %route.inbox_address,
-            validator = %ack.validator_address,
+            validator_hint = %ack.validator_address,
             submitter = %submitter_address,
             proof_gen_url = %ack.proof_gen_url,
             "🧾 acknowledgment submitter online (ack mode)"
@@ -241,7 +273,7 @@ pub async fn run(
         } => info!(
             chain_key,
             inbox = %route.inbox_address,
-            validator = %ack.validator_address,
+            validator_hint = %ack.validator_address,
             relayer_contract = %relayer_contract,
             submitter = %submitter_address,
             proof_gen_url = %ack.proof_gen_url,
@@ -249,7 +281,7 @@ pub async fn run(
         ),
     }
 
-    // Resume from the persisted cursor so MessageDelivered events emitted while we were down are
+    // Resume from the persisted cursor so MessageReceived events emitted while we were down are
     // not skipped; fall back to the current head on first run / when persistence is disabled.
     // The cursor is rewound by `scan_lookback_blocks`: the pending-ack queue is memory-only, so a
     // delivery discovered-but-not-acknowledged before a crash would otherwise be skipped forever.
@@ -286,13 +318,6 @@ pub async fn run(
     let mut pending = PendingTxs::new(MAX_PENDING_ACKS);
     // Tx hashes already acknowledged (or terminally skipped) — never re-submitted (bounded).
     let mut done = BoundedSeen::new(MAX_DONE_TRACKED);
-    // The source Outbox each pending tx was tagged with at first discovery — captured once and
-    // never updated again for that entry, even if `outbox` later rotates. Using whatever `outbox`
-    // is *now* would ask a message's canAck state from a contract it was never published on after
-    // a rotation (unknown id defaults to `false`), turning a real unsettled ack into a false
-    // "nothing to do". Kept in lockstep with `pending`/`done`: removed wherever they are.
-    let mut pending_outbox: HashMap<B256, Address> = HashMap::new();
-
     let mut tick = tokio::time::interval(Duration::from_secs(crate::config::poll_secs_override(
         "RELAYER_ACK_POLL_SECS",
         ACK_POLL_INTERVAL_SECS,
@@ -300,33 +325,11 @@ pub async fn run(
     let mut pacer = crate::pacing::RateLimitPacer::default();
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    let mut resolve_tick =
-        tokio::time::interval(Duration::from_secs(crate::config::poll_secs_override(
-            "RELAYER_OUTBOX_RESOLVE_POLL_SECS",
-            DEFAULT_RESOLVE_POLL_INTERVAL_SECS,
-        )));
-    resolve_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
     loop {
         tokio::select! {
             () = cancel.cancelled() => {
                 info!(chain_key, "🛑 acknowledgment submitter exiting on cancel");
                 return Ok(());
-            }
-            _ = resolve_tick.tick() => {
-                match resolver.resolve(&route, &dyn_provider).await {
-                    Ok(resolved) => {
-                        if outbox != Some(resolved.address) {
-                            info!(
-                                chain_key,
-                                outbox = %resolved.address,
-                                "🔁 source Outbox resolved for the canAck pre-check"
-                            );
-                            outbox = Some(resolved.address);
-                        }
-                    }
-                    Err(err) => debug!(chain_key, %err, "source Outbox re-resolution failed; keeping previous state"),
-                }
             }
             _ = tick.tick() => {
                 // Rate-limit pacing: while a deferral window is active, skip the tick entirely —
@@ -337,19 +340,36 @@ pub async fn run(
                     continue;
                 }
                 let mut rate_limited = false;
-                match discover_delivered(
-                    chain_key,
-                    route.inbox_address,
-                    ack.confirmation_depth,
-                    &dest_provider,
-                    &mut last_seen,
-                    &mut pending,
-                    &done,
-                    outbox,
-                    &mut pending_outbox,
-                ).await {
+                // Retry failed startup hints independently. A successful hint becomes a no-op;
+                // a broken configured validator never prevents Inbox/history discovery.
+                if let Err(err) = route_history.seed_validator(&source_provider, ack.validator_address).await {
+                    debug!(chain_key, %err, "configured validator Outbox hint still unavailable; retrying later");
+                }
+                let scan = match dest_rpc.connect().await {
+                    Ok(provider) => {
+                        let provider = provider.clone();
+                        if let Err(err) = route_history.seed(&provider).await {
+                            debug!(chain_key, %err, "current Inbox Outbox hints still unavailable; retrying later");
+                        }
+                        if let Err(err) = route_history.refresh(&provider, ack.confirmation_depth).await {
+                            warn!(chain_key, %err, "settlement support history incomplete; unknown routes remain retryable");
+                        }
+                        discover_delivered(
+                            chain_key,
+                            route.inbox_address,
+                            ack.confirmation_depth,
+                            &provider,
+                            &mut last_seen,
+                            &mut pending,
+                            &done,
+                        ).await
+                    }
+                    Err(err) => Err(err),
+                };
+                match scan {
                     Ok(()) => {
                         // Successful destination scan = loop progress (C2r).
+                        dest_rpc.note_ok();
                         health.heartbeat(&health_key);
                         if let Some(cp) = &checkpoint {
                             // Clamp the *persisted* cursor so it never advances past a tx that is
@@ -362,12 +382,17 @@ pub async fn run(
                                 .oldest_pending_block()
                                 .map_or(last_seen, |b| last_seen.min(b.saturating_sub(1)));
                             if let Err(err) = cp.set(&checkpoint_key, persist) {
+                                metrics.inc_checkpoint_write_failure(chain_key);
                                 warn!(chain_key, %err, "failed to persist ack checkpoint");
                             }
                         }
                     }
                     Err(err) => {
                         rate_limited = crate::pacing::error_looks_rate_limited(&format!("{err:#}"));
+                        // The loop is turning, the upstream is not: degraded, not stale (see
+                        // `crate::health`), and the provider is re-dialed after a failure streak.
+                        health.error(&health_key);
+                        dest_rpc.note_err();
                         warn!(chain_key, %err, "ack discovery iteration failed; will retry");
                     }
                 }
@@ -376,7 +401,8 @@ pub async fn run(
                     chain_key,
                     &ack,
                     &mode,
-                    &mut pending_outbox,
+                    route_history.source_chain_id(),
+                    route_history.outboxes(),
                     &client,
                     &source_provider,
                     submitter_address,
@@ -408,15 +434,16 @@ pub async fn run(
     }
 }
 
-/// Poll the destination Inbox for new `MessageDelivered` AND `MessagePending` events and enqueue
-/// their tx hashes (see the module docs' "Relay-fee claiming" section for why `MessagePending`
-/// matters here too).
+/// Poll the destination Inbox for new `MessageReceived`, `MessageQueued`, `MessageDeferred` AND
+/// `MessageExecuted` events and enqueue their tx hashes (see the module docs' "Relay-fee claiming"
+/// section for why `MessageQueued`/`MessageDeferred`, and a destination-failure-only
+/// `MessageReceived`, still matter here even though neither is ack-eligible by itself — and why
+/// `MessageExecuted` is watched directly, not just discovered as a side effect of `MessageReceived`).
 ///
 /// Scans only up to `tip - confirmation_depth` so a destination reorg on the unsafe head cannot
 /// enqueue an ack for a delivery that later disappears.
 ///
-/// `outbox`, if known, is recorded in `pending_outbox` for every *newly* discovered tx (see that
-/// field's doc in [`run`]); `None` just leaves that tx's pre-check failing open.
+/// Publication routes are resolved independently from historical Inbox authorization.
 #[allow(clippy::too_many_arguments)]
 async fn discover_delivered<P: Provider>(
     chain_key: u64,
@@ -424,10 +451,8 @@ async fn discover_delivered<P: Provider>(
     confirmation_depth: u64,
     provider: &P,
     last_seen: &mut u64,
-    pending: &mut PendingTxs,
+    pending: &mut PendingTxs<DeliveryEvent>,
     done: &BoundedSeen,
-    outbox: Option<Address>,
-    pending_outbox: &mut HashMap<B256, Address>,
 ) -> Result<()> {
     let tip = provider.get_block_number().await?;
     let confirmed = tip.saturating_sub(confirmation_depth);
@@ -441,87 +466,106 @@ async fn discover_delivered<P: Provider>(
     let filter = Filter::new()
         .address(inbox)
         .event_signature(vec![
-            IInbox::MessageDelivered::SIGNATURE_HASH,
-            IInbox::MessagePending::SIGNATURE_HASH,
+            IInbox::MessageReceived::SIGNATURE_HASH,
+            IInbox::MessageQueued::SIGNATURE_HASH,
+            IInbox::MessageDeferred::SIGNATURE_HASH,
+            IInbox::MessageExecuted::SIGNATURE_HASH,
         ])
         .from_block(from_block)
         .to_block(to_block);
 
     let logs = provider.get_logs(&filter).await.with_context(|| {
         format!(
-            "eth_getLogs MessageDelivered/MessagePending from {from_block} to {to_block} failed"
+            "eth_getLogs MessageReceived/MessageQueued/MessageDeferred/MessageExecuted from \
+             {from_block} to {to_block} failed"
         )
     })?;
 
+    // Decode the whole range before admitting any transaction. Otherwise a malformed or
+    // incomplete Executed companion could let its Received-only half finish as a fee-only tx.
+    let mut decoded = Vec::with_capacity(logs.len());
     for log in logs {
-        let Some(tx_hash) = log.transaction_hash else {
-            warn!(chain_key, "delivery log without transaction_hash; skipping");
+        if log.address() != inbox || log.removed {
+            anyhow::bail!("delivery RPC returned a removed log or a different Inbox");
+        }
+        let tx_hash = log
+            .transaction_hash
+            .context("delivery log without transaction hash")?;
+        let block = log
+            .block_number
+            .context("delivery log without block number")?;
+        if block < from_block || block > to_block {
+            anyhow::bail!("delivery RPC returned a log outside the requested range");
+        }
+        let Some((event_name, message_id)) =
+            decode_delivery_log(&log).context("decoding delivery log")?
+        else {
             continue;
         };
-        let Some(block) = log.block_number else {
-            warn!(
-                chain_key,
-                %tx_hash,
-                "delivery log without block_number; skipping"
-            );
-            continue;
+        decoded.push((tx_hash, block, event_name, message_id));
+    }
+    let mut first_unadmitted_block: Option<u64> = None;
+    for (tx_hash, block, event_name, message_id) in decoded {
+        let event = DeliveryEvent {
+            message_id,
+            executed: event_name == "MessageExecuted",
         };
-
-        // The delivered/pending messageId feeds the canAck and relay-claimable pre-checks, so
-        // bridge or already-settled traffic never costs a proof fetch. A tx may carry several
-        // such logs (one call, several messages).
-        let (event_name, message_id) = match decode_delivery_log(&log) {
-            Ok(Some(decoded)) => decoded,
-            Ok(None) => {
-                // Filter should prevent this, but skip rather than mis-decode if it doesn't.
-                continue;
-            }
-            Err(err) => {
-                warn!(chain_key, %tx_hash, %err, "could not decode delivery log; skipping");
-                continue;
-            }
-        };
-
         if done.contains(&tx_hash) {
             continue;
         }
         if pending.contains(&tx_hash) {
-            pending.note_meta(&tx_hash, message_id);
+            pending.note_meta(&tx_hash, event);
             continue;
         }
-        if let Some(evicted) = pending.insert(tx_hash, Instant::now(), block, vec![message_id]) {
-            pending_outbox.remove(&evicted);
-            warn!(
+        if pending.is_full() {
+            // Keep the cursor before the earliest unadmitted block, while existing pending
+            // work retains its checkpoint barrier. Advancing the fully admitted prefix avoids
+            // replaying it forever after the bounded completed-tx cache rolls over.
+            debug!(
                 chain_key,
-                %evicted,
-                "ack pending queue at capacity; giving up on oldest un-acknowledged delivery"
+                "ack pending queue full; pausing discovery until settlement frees capacity"
             );
+            // Still consume metadata for already-admitted transactions later in this response.
+            // RPC log ordering must not let a Received event hide its Executed companion.
+            first_unadmitted_block =
+                Some(first_unadmitted_block.map_or(block, |old| old.min(block)));
+            continue;
         }
-        if let Some(addr) = outbox {
-            pending_outbox.insert(tx_hash, addr);
-        }
+        pending.insert(tx_hash, Instant::now(), block, vec![event]);
         debug!(chain_key, %tx_hash, %message_id, event_name, "🧾 observed delivery event; queued for settlement");
     }
 
-    *last_seen = to_block;
+    *last_seen = first_unadmitted_block.map_or(to_block, |block| block.saturating_sub(1));
     Ok(())
 }
 
 /// Classify and decode one destination log by topic0: `Ok(Some((name, messageId)))` for a
-/// recognized `MessageDelivered`/`MessagePending` log, `Ok(None)` for anything else, `Err` if the
-/// topic0 matched but the log body failed to decode. Split out from [`discover_delivered`] so
-/// this dispatch is unit-testable without a live provider.
+/// recognized `MessageReceived`/`MessageQueued`/`MessageDeferred`/`MessageExecuted` log,
+/// `Ok(None)` for anything else, `Err` if the topic0 matched but the log body failed to decode.
+/// Split out from [`discover_delivered`] so this dispatch is unit-testable without a live provider.
 fn decode_delivery_log(
     log: &alloy::rpc::types::Log,
 ) -> Result<Option<(&'static str, B256)>, alloy::sol_types::Error> {
     match log.topics().first().copied() {
-        Some(sig) if sig == IInbox::MessageDelivered::SIGNATURE_HASH => {
-            IInbox::MessageDelivered::decode_log(&log.inner)
-                .map(|decoded| Some(("MessageDelivered", decoded.data.messageId)))
+        Some(sig) if sig == IInbox::MessageReceived::SIGNATURE_HASH => {
+            IInbox::MessageReceived::decode_log(&log.inner)
+                .map(|decoded| Some(("MessageReceived", decoded.data.messageId)))
         }
-        Some(sig) if sig == IInbox::MessagePending::SIGNATURE_HASH => {
-            IInbox::MessagePending::decode_log(&log.inner)
-                .map(|decoded| Some(("MessagePending", decoded.data.messageId)))
+        Some(sig) if sig == IInbox::MessageQueued::SIGNATURE_HASH => {
+            IInbox::MessageQueued::decode_log(&log.inner)
+                .map(|decoded| Some(("MessageQueued", decoded.data.messageId)))
+        }
+        Some(sig) if sig == IInbox::MessageDeferred::SIGNATURE_HASH => {
+            IInbox::MessageDeferred::decode_log(&log.inner)
+                .map(|decoded| Some(("MessageDeferred", decoded.data.messageId)))
+        }
+        // #54: a successful retryFailedMessage/retryPendingMessage emits MessageExecuted ALONE —
+        // no MessageReceived on that tx — so without watching this directly, a message that ever
+        // went DestinationFailed (or pending) and later succeeded on retry would never be
+        // discovered, and its ack (and ack fee) would never be submitted.
+        Some(sig) if sig == IInbox::MessageExecuted::SIGNATURE_HASH => {
+            IInbox::MessageExecuted::decode_log(&log.inner)
+                .map(|decoded| Some(("MessageExecuted", decoded.data.messageId)))
         }
         _ => Ok(None),
     }
@@ -530,20 +574,21 @@ fn decode_delivery_log(
 /// Try to fetch a proof and submit an acknowledgment for every pending destination tx that is due
 /// for an attempt. Successful (or terminally-reverting) submissions move to `done`; not-yet-ready
 /// proofs are re-polled per the route's [`crate::pending::NotReadyPolicy`] (flat cadence inside
-/// the window, slow backoff past it, `MAX_ACK_AGE` give-up); transient failures back off
+/// the window, capped slow backoff past it); transient failures back off
 /// exponentially and escalate the log after [`MAX_ACK_TRANSIENT_ATTEMPTS`].
 #[allow(clippy::too_many_arguments)]
 async fn process_pending<P: Provider>(
     chain_key: u64,
     ack: &AckConfig,
     mode: &SettlementMode,
-    pending_outbox: &mut HashMap<B256, Address>,
+    source_chain_id: u64,
+    outboxes: &BTreeSet<Address>,
     client: &ProofGenClient,
     source_provider: &P,
     submitter_address: alloy::primitives::Address,
     broadcast_locks: &Arc<crate::broadcast::BroadcastLocks>,
     metrics: &Metrics,
-    pending: &mut PendingTxs,
+    pending: &mut PendingTxs<DeliveryEvent>,
     done: &mut BoundedSeen,
 ) {
     // Retry oldest-first, a bounded batch per tick, so a large backlog cannot make one tick run
@@ -557,27 +602,23 @@ async fn process_pending<P: Provider>(
     // Fetch proofs + submit with bounded concurrency rather than strictly serially: each attempt
     // is independent and dominated by network latency. Mutations to `pending`/`done` are applied
     // afterwards, on this task, so no shared-state synchronization is needed.
-    let results: Vec<(B256, Vec<B256>, Result<AckOutcome>)> = futures::stream::iter(batch)
-        .map(|(tx_hash, message_ids)| {
-            // Tagged at discovery time, not whatever the resolver reports now — see `pending_outbox`.
-            let outbox = pending_outbox.get(&tx_hash).copied();
-            async move {
-                let outcome = acknowledge_tx(
-                    chain_key,
-                    ack,
-                    mode,
-                    outbox,
-                    &message_ids,
-                    client,
-                    source_provider,
-                    submitter_address,
-                    broadcast_locks,
-                    metrics,
-                    tx_hash,
-                )
-                .await;
-                (tx_hash, message_ids, outcome)
-            }
+    let results: Vec<(B256, Vec<DeliveryEvent>, Result<AckOutcome>)> = futures::stream::iter(batch)
+        .map(|(tx_hash, message_ids)| async move {
+            let outcome = acknowledge_tx(
+                chain_key,
+                mode,
+                source_chain_id,
+                outboxes,
+                &message_ids,
+                client,
+                source_provider,
+                submitter_address,
+                broadcast_locks,
+                metrics,
+                tx_hash,
+            )
+            .await;
+            (tx_hash, message_ids, outcome)
         })
         .buffer_unordered(MAX_ACK_CONCURRENCY)
         .collect()
@@ -590,34 +631,28 @@ async fn process_pending<P: Provider>(
             Ok(AckOutcome::Acknowledged) => {
                 info!(chain_key, %tx_hash, "✅ delivery settled on source chain");
                 pending.remove(&tx_hash);
-                pending_outbox.remove(&tx_hash);
                 done.insert(tx_hash);
             }
             Ok(AckOutcome::Terminal(reason)) => {
                 info!(chain_key, %tx_hash, %reason, "ack skipped (terminal); will not retry");
                 pending.remove(&tx_hash);
-                pending_outbox.remove(&tx_hash);
                 done.insert(tx_hash);
             }
             Ok(AckOutcome::NotReady(reason)) => {
-                // Normal early state (destination finality + attestation take minutes) — re-poll
-                // without burning the transient budget, but don't wait forever on a block that
-                // never attests. INFO, not WARN: nothing is wrong yet, and the operator reading
-                // the latency of an ack needs to see how long it has been waiting and on what.
+                // A delayed proof remains an obligation even after a prolonged outage. Keeping
+                // the pending entry also holds the durable cursor behind its discovery block.
                 let waited = pending.age(&tx_hash, now).unwrap_or_default();
-                if waited > MAX_ACK_AGE {
+                let retry_in = not_ready_policy.next_delay(waited);
+                if waited > ACK_OVERDUE_AFTER {
                     warn!(
                         chain_key,
                         %tx_hash,
                         %reason,
-                        "proof never became ready within {MAX_ACK_AGE:?}; giving up on this ack"
+                        waited_secs = waited.as_secs(),
+                        retry_in_secs = retry_in.as_secs(),
+                        "proof is overdue; retaining settlement and retrying at capped backoff"
                     );
-                    pending.remove(&tx_hash);
-                    pending_outbox.remove(&tx_hash);
-                    done.insert(tx_hash);
                 } else {
-                    let retry_in = not_ready_policy.next_delay(waited);
-                    let past_window = waited >= not_ready_policy.poll_window;
                     info!(
                         chain_key,
                         %tx_hash,
@@ -625,12 +660,12 @@ async fn process_pending<P: Provider>(
                         %reason,
                         waited_secs = waited.as_secs(),
                         retry_in_secs = retry_in.as_secs(),
-                        past_poll_window = past_window,
+                        past_poll_window = waited >= not_ready_policy.poll_window,
                         "⏳ proof not ready yet (destination block not attested / proof-gen catching \
                          up); polling"
                     );
-                    pending.defer(&tx_hash, now + retry_in);
                 }
+                pending.defer(&tx_hash, now + retry_in);
             }
             Err(err) => {
                 let attempts = pending.record_transient_failure(&tx_hash, now);
@@ -671,8 +706,8 @@ async fn process_pending<P: Provider>(
 #[derive(Clone, Copy, Debug)]
 enum SettlementMode {
     /// No RelayerContract on the route: prove delivery to the `AcknowledgmentValidator` only
-    /// (`submitAcknowledgment`, one call per tx — the validator acks every `MessageDelivered` log
-    /// under try/catch). The validator address comes from `ack.validator_address`.
+    /// (`submitAcknowledgment`, one call per tx — the validator acks every `MessageExecuted` log
+    /// under try/catch). Each original Outbox supplies its own current validator.
     Ack,
     /// The route has a `RelayerContract` (fee ledger): submit BOTH settlements from one proof —
     /// `submitAcknowledgment` (which also earns the message's user-set ackFee, an open bounty paid
@@ -707,13 +742,15 @@ enum SubmitOutcome {
         gas_cost_wei: u128,
         tx_hash: B256,
     },
-    /// A permanent on-chain condition (revert: already settled / does not require ack / reverted).
+    /// A reverted submission. Source acknowledgment/fee state must confirm completion before
+    /// this is allowed to release the transaction from the pending queue.
     Terminal(String),
 }
 
 /// Await a broadcast result and classify it, shared by both submit paths so the receipt-wait, revert
 /// classification, and gas accounting cannot drift between ack and claim. `Err` is a transient
-/// failure the caller should retry; `Ok(Terminal)` is permanent. `call` names the call for logs.
+/// failure the caller should retry; `Ok(Terminal)` still requires a finalized source-state check.
+/// `call` names the call for logs.
 async fn classify_submit(
     pending_tx: Result<PendingTransactionBuilder<Ethereum>, alloy::contract::Error>,
     call: &str,
@@ -761,6 +798,7 @@ async fn relay_claimable_ids<P: Provider>(
     for id in ids {
         let info = ledger
             .getMessageInfo(*id)
+            .block(BlockNumberOrTag::Finalized.into())
             .call()
             .await
             .context("IRelayerContract.getMessageInfo call failed")?;
@@ -780,10 +818,10 @@ async fn relay_claimable_ids<P: Provider>(
 #[allow(clippy::too_many_arguments)]
 async fn acknowledge_tx<P: Provider>(
     chain_key: u64,
-    ack: &AckConfig,
     mode: &SettlementMode,
-    outbox: Option<alloy::primitives::Address>,
-    message_ids: &[B256],
+    source_chain_id: u64,
+    outboxes: &BTreeSet<Address>,
+    messages: &[DeliveryEvent],
     client: &ProofGenClient,
     source_provider: &P,
     submitter_address: alloy::primitives::Address,
@@ -791,40 +829,56 @@ async fn acknowledge_tx<P: Provider>(
     metrics: &Metrics,
     tx_hash: B256,
 ) -> Result<AckOutcome> {
-    // Pre-checks: skip the proof fetch entirely when nothing is left to do. Both checks fail
-    // open — a view-call error falls through to the proof path, where the contracts enforce the
-    // same rules on-chain; this is purely a cost-saving shortcut. The two settlements are
-    // independent (usc-contracts #23: `claimDelivery` no longer acknowledges), so the tx is only
-    // terminal when NEITHER an ack nor a claim remains outstanding.
-    let needs_ack: bool = if let Some(outbox_addr) = outbox {
-        if message_ids.is_empty() {
-            true // discovery always records ids; treat the impossible case fail-open
-        } else {
-            match any_requires_ack(source_provider, outbox_addr, message_ids).await {
-                Ok(needed) => needed,
-                Err(err) => {
-                    warn!(chain_key, %tx_hash, %err, "canAck pre-check failed; assuming ack needed");
-                    true
-                }
-            }
-        }
+    // Resolve each original publication before deciding no settlement remains. Missing history
+    // or RPC failures must never turn an unknown message into a no-op on today's default Outbox.
+    let message_ids: Vec<B256> = messages
+        .iter()
+        .filter(|event| !event.executed)
+        .map(|event| event.message_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let executed_ids: Vec<B256> = messages
+        .iter()
+        .filter(|event| event.executed)
+        .map(|event| event.message_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let ack_routes = if executed_ids.is_empty() {
+        routes::Resolution::default()
     } else {
-        true // no Outbox view configured — let the validator decide on-chain
+        routes::validators(
+            source_provider,
+            source_chain_id,
+            chain_key,
+            outboxes,
+            &executed_ids,
+        )
+        .await
     };
+    let needs_ack = !ack_routes.authorities.is_empty() || ack_routes.failure.is_some();
+    let mut failure = ack_routes.failure;
 
     let claim_ids: Vec<B256> = match mode {
         SettlementMode::Ack => Vec::new(),
         SettlementMode::AckAndClaim {
             relayer_contract, ..
-        } => match relay_claimable_ids(source_provider, *relayer_contract, message_ids).await {
+        } => match relay_claimable_ids(source_provider, *relayer_contract, &message_ids).await {
             Ok(ids) => ids,
             Err(err) => {
                 warn!(chain_key, %tx_hash, %err, "relay-claimable pre-check failed; attempting all ids");
-                message_ids.to_vec()
+                message_ids.clone()
             }
         },
     };
 
+    if claim_ids.is_empty() && ack_routes.authorities.is_empty() {
+        // Other known routes and independent fee claims can still settle during backfill.
+        if let Some(err) = failure {
+            return Err(err);
+        }
+    }
     if !needs_ack && claim_ids.is_empty() {
         // Count the no-op rather than returning silently. Without this, a route whose messages
         // legitimately need no settlement is metrically identical to one whose settlement worker
@@ -848,6 +902,11 @@ async fn acknowledge_tx<P: Provider>(
             // Counted apart from `Error`: a stream of these with matching `Ready` growth is
             // attestation latency, not a fault, and must not look like the outage shape below.
             metrics.inc_ack_proof_fetch(chain_key, ProofFetchOutcome::NotReady);
+            if let Some(err) = failure {
+                // Preserve the routing error while history or source RPCs recover, even when
+                // proof-gen also needs more time.
+                return Err(err.context(format!("delivery proof also not ready: {reason}")));
+            }
             return Ok(AckOutcome::NotReady(reason));
         }
         Err(err) => {
@@ -892,12 +951,11 @@ async fn acknowledge_tx<P: Provider>(
     // Ack FIRST, claim second: the ack fee is an open bounty paid to the first successful
     // submitter (front-runnable by design), while the relay-fee claim always pays the proven
     // relayer no matter who or when submits — so the time-sensitive settlement goes first.
-    // A transient failure anywhere aborts the whole tx for retry; both settlements are idempotent
-    // on-chain, and the pre-checks drop already-settled work on the retry, so retries converge.
-    if needs_ack {
+    // Attempt every independent settlement even when one fails. On retry, source-state reads
+    // skip completed work and select current authorities, so partial successes converge.
+    for authority in &ack_routes.authorities {
         let (inclusion, continuity) = proof.to_inclusion_and_continuity()?;
-        let validator =
-            crate::abi::IAcknowledgmentValidator::new(ack.validator_address, source_provider);
+        let validator = crate::abi::IAcknowledgmentValidator::new(*authority, source_provider);
         let pending_tx = match broadcast_locks
             .broadcast(
                 submitter_address,
@@ -911,7 +969,8 @@ async fn acknowledge_tx<P: Provider>(
             Ok(res) => res,
             Err(stalled) => {
                 metrics.inc_ack_submission(chain_key, SettlementOutcome::Failed);
-                return Err(anyhow!("submitAcknowledgment {stalled}"));
+                failure.get_or_insert_with(|| anyhow!("submitAcknowledgment {stalled}"));
+                continue;
             }
         };
         match classify_submit(pending_tx, "submitAcknowledgment").await {
@@ -932,16 +991,18 @@ async fn acknowledge_tx<P: Provider>(
                     "submitAcknowledgment confirmed (ack fee, if any, paid to this submitter)",
                 );
             }
-            // Terminal here (e.g. NoMessageDeliveredLogs because another submitter front-ran the
-            // bounty and every log is now already-acked) must not block the relay-fee claim below —
-            // the claim pays the proven relayer regardless of who acknowledged.
+            // Terminal here (e.g. NoMessageExecutedLogs because another submitter front-ran the
+            // bounty and every log is now already-acked, or because this tx has no MessageExecuted
+            // log at all — a destination-failure-only or MessageQueued/MessageDeferred tx) must
+            // not block the relay-fee claim below — the claim pays the proven relayer regardless of
+            // destination outcome or who acknowledged.
             Ok(SubmitOutcome::Terminal(reason)) => {
                 metrics.inc_ack_submission(chain_key, SettlementOutcome::Terminal);
-                info!(chain_key, %tx_hash, %reason, "submitAcknowledgment terminal; continuing to claim");
+                info!(chain_key, %tx_hash, %reason, "submitAcknowledgment reverted; continuing other settlements before source-state verification");
             }
             Err(err) => {
                 metrics.inc_ack_submission(chain_key, SettlementOutcome::Failed);
-                return Err(err);
+                failure.get_or_insert(err);
             }
         }
     }
@@ -970,7 +1031,8 @@ async fn acknowledge_tx<P: Provider>(
                 Ok(res) => res,
                 Err(stalled) => {
                     metrics.inc_claim_submission(chain_key, SettlementOutcome::Failed);
-                    return Err(anyhow!("claimDelivery {stalled}"));
+                    failure.get_or_insert_with(|| anyhow!("claimDelivery {stalled}"));
+                    continue;
                 }
             };
             match classify_submit(pending_tx, "claimDelivery").await {
@@ -999,49 +1061,59 @@ async fn acknowledge_tx<P: Provider>(
                         %tx_hash,
                         message_id = %id,
                         %reason,
-                        "claimDelivery skipped for message (terminal)",
+                        "claimDelivery reverted; checking fee-ledger state before completing",
                     );
                 }
                 Err(err) => {
                     metrics.inc_claim_submission(chain_key, SettlementOutcome::Failed);
-                    return Err(err);
+                    failure.get_or_insert(err);
                 }
             }
         }
     }
 
-    Ok(AckOutcome::Acknowledged)
-}
-
-/// Whether any of `ids` still needs an acknowledgment on the source Outbox: published with
-/// `canAck = true`, known to the outbox (`emitter != 0`), and not yet acknowledged.
-async fn any_requires_ack<P: Provider>(
-    provider: &P,
-    outbox: alloy::primitives::Address,
-    ids: &[B256],
-) -> Result<bool> {
-    let outbox = IOutbox::new(outbox, provider);
-    for id in ids {
-        if !outbox
-            .messageCanAck(*id)
-            .call()
-            .await
-            .context("IOutbox.messageCanAck call failed")?
-        {
-            // `messageRequiresAck` is false for an unknown id (mapping default), so passing this
-            // gate already implies the message exists — no separate existence check needed.
-            continue;
+    // A successful receipt or NoMessageExecutedLogs is not proof of acknowledgment: the
+    // validator catches individual Outbox failures, including a concurrently rotated authority.
+    // Only source state can release executed obligations. Non-executed deliveries are excluded,
+    // so queued/failure-only transactions finish their fee claim without waiting for a later retry.
+    if !executed_ids.is_empty() {
+        let remaining = routes::validators(
+            source_provider,
+            source_chain_id,
+            chain_key,
+            outboxes,
+            &executed_ids,
+        )
+        .await;
+        if let Some(err) = remaining.failure {
+            failure.get_or_insert(err);
         }
-        if !outbox
-            .isAcknowledged(*id)
-            .call()
-            .await
-            .context("IOutbox.isAcknowledged call failed")?
-        {
-            return Ok(true);
+        if !remaining.authorities.is_empty() {
+            failure.get_or_insert_with(|| {
+                anyhow!("executed messages remain unacknowledged on their original Outboxes")
+            });
         }
     }
-    Ok(false)
+    if let SettlementMode::AckAndClaim {
+        relayer_contract, ..
+    } = mode
+    {
+        match relay_claimable_ids(source_provider, *relayer_contract, &claim_ids).await {
+            Ok(remaining) if !remaining.is_empty() => {
+                failure.get_or_insert_with(|| {
+                    anyhow!("relay fees remain unsettled in the configured ledger")
+                });
+            }
+            Err(err) => {
+                failure.get_or_insert(err);
+            }
+            Ok(_) => {}
+        }
+    }
+    if let Some(err) = failure {
+        return Err(err);
+    }
+    Ok(AckOutcome::Acknowledged)
 }
 
 /// Decode a known ack-path revert selector into its error name, for actionable Terminal logs
@@ -1054,18 +1126,15 @@ fn ack_revert_name(sel: [u8; 4]) -> Option<&'static str> {
         s if s == O::MessageAlreadyAcknowledged::SELECTOR => "MessageAlreadyAcknowledged",
         s if s == O::MessageNotFound::SELECTOR => "MessageNotFound",
         s if s == V::ProofInvalid::SELECTOR => "ProofInvalid",
-        s if s == V::NoMessageDeliveredLogs::SELECTOR => "NoMessageDeliveredLogs",
+        s if s == V::NoMessageExecutedLogs::SELECTOR => "NoMessageExecutedLogs",
         s if s == RC::RelayAlreadySettled::SELECTOR => "RelayAlreadySettled",
         s if s == RC::UnknownOperation::SELECTOR => "UnknownOperation",
         _ => return None,
     })
 }
 
-/// Classify a submit error as a permanent on-chain revert (vs. a transient RPC failure). A contract
-/// revert observed at send / gas-estimation time is deterministic, so it must be terminal — otherwise
-/// the tx is retried forever (e.g. every bridge Release delivery, which reverts
-/// `MessageCannotBeAcknowledged`). Matches revert phrasing across node dialects (see [`crate::revert`])
-/// plus decoded error names as a fallback.
+/// Recognize on-chain reverts for submission diagnostics. Even a deterministic revert needs a
+/// finalized source-state check before the settlement can be removed from the queue.
 fn is_terminal_revert(err: &impl std::fmt::Display) -> bool {
     let s = err.to_string();
     // NativeTransferFailed is the one revert that is NOT deterministic for a given message: it
@@ -1080,11 +1149,8 @@ fn is_terminal_revert(err: &impl std::fmt::Display) -> bool {
     {
         return false;
     }
-    // Any other revert observed at send/estimation time is deterministic for the proof + message
-    // state at hand, so it must be terminal — otherwise e.g. every bridge Release delivery
-    // (MessageCannotBeAcknowledged) retries forever. A mined-but-reverted settlement is terminal for
-    // the same reason: the state that made it revert (already settled / already acked) does not
-    // un-happen, and the pre-checks drop that id on the next pass anyway.
+    // Reverts can reflect already-settled work or temporary contract state (pause/verifier
+    // changes). The caller checks the actual obligation after processing all independent groups.
     if crate::revert::is_revert(&s) {
         return true;
     }
@@ -1097,13 +1163,13 @@ fn is_terminal_revert(err: &impl std::fmt::Display) -> bool {
         || s.contains("DoesNotRequireAck")
         || s.contains("MessageNotFound")
         || s.contains("ProofInvalid")
-        || s.contains("NoMessageDeliveredLogs")
+        || s.contains("NoMessageExecutedLogs")
         || s.contains("RelayAlreadySettled")
         || s.contains("UnknownOperation")
 }
 
 /// Prefix a terminal revert with the decoded error name when the selector is recognized, so the
-/// `ack skipped (terminal)` log tells the operator *why* without a manual selector lookup.
+/// submission diagnostic tells the operator why without a manual selector lookup.
 fn describe_revert(err: &impl std::fmt::Display) -> String {
     let s = err.to_string();
     match crate::revert::revert_selector(&s).and_then(ack_revert_name) {
@@ -1115,6 +1181,503 @@ fn describe_revert(err: &impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::{Bytes, U64};
+    use alloy::providers::ProviderBuilder;
+    use alloy::sol_types::SolValue;
+    use alloy::transports::mock::Asserter;
+
+    #[tokio::test]
+    async fn full_pending_queue_keeps_cursor_and_unfinished_work() {
+        let rpc = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(rpc.clone());
+        let inbox = Address::repeat_byte(1);
+        let mut pending = PendingTxs::new(1);
+        let mut done = BoundedSeen::new(10);
+        let mut cursor = 10;
+        let tx1 = B256::repeat_byte(1);
+        let tx2 = B256::repeat_byte(2);
+        let id1 = B256::repeat_byte(11);
+        let id2 = B256::repeat_byte(12);
+        let log = |tx, id| alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: inbox,
+                data: IInbox::MessageReceived {
+                    messageId: id,
+                    processor: inbox,
+                    relayer: inbox,
+                }
+                .encode_log_data(),
+            },
+            transaction_hash: Some(tx),
+            block_number: Some(11),
+            ..Default::default()
+        };
+        let executed = alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: inbox,
+                data: IInbox::MessageExecuted {
+                    messageId: id1,
+                    emitterAddress: inbox,
+                    destination: inbox,
+                    dispatcher: inbox,
+                    relayer: inbox,
+                    messagePayload: Bytes::new(),
+                }
+                .encode_log_data(),
+            },
+            transaction_hash: Some(tx1),
+            block_number: Some(11),
+            ..Default::default()
+        };
+        // Deliberately unsorted: execution metadata for an admitted tx arrives after capacity.
+        let logs = vec![log(tx1, id1), log(tx2, id2), executed];
+        rpc.push_success(&U64::from(12));
+        rpc.push_success(&logs);
+        discover_delivered(2, inbox, 0, &provider, &mut cursor, &mut pending, &done)
+            .await
+            .unwrap();
+        assert_eq!(cursor, 10, "a partial range must be replayed");
+        assert!(pending.contains(&tx1));
+        assert!(!pending.contains(&tx2));
+        assert_eq!(pending.oldest_pending_block(), Some(11));
+        assert!(pending.ready(1, Instant::now())[0]
+            .1
+            .iter()
+            .any(|event| event.executed));
+        pending.remove(&tx1);
+        done.insert(tx1);
+        rpc.push_success(&U64::from(12));
+        rpc.push_success(&logs);
+        discover_delivered(2, inbox, 0, &provider, &mut cursor, &mut pending, &done)
+            .await
+            .unwrap();
+        assert_eq!(cursor, 12);
+        assert!(pending.contains(&tx2));
+    }
+
+    #[tokio::test]
+    async fn queued_transaction_without_execution_has_no_ack_obligation() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let result = acknowledge_tx(
+            2,
+            &SettlementMode::Ack,
+            42,
+            &BTreeSet::new(),
+            &[DeliveryEvent {
+                message_id: B256::repeat_byte(1),
+                executed: false,
+            }],
+            &ProofGenClient::new("http://unused.invalid").unwrap(),
+            &provider,
+            Address::repeat_byte(1),
+            &crate::broadcast::BroadcastLocks::new(),
+            &(crate::prom::NoopMetrics::new() as Metrics),
+            B256::repeat_byte(2),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, AckOutcome::Terminal(_)));
+    }
+
+    #[tokio::test]
+    async fn execution_flag_survives_a_later_received_event() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let id = B256::repeat_byte(1);
+        let result = acknowledge_tx(
+            2,
+            &SettlementMode::Ack,
+            42,
+            &BTreeSet::new(),
+            &[
+                DeliveryEvent {
+                    message_id: id,
+                    executed: true,
+                },
+                DeliveryEvent {
+                    message_id: id,
+                    executed: false,
+                },
+            ],
+            &ProofGenClient::new("http://unused.invalid").unwrap(),
+            &provider,
+            Address::repeat_byte(1),
+            &crate::broadcast::BroadcastLocks::new(),
+            &(crate::prom::NoopMetrics::new() as Metrics),
+            B256::repeat_byte(2),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "unknown executed obligations must remain retryable"
+        );
+    }
+
+    async fn proof_server() -> (ProofGenClient, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(|| async {
+            axum::Json(serde_json::json!({
+                "headerNumber": 12, "txBytes": "0x01",
+                "continuityProof": { "lowerEndpointDigest": B256::ZERO, "roots": [] },
+                "merkleProof": { "root": B256::ZERO, "siblings": [] },
+            }))
+        });
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (ProofGenClient::new(&url).unwrap(), task)
+    }
+
+    #[tokio::test]
+    async fn overdue_proof_remains_pending_and_holds_restart_checkpoint() {
+        let rpc = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(rpc.clone());
+        let outbox = Address::repeat_byte(1);
+        let validator = Address::repeat_byte(2);
+        let message = crate::abi::OutboxMessage {
+            emitter: Address::repeat_byte(3),
+            sequence: 4,
+            timestamp: 5,
+            canAck: true,
+            acknowledged: false,
+            payloadHash: B256::repeat_byte(6),
+        };
+        let id = alloy::primitives::keccak256(
+            (
+                outbox,
+                message.emitter,
+                message.sequence,
+                message.payloadHash,
+                U256::from(42),
+            )
+                .abi_encode_params(),
+        );
+        rpc.push_success(&Bytes::from(message.abi_encode()));
+        rpc.push_success(&Bytes::from(validator.abi_encode()));
+        rpc.push_success(&Bytes::from(outbox.abi_encode()));
+        rpc.push_success(&Bytes::from(2u64.abi_encode()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(|| async { axum::http::StatusCode::NOT_FOUND });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let ack = AckConfig {
+            proof_gen_url: url.clone(),
+            validator_address: validator,
+            signer_key: String::new(),
+            confirmation_depth: 0,
+            start_block: None,
+            not_ready_poll_secs: 6,
+            not_ready_poll_window_secs: 600,
+        };
+        let tx = B256::repeat_byte(9);
+        let mut pending = PendingTxs::new(1);
+        let mut done = BoundedSeen::new(10);
+        pending.insert(
+            tx,
+            Instant::now() - ACK_OVERDUE_AFTER - Duration::from_secs(1),
+            12,
+            vec![DeliveryEvent {
+                message_id: id,
+                executed: true,
+            }],
+        );
+        process_pending(
+            2,
+            &ack,
+            &SettlementMode::Ack,
+            42,
+            &BTreeSet::from([outbox]),
+            &ProofGenClient::new(&url).unwrap(),
+            &provider,
+            Address::repeat_byte(8),
+            &crate::broadcast::BroadcastLocks::new(),
+            &(crate::prom::NoopMetrics::new() as Metrics),
+            &mut pending,
+            &mut done,
+        )
+        .await;
+        server.abort();
+        assert!(
+            pending.contains(&tx),
+            "old proof unavailability must not abandon custody"
+        );
+        assert!(!done.contains(&tx));
+        assert_eq!(pending.oldest_pending_block(), Some(12));
+        assert!(pending.ready(1, Instant::now()).is_empty());
+        assert_eq!(
+            pending
+                .ready(1, Instant::now() + crate::pending::TRANSIENT_BACKOFF_MAX)
+                .len(),
+            1
+        );
+        assert!(rpc.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn settlement_completion_reads_finalized_source_state() {
+        let outbox = Address::repeat_byte(1);
+        let message = crate::abi::OutboxMessage {
+            emitter: Address::repeat_byte(3),
+            sequence: 4,
+            timestamp: 5,
+            canAck: true,
+            acknowledged: true,
+            payloadHash: B256::repeat_byte(6),
+        };
+        let id = alloy::primitives::keccak256(
+            (
+                outbox,
+                message.emitter,
+                message.sequence,
+                message.payloadHash,
+                U256::from(42),
+            )
+                .abi_encode_params(),
+        );
+        let info = crate::abi::IRelayerContract::MessageInfo {
+            payer: Address::repeat_byte(1),
+            destinationChain: 2,
+            gasLimit: U256::from(100_000),
+            relayFee: U256::from(1),
+            tip: U256::ZERO,
+            tipExpiry: U256::ZERO,
+            deliveryDeadline: U256::ZERO,
+            relaySettled: true,
+            feesInNative: false,
+        };
+        let responses = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+            Bytes::from(message.abi_encode()),
+            Bytes::from(info.abi_encode()),
+        ])));
+        let received = responses.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(move |axum::Json(request): axum::Json<serde_json::Value>| {
+            let received = received.clone();
+            async move {
+                assert_eq!(request["method"], "eth_call");
+                assert_eq!(request["params"][1], "finalized");
+                let result = received.lock().unwrap().pop_front().unwrap();
+                axum::Json(serde_json::json!({ "jsonrpc": "2.0", "id": request["id"], "result": result }))
+            }
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = ProviderBuilder::new().connect_http(url.parse().unwrap());
+        let resolved = routes::validators(&provider, 42, 2, &BTreeSet::from([outbox]), &[id]).await;
+        assert!(resolved.failure.is_none());
+        assert!(resolved.authorities.is_empty());
+        assert!(
+            relay_claimable_ids(&provider, Address::repeat_byte(2), &[id])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        server.abort();
+        assert!(responses.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_executed_logs_revert_cannot_discard_an_unacknowledged_execution() {
+        let rpc = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_mocked_client(rpc.clone());
+        let outbox = Address::repeat_byte(1);
+        let validator = Address::repeat_byte(2);
+        let message = crate::abi::OutboxMessage {
+            emitter: Address::repeat_byte(3),
+            sequence: 4,
+            timestamp: 5,
+            canAck: true,
+            acknowledged: false,
+            payloadHash: B256::repeat_byte(6),
+        };
+        let id = alloy::primitives::keccak256(
+            (
+                outbox,
+                message.emitter,
+                message.sequence,
+                message.payloadHash,
+                U256::from(42),
+            )
+                .abi_encode_params(),
+        );
+        let push_route = || {
+            rpc.push_success(&Bytes::from(message.abi_encode()));
+            rpc.push_success(&Bytes::from(validator.abi_encode()));
+            rpc.push_success(&Bytes::from(outbox.abi_encode()));
+            rpc.push_success(&Bytes::from(2u64.abi_encode()));
+        };
+        push_route();
+        rpc.push_failure_msg("execution reverted: NoMessageExecutedLogs");
+        push_route();
+        let (client, server) = proof_server().await;
+        let result = acknowledge_tx(
+            2,
+            &SettlementMode::Ack,
+            42,
+            &BTreeSet::from([outbox]),
+            &[DeliveryEvent {
+                message_id: id,
+                executed: true,
+            }],
+            &client,
+            &provider,
+            Address::repeat_byte(8),
+            &crate::broadcast::BroadcastLocks::new(),
+            &(crate::prom::NoopMetrics::new() as Metrics),
+            B256::repeat_byte(9),
+        )
+        .await;
+        server.abort();
+        assert!(
+            result.is_err(),
+            "a caught Outbox failure is not settlement evidence"
+        );
+        assert!(
+            rpc.read_q().is_empty(),
+            "source acknowledgment state must be rechecked"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_authority_failure_does_not_block_other_acknowledgments() {
+        let rpc = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_mocked_client(rpc.clone());
+        let a = Address::repeat_byte(1);
+        let b = Address::repeat_byte(2);
+        let record = |acknowledged| crate::abi::OutboxMessage {
+            emitter: Address::repeat_byte(3),
+            sequence: 4,
+            timestamp: 5,
+            canAck: true,
+            acknowledged,
+            payloadHash: B256::repeat_byte(6),
+        };
+        let id = |outbox: Address| {
+            alloy::primitives::keccak256(
+                (
+                    outbox,
+                    record(false).emitter,
+                    4u64,
+                    B256::repeat_byte(6),
+                    U256::from(42),
+                )
+                    .abi_encode_params(),
+            )
+        };
+        let push = |outbox: Address, authority: Address| {
+            rpc.push_success(&Bytes::from(record(false).abi_encode()));
+            rpc.push_success(&Bytes::from(authority.abi_encode()));
+            rpc.push_success(&Bytes::from(outbox.abi_encode()));
+            rpc.push_success(&Bytes::from(2u64.abi_encode()));
+        };
+        let mut publications = [a, b];
+        publications.sort_by_key(|outbox| id(*outbox));
+        for outbox in publications {
+            if outbox == a {
+                push(a, Address::repeat_byte(11));
+            } else {
+                rpc.push_failure_msg("execution reverted: 0x5d803cca");
+                push(b, Address::repeat_byte(12));
+            }
+        }
+        rpc.push_failure_msg("validator A RPC failure");
+        // B raced with another submitter, which already acknowledged it successfully.
+        rpc.push_failure_msg("execution reverted: NoMessageExecutedLogs");
+        for outbox in publications {
+            if outbox == a {
+                push(a, Address::repeat_byte(11));
+            } else {
+                rpc.push_failure_msg("execution reverted: 0x5d803cca");
+                rpc.push_success(&Bytes::from(record(true).abi_encode()));
+            }
+        }
+        let (client, server) = proof_server().await;
+        let result = acknowledge_tx(
+            2,
+            &SettlementMode::Ack,
+            42,
+            &BTreeSet::from([a, b]),
+            &[
+                DeliveryEvent {
+                    message_id: id(a),
+                    executed: true,
+                },
+                DeliveryEvent {
+                    message_id: id(b),
+                    executed: true,
+                },
+            ],
+            &client,
+            &provider,
+            Address::repeat_byte(8),
+            &crate::broadcast::BroadcastLocks::new(),
+            &(crate::prom::NoopMetrics::new() as Metrics),
+            B256::repeat_byte(9),
+        )
+        .await;
+        server.abort();
+        assert!(result.is_err(), "A must remain queued");
+        assert!(
+            rpc.read_q().is_empty(),
+            "B must be attempted even when A fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_claim_revert_cannot_discard_an_unsettled_fee() {
+        let rpc = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_mocked_client(rpc.clone());
+        let info = crate::abi::IRelayerContract::MessageInfo {
+            payer: Address::repeat_byte(1),
+            destinationChain: 2,
+            gasLimit: U256::from(100_000),
+            relayFee: U256::from(1),
+            tip: U256::ZERO,
+            tipExpiry: U256::ZERO,
+            deliveryDeadline: U256::ZERO,
+            relaySettled: false,
+            feesInNative: false,
+        };
+        rpc.push_success(&Bytes::from(info.abi_encode()));
+        rpc.push_failure_msg("execution reverted: EnforcedPause");
+        rpc.push_success(&Bytes::from(info.abi_encode()));
+        let (client, server) = proof_server().await;
+        let result = acknowledge_tx(
+            2,
+            &SettlementMode::AckAndClaim {
+                relayer_contract: Address::repeat_byte(2),
+                chain_key: B256::from(U256::from(2)),
+            },
+            42,
+            &BTreeSet::new(),
+            &[DeliveryEvent {
+                message_id: B256::repeat_byte(1),
+                executed: false,
+            }],
+            &client,
+            &provider,
+            Address::repeat_byte(8),
+            &crate::broadcast::BroadcastLocks::new(),
+            &(crate::prom::NoopMetrics::new() as Metrics),
+            B256::repeat_byte(9),
+        )
+        .await;
+        server.abort();
+        assert!(
+            result.is_err(),
+            "an operational revert must leave the fee claim queued"
+        );
+        assert!(
+            rpc.read_q().is_empty(),
+            "fee settlement must be checked after submission"
+        );
+    }
 
     #[test]
     fn terminal_revert_classification() {
@@ -1200,35 +1763,62 @@ mod tests {
         let message_id = B256::from([7u8; 32]);
         let addr = Address::from([1u8; 20]);
 
-        let delivered = IInbox::MessageDelivered {
+        let received = IInbox::MessageReceived {
             messageId: message_id,
             processor: addr,
             relayer: addr,
         };
-        let (name, id) = decode_delivery_log(&rpc_log(addr, delivered.encode_log_data()))
+        let (name, id) = decode_delivery_log(&rpc_log(addr, received.encode_log_data()))
             .expect("decodes")
             .expect("recognized");
-        assert_eq!(name, "MessageDelivered");
+        assert_eq!(name, "MessageReceived");
         assert_eq!(id, message_id);
 
-        let pending = IInbox::MessagePending {
+        let queued = IInbox::MessageQueued {
             messageId: message_id,
             destinationContract: addr,
             relayer: addr,
         };
-        let (name, id) = decode_delivery_log(&rpc_log(addr, pending.encode_log_data()))
+        let (name, id) = decode_delivery_log(&rpc_log(addr, queued.encode_log_data()))
             .expect("decodes")
             .expect("recognized");
-        assert_eq!(name, "MessagePending");
+        assert_eq!(name, "MessageQueued");
+        assert_eq!(id, message_id);
+
+        let deferred = IInbox::MessageDeferred {
+            messageId: message_id,
+            destinationContract: addr,
+            relayer: addr,
+        };
+        let (name, id) = decode_delivery_log(&rpc_log(addr, deferred.encode_log_data()))
+            .expect("decodes")
+            .expect("recognized");
+        assert_eq!(name, "MessageDeferred");
+        assert_eq!(id, message_id);
+
+        // #54: a retry-only success (no MessageReceived on that tx) must still be discoverable, or
+        // its ack (and ack-fee bounty) is never submitted.
+        let executed = IInbox::MessageExecuted {
+            messageId: message_id,
+            emitterAddress: addr,
+            destination: addr,
+            dispatcher: addr,
+            relayer: addr,
+            messagePayload: alloy::primitives::Bytes::new(),
+        };
+        let (name, id) = decode_delivery_log(&rpc_log(addr, executed.encode_log_data()))
+            .expect("decodes")
+            .expect("recognized");
+        assert_eq!(name, "MessageExecuted");
         assert_eq!(id, message_id);
     }
 
     #[test]
     fn decode_delivery_log_ignores_unrelated_topic0() {
-        // The discovery filter only requests these two topic0s, but an RPC is not trusted to
+        // The discovery filter only requests these four topic0s, but an RPC is not trusted to
         // honor that — an unrelated event on the same Inbox (e.g. the ack validator's
         // Acknowledged, a completely different contract in practice but same shape of concern)
-        // must be skipped, not mis-decoded as one of the two we expect.
+        // must be skipped, not mis-decoded as one of the four we expect.
         let unrelated = crate::abi::IAcknowledgmentValidator::Acknowledged {
             messageId: B256::from([9u8; 32]),
         };
@@ -1244,7 +1834,7 @@ mod tests {
         // processor, relayer) — a malformed/truncated log must error, not silently drop the
         // relay-fee claim by falling through as "unrecognized".
         let malformed = alloy::primitives::LogData::new(
-            vec![IInbox::MessageDelivered::SIGNATURE_HASH],
+            vec![IInbox::MessageReceived::SIGNATURE_HASH],
             Default::default(),
         )
         .expect("valid LogData");

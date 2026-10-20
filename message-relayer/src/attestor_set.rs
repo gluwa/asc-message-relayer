@@ -65,9 +65,10 @@ pub async fn run(
     // `threshold: usize::MAX`, so until this watcher's first successful read the pool rejects
     // every vote — a watcher that can never read the validator is a *completely dead route*
     // (S1r). Heartbeat on every successful read (set changed or not); a persistent read failure
-    // goes stale and `/health` makes it visible/restartable instead of silently dead. Registered
-    // only in this Evm arm — the parked Cc3/static arms above never resolve a set, so registering
-    // them would trip a permanently-stale false positive.
+    // is reported through `Health::error`, so `/health` names the route as degraded (still
+    // retrying — every poll re-dials, see below) and only a *silent* watcher goes stale and
+    // restarts the process. Registered only in this Evm arm — the parked Cc3/static arms above
+    // never resolve a set, so registering them would trip a permanently-stale false positive.
     let health_key = format!("attestor-set:{chain_key}");
     health.heartbeat(&health_key);
 
@@ -131,6 +132,7 @@ pub async fn run(
                     Err(err) => {
                         let rate_limited =
                             crate::pacing::error_looks_rate_limited(&format!("{err:#}"));
+                        health.error(&health_key);
                         warn!(chain_key, %err, "failed to read on-chain attestor set; will retry");
                         // Rate-limit pacing — see `crate::pacing`: this 30s poll runs on every
                         // route and collides with the attestor fleet's synchronized per-block

@@ -1,4 +1,4 @@
-//! Spy-node configuration (YAML, relayer conventions).
+//! Observer-node configuration (YAML, relayer conventions).
 
 use std::path::Path;
 
@@ -11,15 +11,15 @@ const DEFAULT_MAX_CLIENTS: usize = 256;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// USC chain keys whose message-vote + reobservation topics the spy subscribes to.
+    /// USC chain keys whose message-vote + reobservation topics the observer subscribes to.
     pub chain_keys: Vec<u64>,
     pub p2p: P2pConfig,
     /// WebSocket + health/metrics bind host (e.g. "0.0.0.0").
     pub bind_host: String,
     /// WebSocket + health/metrics bind port.
     pub bind_port: u16,
-    /// Allow WS clients to publish reobservation requests through this spy (the one write path —
-    /// needed when a relayer fronts its gossip through the spy). Off by default: a public
+    /// Allow WS clients to publish reobservation requests through this observer (the one write path —
+    /// needed when a relayer fronts its gossip through the observer). Off by default: a public
     /// observer deployment should be read-only.
     #[serde(default)]
     pub allow_publish: bool,

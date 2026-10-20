@@ -1,4 +1,4 @@
-//! The spy's HTTP surface: `/ws` subscription API, `/health`, `/metrics`.
+//! The observer's HTTP surface: `/ws` subscription API, `/health`, `/metrics`.
 
 use std::sync::Arc;
 
@@ -14,18 +14,18 @@ use message_relayer::health::Health;
 
 use crate::events::{ClientFrame, Filter, PublishReobservation};
 use crate::hub::Hub;
-use crate::metrics::SpyMetrics;
+use crate::metrics::ObserverMetrics;
 use crate::swarm::PublishRequest;
 
 /// Shared state behind the axum router.
 #[derive(Clone)]
 pub struct WsState {
     pub hub: Hub,
-    pub metrics: Arc<SpyMetrics>,
+    pub metrics: Arc<ObserverMetrics>,
     pub health: Arc<Health>,
     /// `None` when `allow_publish: false` — publish frames are refused.
     pub publish_tx: Option<mpsc::Sender<PublishRequest>>,
-    /// The chain keys this spy observes; publish frames for other chains are refused up-front so
+    /// The chain keys this observer observes; publish frames for other chains are refused up-front so
     /// the client gets a truthful ack instead of a silent swarm-side drop.
     pub chain_keys: Vec<u64>,
     pub max_clients: usize,
@@ -39,14 +39,26 @@ pub fn build_router(state: WsState) -> Router {
         .with_state(state)
 }
 
+/// `200 ok` when every worker has made progress within the deadline, `200` naming degraded
+/// workers (erroring but alive), `503` naming stale (silent) ones — the same two-tier verdict as
+/// the relayer's `/health`; see `message_relayer::health`.
 async fn health_handler(State(state): State<WsState>) -> axum::response::Response {
-    match state.health.status() {
-        (true, _) => (axum::http::StatusCode::OK, "ok").into_response(),
-        (false, stale) => (
+    let report = state.health.report();
+    if !report.is_alive() {
+        return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            format!("stale workers: {}", stale.join(", ")),
+            format!("stale workers: {}", report.stale.join(", ")),
         )
-            .into_response(),
+            .into_response();
+    }
+    if report.degraded.is_empty() {
+        (axum::http::StatusCode::OK, "ok").into_response()
+    } else {
+        (
+            axum::http::StatusCode::OK,
+            format!("degraded workers: {}", report.degraded.join(", ")),
+        )
+            .into_response()
     }
 }
 
@@ -178,11 +190,11 @@ async fn handle_client_frame(
 /// `allow_publish` is off (public read-only deployments).
 fn publish_reobservation(state: &WsState, publish: PublishReobservation) -> anyhow::Result<()> {
     let Some(publish_tx) = &state.publish_tx else {
-        anyhow::bail!("publishing is disabled on this spy (allow_publish: false)");
+        anyhow::bail!("publishing is disabled on this observer (allow_publish: false)");
     };
     anyhow::ensure!(
         state.chain_keys.contains(&publish.chain_key),
-        "chain_key {} is not observed by this spy",
+        "chain_key {} is not observed by this observer",
         publish.chain_key
     );
     let request = write_ability::envelope::ReobservationRequest {
@@ -194,7 +206,7 @@ fn publish_reobservation(state: &WsState, publish: PublishReobservation) -> anyh
     };
     publish_tx
         .try_send(PublishRequest { request })
-        .map_err(|_| anyhow::anyhow!("publish queue full or spy shutting down"))?;
+        .map_err(|_| anyhow::anyhow!("publish queue full or observer shutting down"))?;
     Ok(())
 }
 
@@ -222,7 +234,7 @@ mod tests {
     fn publish_refused_when_disabled() {
         let state = WsState {
             hub: Hub::new(),
-            metrics: SpyMetrics::new(),
+            metrics: ObserverMetrics::new(),
             health: Health::new(message_relayer::health::PROGRESS_DEADLINE),
             publish_tx: None,
             chain_keys: vec![102],
@@ -246,7 +258,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
         let state = WsState {
             hub: Hub::new(),
-            metrics: SpyMetrics::new(),
+            metrics: ObserverMetrics::new(),
             health: Health::new(message_relayer::health::PROGRESS_DEADLINE),
             publish_tx: Some(tx),
             chain_keys: vec![102],
@@ -270,7 +282,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let state = WsState {
             hub: Hub::new(),
-            metrics: SpyMetrics::new(),
+            metrics: ObserverMetrics::new(),
             health: Health::new(message_relayer::health::PROGRESS_DEADLINE),
             publish_tx: Some(tx),
             chain_keys: vec![102],

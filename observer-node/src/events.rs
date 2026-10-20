@@ -1,9 +1,10 @@
-//! The spy's outward-facing event schema (JSON over WebSocket) and subscription filters.
+//! The observer's outward-facing event schema (JSON over WebSocket) and subscription filters.
 //!
-//! Deliberately dumb, like Wormhole's Spy: events are *verified observations* (decoded envelope
+//! Deliberately dumb, like Wormhole's Observer: events are *verified observations* (decoded envelope
 //! plus ECDSA recovery), never aggregation or quorum judgment. Consumers count signers themselves.
-//! `signature_valid` asserts only that the signature recovers to `signer` over `message_hash`;
-//! active-set membership is the consumer's problem (checking it would give the spy a chain-RPC
+//! `signature_valid` asserts only that the signature recovers to `signer` over `message_id` (also
+//! the vote's `message_hash` field, kept for wire compatibility — see that field's doc);
+//! active-set membership is the consumer's problem (checking it would give the observer a chain-RPC
 //! dependency, and the mesh's real validators enforce it anyway).
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,18 +21,21 @@ fn now_ms() -> u64 {
 /// One observed p2p event, serialized as `{"type": "...", ...}`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum SpyEvent {
+pub enum ObserverEvent {
     /// An attestor's ECDSA vote for a published message, seen on `{chain_key}/message-votes/v1`.
     MessageVote {
         chain_key: u64,
-        /// `0x`-prefixed 32-byte hex.
+        /// `0x`-prefixed 32-byte hex — also the digest the signature covers (raw, no EIP-191)
+        /// since asc-contracts #54.
         message_id: String,
-        /// `0x`-prefixed 32-byte hex — the digest the signature covers (raw, no EIP-191).
+        /// Equal to `message_id` — kept as a separate field for wire compatibility with existing
+        /// consumers of this API; asc-contracts #54 removed the distinct six-field hash this used
+        /// to carry (`Inbox.validateVotes` now takes `messageId` itself as the signed digest).
         message_hash: String,
         /// Recovered signer when recovery succeeds; the envelope's advertised signer (with
         /// `signature_valid: false`) when it does not.
         signer: String,
-        /// Whether the 65-byte signature recovers to `signer` over `message_hash`.
+        /// Whether the 65-byte signature recovers to `signer` over `message_id`.
         signature_valid: bool,
         /// `0x`-prefixed 65-byte hex — carried so consumers can re-verify independently.
         signature: String,
@@ -51,7 +55,7 @@ pub enum SpyEvent {
         received_at_ms: u64,
     },
     /// An attestor's ECDSA vote proposing a new destination attestor set, seen on
-    /// `{chain_key}/attestor-set-update/v1`. Streamed raw: the spy has no destination-chain
+    /// `{chain_key}/attestor-set-update/v1`. Streamed raw: the observer has no destination-chain
     /// connection and cannot recompute the update digest, so (unlike `MessageVote`) it does not
     /// annotate `signature_valid` — the relayer's set-update aggregator re-derives the digest from
     /// chain state and recovers the signer itself.
@@ -70,7 +74,7 @@ pub enum SpyEvent {
         source_peer: String,
         received_at_ms: u64,
     },
-    /// Per-chain mesh visibility: how many peers this spy currently sees subscribed to the
+    /// Per-chain mesh visibility: how many peers this observer currently sees subscribed to the
     /// message-vote topic. Emitted on every change.
     PeerStatus {
         chain_key: u64,
@@ -79,11 +83,10 @@ pub enum SpyEvent {
     },
 }
 
-impl SpyEvent {
+impl ObserverEvent {
     pub fn message_vote(
         chain_key: u64,
         message_id: [u8; 32],
-        message_hash: [u8; 32],
         signer: alloy::primitives::Address,
         signature_valid: bool,
         signature: &[u8; 65],
@@ -92,7 +95,9 @@ impl SpyEvent {
         Self::MessageVote {
             chain_key,
             message_id: format!("0x{}", hex::encode(message_id)),
-            message_hash: format!("0x{}", hex::encode(message_hash)),
+            // Equal to `message_id` (see that field's doc) — asc-contracts #54 removed the
+            // distinct hash this used to carry.
+            message_hash: format!("0x{}", hex::encode(message_id)),
             signer: format!("{signer:?}"),
             signature_valid,
             signature: format!("0x{}", hex::encode(signature)),
@@ -204,7 +209,7 @@ pub struct Filter {
 }
 
 impl Filter {
-    pub fn matches(&self, event: &SpyEvent) -> bool {
+    pub fn matches(&self, event: &ObserverEvent) -> bool {
         if !self.chain_keys.is_empty() && !self.chain_keys.contains(&event.chain_key()) {
             return false;
         }
@@ -220,7 +225,7 @@ impl Filter {
     }
 }
 
-/// Frames a client may send: a subscription filter, or (when the spy allows publishing) a
+/// Frames a client may send: a subscription filter, or (when the observer allows publishing) a
 /// reobservation request to gossip on behalf of the client.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
@@ -244,11 +249,10 @@ pub struct PublishReobservation {
 mod tests {
     use super::*;
 
-    fn vote(chain_key: u64, id_byte: u8) -> SpyEvent {
-        SpyEvent::message_vote(
+    fn vote(chain_key: u64, id_byte: u8) -> ObserverEvent {
+        ObserverEvent::message_vote(
             chain_key,
             [id_byte; 32],
-            [0xAB; 32],
             alloy::primitives::Address::repeat_byte(0x11),
             true,
             &[0u8; 65],
@@ -268,7 +272,7 @@ mod tests {
 
     #[test]
     fn set_update_vote_serializes_with_type_tag_and_hex_fields() {
-        let event = SpyEvent::set_update_vote(
+        let event = ObserverEvent::set_update_vote(
             7,
             &[[0x0A; 20], [0x0B; 20]],
             [0xCD; 32],
@@ -294,7 +298,7 @@ mod tests {
     fn empty_filter_matches_everything() {
         let f = Filter::default();
         assert!(f.matches(&vote(102, 1)));
-        assert!(f.matches(&SpyEvent::peer_status(7, 3)));
+        assert!(f.matches(&ObserverEvent::peer_status(7, 3)));
     }
 
     #[test]
@@ -307,7 +311,7 @@ mod tests {
         assert!(f.matches(&vote(102, 1)));
         assert!(!f.matches(&vote(7, 1)), "wrong chain");
         assert!(
-            !f.matches(&SpyEvent::peer_status(102, 3)),
+            !f.matches(&ObserverEvent::peer_status(102, 3)),
             "wrong event kind"
         );
     }
@@ -323,7 +327,7 @@ mod tests {
         assert!(f.matches(&vote(102, 0x01)));
         assert!(!f.matches(&vote(102, 0x02)));
         assert!(
-            !f.matches(&SpyEvent::peer_status(102, 3)),
+            !f.matches(&ObserverEvent::peer_status(102, 3)),
             "peer_status is not message-scoped"
         );
     }

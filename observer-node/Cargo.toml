@@ -3,7 +3,7 @@ authors.workspace = true
 description = "Passive USC write-ability p2p observer: joins the attestor gossip mesh and streams message-attestation events over WebSocket"
 edition.workspace = true
 license.workspace = true
-name = "spy-node"
+name = "observer-node"
 publish.workspace = true
 repository.workspace = true
 version.workspace = true
@@ -12,8 +12,8 @@ version.workspace = true
 path = "src/lib.rs"
 
 [[bin]]
-name = "spy-node"
-path = "bin/spy.rs"
+name = "observer-node"
+path = "bin/observer.rs"
 
 [lints.clippy]
 module_name_repetitions = "allow"
@@ -24,7 +24,7 @@ dotenvy = "0.15"
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 # Sibling crates: the relayer lib supplies the p2p behavior/protocols + identity derivation +
-# health registry the spy reuses; write-ability supplies the wire envelopes + topic ids.
+# health registry the observer reuses; write-ability supplies the wire envelopes + topic ids.
 message-relayer = { path = "../message-relayer" }
 write-ability = { workspace = true }
 

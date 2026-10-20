@@ -1,4 +1,4 @@
-//! Prometheus metrics for the spy node.
+//! Prometheus metrics for the observer node.
 
 use std::sync::atomic::{AtomicI64, AtomicU64};
 use std::sync::Arc;
@@ -10,52 +10,52 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 
 #[derive(Debug)]
-pub struct SpyMetrics {
+pub struct ObserverMetrics {
     registry: Registry,
     /// Observed gossip frames by kind + outcome. `rate()` of `outcome="accepted"` going flat
-    /// while the chain has Outbox activity is the "spy stopped observing" alert.
+    /// while the chain has Outbox activity is the "observer stopped observing" alert.
     events: Family<LabelEvent, Counter<u64, AtomicU64>>,
     /// Currently connected WS subscribers.
     ws_clients: Gauge<i64, AtomicI64>,
     /// Clients disconnected for falling behind the fire-hose (lagged past the hub ring).
     ws_client_lag_drops: Counter<u64, AtomicU64>,
-    /// Peers this spy sees subscribed to the message-vote topic, per chain.
+    /// Peers this observer sees subscribed to the message-vote topic, per chain.
     subscribed_peers: Family<LabelChain, Gauge<i64, AtomicI64>>,
     /// Reobservation requests published on behalf of WS clients (only when `allow_publish`).
     reobservations_published: Counter<u64, AtomicU64>,
 }
 
-impl SpyMetrics {
+impl ObserverMetrics {
     #[must_use]
     pub fn new() -> Arc<Self> {
         let mut registry = Registry::default();
         let events = Family::default();
         registry.register(
-            "spy_events",
+            "observer_events",
             "Observed gossip frames by kind and outcome",
             events.clone(),
         );
         let ws_clients = Gauge::default();
         registry.register(
-            "spy_ws_clients",
+            "observer_ws_clients",
             "Currently connected WebSocket subscribers",
             ws_clients.clone(),
         );
         let ws_client_lag_drops = Counter::default();
         registry.register(
-            "spy_ws_client_lag_drops",
+            "observer_ws_client_lag_drops",
             "Subscribers disconnected for falling behind the event fire-hose",
             ws_client_lag_drops.clone(),
         );
         let subscribed_peers = Family::default();
         registry.register(
-            "spy_subscribed_peers",
+            "observer_subscribed_peers",
             "Peers seen subscribed to the message-vote topic per chain_key",
             subscribed_peers.clone(),
         );
         let reobservations_published = Counter::default();
         registry.register(
-            "spy_reobservations_published",
+            "observer_reobservations_published",
             "Reobservation requests gossiped on behalf of WS clients",
             reobservations_published.clone(),
         );
@@ -135,13 +135,13 @@ mod tests {
 
     #[test]
     fn metrics_encode_round_trips() {
-        let m = SpyMetrics::new();
+        let m = ObserverMetrics::new();
         m.inc_event(EventLabelKind::MessageVote, EventOutcome::Accepted);
         m.set_ws_clients(2);
         m.set_subscribed_peers(102, 5);
         let body = m.encode();
-        assert!(body.contains("spy_events"));
-        assert!(body.contains("spy_ws_clients"));
-        assert!(body.contains("spy_subscribed_peers"));
+        assert!(body.contains("observer_events"));
+        assert!(body.contains("observer_ws_clients"));
+        assert!(body.contains("observer_subscribed_peers"));
     }
 }

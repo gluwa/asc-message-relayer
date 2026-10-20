@@ -417,7 +417,7 @@ async fn handle_swarm_event(
 /// a fresh ephemeral key is generated and we log a warning so operators understand peers
 /// will see a different `PeerId` each restart.
 ///
-/// `pub` so the spy node (sibling crate) derives its identity the same way — one seed format
+/// `pub` so the observer node (sibling crate) derives its identity the same way — one seed format
 /// (`0x` hex or BIP39 mnemonic) across every mesh participant we ship.
 pub fn derive_keypair(identity: Option<&str>) -> Result<libp2p::identity::Keypair> {
     match identity {

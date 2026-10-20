@@ -32,9 +32,9 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p message-relayer -p spy-node && \
+    cargo build --release -p message-relayer -p observer-node && \
     cp target/release/message-relayer /message-relayer && \
-    cp target/release/spy-node /spy-node
+    cp target/release/observer-node /observer-node
 
 
 # Runtime base is kept in sync with the CI runner OS (ubuntu-26.04) by
@@ -45,15 +45,15 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/* && \
     useradd --home-dir /relayer --create-home relayer
 
-# Both workspace binaries ship in one image (deps dominate the build; the spy adds a few MB).
-# The default entrypoint stays the relayer; the spy-node Helm chart overrides the command to
-# /bin/spy-node.
+# Both workspace binaries ship in one image (deps dominate the build; the observer adds a few MB).
+# The default entrypoint stays the relayer; the observer-node Helm chart overrides the command to
+# /bin/observer-node.
 COPY --from=builder /message-relayer /bin/message-relayer
-COPY --from=builder /spy-node /bin/spy-node
+COPY --from=builder /observer-node /bin/observer-node
 
 USER relayer
 WORKDIR /relayer
 # 3200 = relayer HTTP (/metrics, /health, /votes); 9100 = libp2p gossip.
-# The spy chart exposes its own ports (ws + p2p) via the container spec.
+# The observer chart exposes its own ports (ws + p2p) via the container spec.
 EXPOSE 3200 9100/tcp 9100/udp
 ENTRYPOINT ["/bin/message-relayer"]

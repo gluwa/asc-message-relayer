@@ -1,21 +1,21 @@
-//! Spy node binary entrypoint.
+//! Observer node binary entrypoint.
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use spy_node::{Config, Server};
+use observer_node::{Config, Server};
 use tracing::debug;
 
 #[derive(Parser, Debug)]
-#[command(name = "spy-node")]
+#[command(name = "observer-node")]
 struct Cli {
     /// Verbose tracing (`debug` level).
     #[arg(short, long)]
     verbose: bool,
 
     /// YAML configuration (see `config.example.yaml`).
-    #[arg(long, env = "SPY_CONFIG_FILE")]
+    #[arg(long, env = "OBSERVER_CONFIG_FILE")]
     config: PathBuf,
 }
 

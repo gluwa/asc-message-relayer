@@ -1,13 +1,13 @@
-//! The spy's libp2p task: join the attestor mesh, observe, annotate, fan out.
+//! The observer's libp2p task: join the attestor mesh, observe, annotate, fan out.
 //!
 //! Reuses the relayer's [`RelayerBehavior`] (gossipsub Strict + `validate_messages`, kad,
 //! identify, ping, mdns toggle, connection limits) and the shared `write-ability` topic ids, so
-//! the spy is wire-identical to the relayer's observer half — one mesh, one stack.
+//! the observer is wire-identical to the relayer's observer half — one mesh, one stack.
 //!
 //! Gossipsub citizenship for a non-validator (spec §3): a decodable vote whose envelope
 //! `chain_key` matches its topic is **Accept**ed and streamed — including votes whose signature
 //! does *not* recover to the advertised signer. Signature validity is an **annotation**
-//! (`signature_valid`), not a gate: the spy has no active-set view, the mesh's real validators
+//! (`signature_valid`), not a gate: the observer has no active-set view, the mesh's real validators
 //! (attestors, relayer pool) enforce membership and reject forgeries themselves, and an observer
 //! that Rejected on local crypto judgment would P4-penalize peers for traffic the validators may
 //! accept. Only provably malformed frames (undecodable, topic/envelope mismatch) are Rejected.
@@ -28,19 +28,19 @@ use message_relayer::p2p::{derive_keypair, protocols};
 use write_ability::envelope::{MessageVote, ReobservationRequest, SetUpdateVote};
 
 use crate::config::P2pConfig;
-use crate::events::SpyEvent;
+use crate::events::ObserverEvent;
 use crate::hub::Hub;
-use crate::metrics::{EventLabelKind, EventOutcome, SpyMetrics};
+use crate::metrics::{EventLabelKind, EventOutcome, ObserverMetrics};
 
 /// Backoff between listen retries (transient port conflicts from a restarting predecessor).
 const LISTEN_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
 /// Listen attempts before proceeding dial-only (loudly).
 const LISTEN_RETRY_ATTEMPTS: u32 = 12;
 /// Cadence of the swarm loop's liveness pulse into [`Health`]. A wedged loop stops pulsing and
-/// `/health` flips 503 so orchestration restarts the spy.
+/// `/health` flips 503 so orchestration restarts the observer.
 const HEALTH_PULSE: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// A reobservation request a WS client asked the spy to gossip (spec §5, `allow_publish` only).
+/// A reobservation request a WS client asked the observer to gossip (spec §5, `allow_publish` only).
 #[derive(Debug)]
 pub struct PublishRequest {
     pub request: ReobservationRequest,
@@ -51,14 +51,14 @@ pub async fn run(
     chain_keys: Vec<u64>,
     hub: Hub,
     mut publish_rx: mpsc::Receiver<PublishRequest>,
-    metrics: Arc<SpyMetrics>,
+    metrics: Arc<ObserverMetrics>,
     health: Arc<Health>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let keypair =
         derive_keypair(p2p.identity.as_deref()).context("failed to derive libp2p identity")?;
     let local_peer_id = keypair.public().to_peer_id();
-    info!(%local_peer_id, "🕵️ spy libp2p identity ready");
+    info!(%local_peer_id, "🕵️ observer libp2p identity ready");
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
@@ -134,7 +134,7 @@ pub async fn run(
         }
     }
 
-    // Only listen when a `public_addr` is configured. A listening spy leaks its discovered
+    // Only listen when a `public_addr` is configured. A listening observer leaks its discovered
     // listen addrs (loopback + cluster-local pod IP) to peers via identify, and the bootnode's
     // kad table then propagates that record mesh-wide: every attestor — including ones in other
     // clusters with no route to a pod IP — burns dial attempts on it until their unreachable-peer
@@ -151,7 +151,7 @@ pub async fn run(
                 Err(err) if attempt == LISTEN_RETRY_ATTEMPTS => {
                     tracing::error!(
                         %listen, %err, attempts = attempt,
-                        "swarm listen failed after retries — continuing DIAL-ONLY (inbound peers cannot reach this spy)"
+                        "swarm listen failed after retries — continuing DIAL-ONLY (inbound peers cannot reach this observer)"
                     );
                 }
                 Err(err) => {
@@ -167,7 +167,7 @@ pub async fn run(
         info!("🕶️ no public_addr configured — dial-only observer; not listening, nothing dialable advertised");
     }
 
-    info!(chains = chain_keys.len(), "✅ spy swarm online");
+    info!(chains = chain_keys.len(), "✅ observer swarm online");
 
     let mut subscribed_peers: SubscribedPeers = HashMap::new();
     let mut health_tick = tokio::time::interval(HEALTH_PULSE);
@@ -177,7 +177,7 @@ pub async fn run(
     loop {
         tokio::select! {
             () = cancel.cancelled() => {
-                info!("🛑 spy swarm exiting on cancel");
+                info!("🛑 observer swarm exiting on cancel");
                 return Ok(());
             }
             _ = health_tick.tick() => {
@@ -259,9 +259,9 @@ fn note_disconnected(peers: &mut SubscribedPeers, peer_id: &libp2p::PeerId) -> V
         .collect()
 }
 
-fn report_peer_count(chain_key: u64, count: usize, hub: &Hub, metrics: &SpyMetrics) {
+fn report_peer_count(chain_key: u64, count: usize, hub: &Hub, metrics: &ObserverMetrics) {
     metrics.set_subscribed_peers(chain_key, i64::try_from(count).unwrap_or(i64::MAX));
-    hub.publish(SpyEvent::peer_status(chain_key, count));
+    hub.publish(ObserverEvent::peer_status(chain_key, count));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -272,7 +272,7 @@ fn handle_swarm_event(
     reobs_topic_to_chain: &HashMap<TopicHash, u64>,
     setupdate_topic_to_chain: &HashMap<TopicHash, u64>,
     hub: &Hub,
-    metrics: &SpyMetrics,
+    metrics: &ObserverMetrics,
     subscribed_peers: &mut SubscribedPeers,
 ) {
     match event {
@@ -373,7 +373,7 @@ fn observe_vote(
     data: &[u8],
     source: &libp2p::PeerId,
     hub: &Hub,
-    metrics: &SpyMetrics,
+    metrics: &ObserverMetrics,
 ) -> MessageAcceptance {
     let vote = match MessageVote::decode_bytes(data) {
         Ok(vote) if vote.chain_key == chain_key => vote,
@@ -397,17 +397,16 @@ fn observe_vote(
     // Annotate, don't gate: recovery failure streams as `signature_valid: false` (module docs).
     let advertised = alloy::primitives::Address::from(vote.signer);
     let (signer, signature_valid) = match recover_signer(
-        &alloy::primitives::B256::from(vote.message_hash),
+        &alloy::primitives::B256::from(vote.message_id),
         &vote.signature,
     ) {
         Ok(recovered) => (recovered, recovered == advertised),
         Err(_) => (advertised, false),
     };
 
-    hub.publish(SpyEvent::message_vote(
+    hub.publish(ObserverEvent::message_vote(
         chain_key,
         vote.message_id,
-        vote.message_hash,
         signer,
         signature_valid,
         &vote.signature,
@@ -424,11 +423,11 @@ fn observe_reobservation(
     data: &[u8],
     source: &libp2p::PeerId,
     hub: &Hub,
-    metrics: &SpyMetrics,
+    metrics: &ObserverMetrics,
 ) -> MessageAcceptance {
     match ReobservationRequest::decode_bytes(data) {
         Ok(req) if req.chain_key == chain_key => {
-            hub.publish(SpyEvent::reobservation_request(
+            hub.publish(ObserverEvent::reobservation_request(
                 chain_key,
                 req.message_id,
                 req.tx_hash,
@@ -456,22 +455,22 @@ fn observe_reobservation(
     }
 }
 
-/// Decode one attestor-set-update-vote frame and stream it raw. Unlike [`observe_vote`], the spy
+/// Decode one attestor-set-update-vote frame and stream it raw. Unlike [`observe_vote`], the observer
 /// does **not** attempt signature recovery: the signature covers the update digest, which is
-/// derived from destination-chain state (`chain_id`, `attestorSetUpdateNonce`) the spy has no
+/// derived from destination-chain state (`chain_id`, `attestorSetUpdateNonce`) the observer has no
 /// connection to. The relayer's set-update aggregator recomputes the digest and recovers the
-/// signer itself, so the spy just re-emits the wire fields. Any decodable vote whose envelope
+/// signer itself, so the observer just re-emits the wire fields. Any decodable vote whose envelope
 /// `chain_key` matches its topic is Accepted; malformed / mismatched frames are Rejected.
 fn observe_set_update(
     chain_key: u64,
     data: &[u8],
     source: &libp2p::PeerId,
     hub: &Hub,
-    metrics: &SpyMetrics,
+    metrics: &ObserverMetrics,
 ) -> MessageAcceptance {
     match SetUpdateVote::decode_bytes(data) {
         Ok(vote) if vote.chain_key == chain_key => {
-            hub.publish(SpyEvent::set_update_vote(
+            hub.publish(ObserverEvent::set_update_vote(
                 chain_key,
                 &vote.new_attestors,
                 vote.nonce,
@@ -584,15 +583,14 @@ mod tests {
 
         let vote = MessageVote {
             chain_key: 102,
-            message_id: [1u8; 32],
-            message_hash: hash.0,
+            message_id: hash.0,
             signer: signer.address().into_array(),
             signature: raw,
         };
 
         let hub = Hub::new();
         let mut rx = hub.subscribe();
-        let metrics = SpyMetrics::new();
+        let metrics = ObserverMetrics::new();
         let acceptance = observe_vote(
             102,
             &vote.encode_bytes(),
@@ -612,7 +610,7 @@ mod tests {
         );
     }
 
-    /// A forged signer field must still stream (Accept) but be annotated invalid — the spy
+    /// A forged signer field must still stream (Accept) but be annotated invalid — the observer
     /// observes, the mesh's validators judge.
     #[tokio::test]
     async fn forged_signer_streams_with_signature_valid_false() {
@@ -628,15 +626,14 @@ mod tests {
         let impostor = alloy::primitives::Address::repeat_byte(0x66);
         let vote = MessageVote {
             chain_key: 102,
-            message_id: [1u8; 32],
-            message_hash: hash.0,
+            message_id: hash.0,
             signer: impostor.into_array(),
             signature: raw,
         };
 
         let hub = Hub::new();
         let mut rx = hub.subscribe();
-        let metrics = SpyMetrics::new();
+        let metrics = ObserverMetrics::new();
         let acceptance = observe_vote(
             102,
             &vote.encode_bytes(),
@@ -653,7 +650,7 @@ mod tests {
     #[test]
     fn garbage_and_chain_mismatch_are_rejected() {
         let hub = Hub::new();
-        let metrics = SpyMetrics::new();
+        let metrics = ObserverMetrics::new();
         assert!(matches!(
             observe_vote(102, b"garbage", &libp2p::PeerId::random(), &hub, &metrics),
             MessageAcceptance::Reject
@@ -662,7 +659,6 @@ mod tests {
         let vote = MessageVote {
             chain_key: 7, // disagrees with topic chain 102
             message_id: [1u8; 32],
-            message_hash: [2u8; 32],
             signer: [3u8; 20],
             signature: [0u8; 65],
         };
@@ -692,7 +688,7 @@ mod tests {
 
         let hub = Hub::new();
         let mut rx = hub.subscribe();
-        let metrics = SpyMetrics::new();
+        let metrics = ObserverMetrics::new();
         let acceptance = observe_set_update(
             102,
             &vote.encode_bytes(),
@@ -713,7 +709,7 @@ mod tests {
     #[test]
     fn set_update_garbage_and_chain_mismatch_are_rejected() {
         let hub = Hub::new();
-        let metrics = SpyMetrics::new();
+        let metrics = ObserverMetrics::new();
         assert!(matches!(
             observe_set_update(102, b"garbage", &libp2p::PeerId::random(), &hub, &metrics),
             MessageAcceptance::Reject

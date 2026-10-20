@@ -39,9 +39,12 @@ pub mod checkpoint;
 pub mod claim;
 pub mod config;
 pub mod delivery;
+pub mod dest_revert;
 pub mod events;
 pub mod hash;
 pub mod health;
+pub mod observer_client;
+pub mod outcome;
 pub mod p2p;
 pub mod pacing;
 pub mod pending;
@@ -50,14 +53,15 @@ pub mod prom;
 pub mod proofgen;
 pub mod receipt;
 pub mod revert;
+pub mod rpc;
 pub mod set_update;
-pub mod spy_client;
+pub mod work;
 
 pub use config::{
     AttestorSet, AttestorSource, ChainRoute, Config, DeliveryConfig, P2pConfig, VoteCacheConfig,
 };
 pub use delivery::DeliveryJob;
-pub use events::{DiscoveryResolver, IndexedMessage, OutboxResolver};
+pub use events::IndexedMessage;
 pub use p2p::MessageVote;
 pub use pool::{calculate_threshold, RouteAttestors};
 pub use prom::{Metrics, MetricsTrait, NoopMetrics, RelayerMetrics};
@@ -130,11 +134,6 @@ impl Server {
         // roles stop colliding. The two halves are only correct together; see `crate::broadcast`.
         let broadcast_locks = broadcast::BroadcastLocks::new();
 
-        // Outbox-cursor holdback: the pool reports its oldest unfinished message per route; the
-        // outbox watchers clamp their persisted checkpoints to it so restart-recovery always
-        // re-indexes undelivered messages (never lost to the lookback window).
-        let holdback = Arc::new(checkpoint::CursorHoldback::default());
-
         // Persistent block cursors (resume after restart instead of from the chain head). Disabled
         // when `checkpoint_path` is None.
         let checkpoint: Option<Arc<checkpoint::CheckpointStore>> =
@@ -155,6 +154,12 @@ impl Server {
                 }
             };
 
+        let work = self
+            .config
+            .checkpoint_path
+            .as_ref()
+            .map(|path| Arc::new(work::WorkStore::for_checkpoint(path)));
+
         // Resolve attestor sets up-front so the pool only sees concrete addresses.
         let mut route_attestors: Vec<RouteAttestors> = Vec::with_capacity(self.config.routes.len());
         for route in &self.config.routes {
@@ -173,6 +178,9 @@ impl Server {
         let mut delivery_txs: HashMap<u64, mpsc::Sender<DeliveryJob>> = HashMap::new();
         let (delivery_result_tx, delivery_result_rx) =
             mpsc::channel::<delivery::DeliveryResult>(DELIVERY_CHANNEL_CAP);
+        // Terminal per-message verdicts (delivered / destination failed / undeliverable …), written
+        // by the delivery workers and served over `/outcomes` for operators and the dashboard.
+        let outcomes = Arc::new(outcome::OutcomeStore::new(outcome::DEFAULT_CAP));
 
         let mut tasks = JoinSet::new();
 
@@ -192,6 +200,7 @@ impl Server {
                     metrics.clone(),
                     health.clone(),
                     broadcast_locks.clone(),
+                    outcomes.clone(),
                     cancel.clone(),
                 ),
             );
@@ -213,7 +222,7 @@ impl Server {
                     set_update_rx: set_rx,
                     reobs_tx,
                     query_rx,
-                    holdback: holdback.clone(),
+                    work: work.clone(),
                 },
                 metrics.clone(),
                 health.clone(),
@@ -221,37 +230,8 @@ impl Server {
             ),
         );
 
-        // One resolver per route, shared between its Outbox watcher and ack submitter below — both
-        // need to agree on the same live Outbox address. Every route uses the same
-        // `DiscoveryResolver`: it reads the discovery-registry address off the chain-info
-        // precompile and calls `defaultOutbox` on it, no fallback — a chain key with nothing
-        // registered in `OutboxDiscovery` fails closed instead of resolving from any spoofable
-        // source. `route.outbox_address` is the one operator-pinned exception (see
-        // `DiscoveryResolver::override_address`); flagged here at startup as well as on every
-        // resolve (`DiscoveryResolver::resolve`) since it bypasses that fail-closed default.
-        let resolvers: HashMap<u64, Arc<dyn OutboxResolver>> = self
-            .config
-            .routes
-            .iter()
-            .map(|route| {
-                if let Some(address) = route.outbox_address {
-                    tracing::warn!(
-                        chain_key = route.chain_key,
-                        %address,
-                        "⚠️ outbox_address is set for this route — Outbox resolution will bypass \
-                         the OutboxDiscovery registry entirely"
-                    );
-                }
-                let resolver: Arc<dyn OutboxResolver> = Arc::new(DiscoveryResolver {
-                    override_address: route.outbox_address,
-                });
-                (route.chain_key, resolver)
-            })
-            .collect();
-
         // Outbox watchers (per route).
         for route in &self.config.routes {
-            let resolver = resolvers[&route.chain_key].clone();
             spawn_worker(
                 &mut tasks,
                 format!("outbox watcher (chain_key {})", route.chain_key),
@@ -260,11 +240,10 @@ impl Server {
                     self.config.creditcoin_eth_rpc_url.clone(),
                     indexed_tx.clone(),
                     metrics.clone(),
-                    resolver,
                     checkpoint.clone(),
                     self.config.scan_lookback_blocks,
                     health.clone(),
-                    holdback.clone(),
+                    work.clone(),
                     cancel.clone(),
                 ),
             );
@@ -274,7 +253,7 @@ impl Server {
         drop(indexed_tx);
 
         // Acknowledgment submitters (per route, opt-in). Each watches the destination Inbox for
-        // `MessageDelivered`, fetches a native USC delivery proof, and submits it to the
+        // `MessageReceived`, fetches a native USC delivery proof, and submits it to the
         // source-chain `AcknowledgmentValidator` — and, when the route has a RelayerContract
         // configured, additionally submits `RelayerContract.claimDelivery` for the relay fee (the
         // two settlements are independent since usc-contracts #23; the claim no longer acks).
@@ -293,14 +272,12 @@ impl Server {
             );
         }
         for route in self.config.routes.iter().filter(|r| r.ack.is_some()) {
-            let resolver = resolvers[&route.chain_key].clone();
             spawn_worker(
                 &mut tasks,
                 format!("ack submitter (chain_key {})", route.chain_key),
                 ack::run(
                     route.clone(),
                     self.config.creditcoin_eth_rpc_url.clone(),
-                    resolver,
                     checkpoint.clone(),
                     self.config.scan_lookback_blocks,
                     metrics.clone(),
@@ -324,6 +301,7 @@ impl Server {
                     self.config.creditcoin_eth_rpc_url.clone(),
                     checkpoint.clone(),
                     self.config.scan_lookback_blocks,
+                    metrics.clone(),
                     health.clone(),
                     broadcast_locks.clone(),
                     cancel.clone(),
@@ -371,16 +349,16 @@ impl Server {
             ),
         );
 
-        // Vote source: a spy-node WS subscription when configured, else the embedded libp2p
-        // swarm. The spy path is the target architecture (spy spec §1); the embedded swarm
+        // Vote source: an observer-node WS subscription when configured, else the embedded libp2p
+        // swarm. The observer path is the target architecture (observer spec §1); the embedded swarm
         // remains for standalone deployments and local dev.
         let route_chain_keys: Vec<u64> = self.config.routes.iter().map(|r| r.chain_key).collect();
-        if let Some(spy) = self.config.spy.clone() {
+        if let Some(observer) = self.config.observer.clone() {
             spawn_worker(
                 &mut tasks,
-                "spy client",
-                spy_client::run(
-                    spy,
+                "observer client",
+                observer_client::run(
+                    observer,
                     route_chain_keys,
                     vote_tx,
                     setupdate_vote_tx,
@@ -438,7 +416,12 @@ impl Server {
                 )
             })?;
         let bind_addr = SocketAddr::new(ip, self.config.bind_port);
-        let app = prom::build_router(self.prom_metrics.clone(), query_tx, health.clone());
+        let app = prom::build_router(
+            self.prom_metrics.clone(),
+            query_tx,
+            health.clone(),
+            outcomes.clone(),
+        );
         let listener = tokio::net::TcpListener::bind(bind_addr)
             .await
             .with_context(|| format!("failed to bind HTTP listener at {bind_addr}"))?;

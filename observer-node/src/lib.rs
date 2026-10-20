@@ -1,4 +1,4 @@
-//! USC write-ability **spy node** — a passive p2p observer, in the spirit of Wormhole's Spy.
+//! USC write-ability **observer node** — a passive p2p observer, in the spirit of Wormhole's Spy.
 //!
 //! Joins the attestor/relayer gossipsub mesh as just another peer (same topics, same bootnode
 //! discovery), performs **no validation duties, no voting, no delivery**, and fans out every
@@ -6,16 +6,16 @@
 //! explorers, monitors (and eventually the relayer itself) in any language can watch the p2p
 //! process of message voting without reimplementing libp2p + SCALE + ECDSA.
 //!
-//! Spec: `usc-write-ability-research/documents/confluence-spy-node-spec.md`.
+//! Spec: `usc-write-ability-research/documents/confluence-observer-node-spec.md`.
 //!
 //! Two tasks under one supervisor, mirroring the relayer's runtime shape:
 //!  * [`swarm::run`] — the libp2p observer (reusing the relayer's behavior + the shared
-//!    `write-ability` envelopes), publishing [`events::SpyEvent`]s into the [`hub::Hub`].
+//!    `write-ability` envelopes), publishing [`events::ObserverEvent`]s into the [`hub::Hub`].
 //!  * an axum server — `/ws` subscriptions (per-connection filters), `/health` (progress-aware),
 //!    `/metrics`.
 //!
 //! Shutdown is one [`CancellationToken`] fanned out to both; any task exiting tears down the
-//! process (fail-fast — orchestration restarts a spy whose swarm died).
+//! process (fail-fast — orchestration restarts an observer whose swarm died).
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -48,7 +48,7 @@ impl Server {
         info!(
             chain_keys = ?config.chain_keys,
             allow_publish = config.allow_publish,
-            "🕵️ Configured spy node"
+            "🕵️ Configured observer node"
         );
         Self { config }
     }
@@ -56,9 +56,9 @@ impl Server {
     pub async fn run(self) -> Result<()> {
         let cancel = CancellationToken::new();
         let hub = hub::Hub::new();
-        let metrics = metrics::SpyMetrics::new();
+        let metrics = metrics::ObserverMetrics::new();
         // Progress-aware liveness: the swarm loop pulses; a wedged swarm flips /health to 503 so
-        // orchestration restarts the spy (same pattern as the relayer).
+        // orchestration restarts the observer (same pattern as the relayer).
         let health =
             message_relayer::health::Health::new(message_relayer::health::PROGRESS_DEADLINE);
 
@@ -76,7 +76,7 @@ impl Server {
             let chain_keys = self.config.chain_keys.clone();
             spawn_worker(
                 &mut tasks,
-                "spy swarm",
+                "observer swarm",
                 swarm::run(p2p, chain_keys, hub, publish_rx, metrics, health, cancel),
             );
         }
@@ -111,7 +111,7 @@ impl Server {
             Ok(())
         });
 
-        info!("✅ spy node online");
+        info!("✅ observer node online");
 
         tokio::select! {
             () = message_relayer::shutdown_signal() => {
@@ -123,7 +123,7 @@ impl Server {
         }
         cancel.cancel();
         while tasks.join_next().await.is_some() {}
-        info!("🛑 spy node drained, exiting");
+        info!("🛑 observer node drained, exiting");
         Ok(())
     }
 }

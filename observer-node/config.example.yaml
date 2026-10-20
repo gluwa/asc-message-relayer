@@ -1,6 +1,6 @@
-# Spy node configuration example.
+# Observer node configuration example.
 #
-# The spy joins the attestor/relayer gossipsub mesh as a passive observer and streams
+# The observer joins the attestor/relayer gossipsub mesh as a passive observer and streams
 # message-attestation events over WebSocket at ws://<bind_host>:<bind_port>/ws.
 # It needs no chain RPC and no keys of consequence — bootnodes and a port.
 
@@ -11,8 +11,8 @@ chain_keys: [102]
 bind_host: "0.0.0.0"
 bind_port: 9190
 
-# Allow WS clients to publish reobservation requests through this spy. Leave false for public
-# read-only observers; enable when a relayer fronts its gossip through this spy.
+# Allow WS clients to publish reobservation requests through this observer. Leave false for public
+# read-only observers; enable when a relayer fronts its gossip through this observer.
 allow_publish: false
 
 # Maximum concurrent WS subscribers (default 256). Consumers lagging past the shared event ring
@@ -29,6 +29,6 @@ p2p:
   # Ephemeral (PeerId changes each restart) when unset — fine for read-only observers.
   # identity: "0x…"
   # Optional DNS name to advertise.
-  # public_addr: "spy.example.org"
+  # public_addr: "observer.example.org"
   # Disable mDNS outside local dev clusters.
   no_mdns: true

@@ -73,19 +73,19 @@ pub struct Config {
     /// Outboxes and `eth_chainId` from this endpoint.
     pub creditcoin_eth_rpc_url: String,
     pub p2p: P2pConfig,
-    /// When set, the relayer sources votes from a spy node's WebSocket subscription instead of
-    /// embedding its own libp2p swarm — and publishes reobservation requests through that spy
+    /// When set, the relayer sources votes from an observer node's WebSocket subscription instead of
+    /// embedding its own libp2p swarm — and publishes reobservation requests through that observer
     /// (which must run `allow_publish: true`). The `p2p` section is ignored in this mode.
-    pub spy: Option<crate::spy_client::SpyClientConfig>,
+    pub observer: Option<crate::observer_client::ObserverClientConfig>,
     pub vote_cache: VoteCacheConfig,
     pub delivery: DeliveryConfig,
     pub routes: Vec<ChainRoute>,
-    /// Where to persist per-watcher block cursors so the relayer resumes from the last processed
-    /// block after a restart (never silently skips on-chain events emitted while it was down).
+    /// Where to persist per-watcher block cursors. Unfinished source messages are stored in the
+    /// sibling `<checkpoint_path>.messages` directory; keep both on persistent storage.
     /// `None` disables persistence (watchers start from the chain head).
     pub checkpoint_path: Option<PathBuf>,
-    /// Blocks to rewind persisted cursors on startup so in-flight work lost with the process
-    /// (pool votes, pending acks) is re-discovered. See [`DEFAULT_SCAN_LOOKBACK_BLOCKS`];
+    /// Blocks to rewind persisted cursors on startup (including memory-only pending acks).
+    /// Source delivery work is durable independently of this window. See [`DEFAULT_SCAN_LOOKBACK_BLOCKS`];
     /// 0 disables the rewind.
     pub scan_lookback_blocks: u64,
 }
@@ -97,11 +97,10 @@ pub struct ChainRoute {
     pub destination_rpc_url: String,
     pub inbox_address: Address,
     pub signer_key: Option<String>,
-    /// Operator-pinned Outbox address, honored before the on-chain `OutboxDiscovery` registry
-    /// lookup (`DiscoveryResolver::override_address`). The registry is the default and the only
-    /// source of truth resolution otherwise trusts; set this only for a network where the
-    /// chain-info precompile getter is missing or misconfigured, or to pin an Outbox during an
-    /// incident. Logged loudly (`WARN`) at startup and on every resolve while set.
+    /// Operator-pinned source Outbox, bypassing historical on-chain registry authorization.
+    /// Use only where the chain-info precompile is unavailable or to pin a source during an
+    /// incident. The source watcher warns while this override is active. Settlement still
+    /// resolves each message's original Outbox independently.
     pub outbox_address: Option<Address>,
     /// `RelayerContract(Lite)` on the *source* (Creditcoin) chain — the contract holding the
     /// per-message fee ledger (`getMessageInfo`) and `claimDelivery` since usc-contracts #23 moved
@@ -112,18 +111,18 @@ pub struct ChainRoute {
     /// submits `claimDelivery` for each delivered message. `None` falls back to gas estimation
     /// (fee not claimable).
     pub relayer_contract_address: Option<Address>,
-    /// Reorg guard in blocks. For the Creditcoin **Outbox scan** this is only the *fallback*
-    /// boundary: the watcher scans up to the finalized head (Creditcoin has deterministic
-    /// finality, and that is where the attestors sign) and uses `tip - depth` only when the
-    /// `finalized` tag is unavailable or finality has stalled (`events::finality`). The Outbox
-    /// factory scan and the destination-side workers still use it as a plain depth.
+    /// Reorg guard for destination settlement and completion. Execution remains durable until
+    /// `processedAt + depth <= head`; zero explicitly permits completion on an execution receipt.
+    /// Source publication discovery always requires Creditcoin's finalized head and pauses on
+    /// unavailable, regressed or stalled finality instead of falling back to this depth.
     pub block_confirmation_depth: u64,
-    /// First block to scan on first run when no persisted checkpoint exists.
+    /// First source block to scan when no checkpoint exists for the current scan scope. Defaults
+    /// to block 1, including migration from legacy single-Outbox checkpoints.
     pub start_block: Option<u64>,
     pub attestor_set: AttestorSet,
     pub threshold_override: Option<u32>,
     /// Opt-in trust-minimized acknowledgment. When set, the relayer watches the destination
-    /// Inbox for `MessageDelivered`, fetches a native USC delivery proof from the proof-gen API,
+    /// Inbox for `MessageReceived`, fetches a native USC delivery proof from the proof-gen API,
     /// and submits it to the source-chain `AcknowledgmentValidator`. `None` disables ack for the
     /// route (the default).
     pub ack: Option<AckConfig>,
@@ -211,12 +210,14 @@ pub struct AckConfig {
     /// Base URL of the proof-gen API server (e.g. `http://127.0.0.1:8080`). The submitter calls
     /// `GET {base}/api/v1/proof-by-tx/{chain_key}/{tx_hash}`.
     pub proof_gen_url: String,
-    /// `AcknowledgmentValidator` contract on the Creditcoin (source) chain — the submit target.
+    /// Primary `AcknowledgmentValidator` address used as an Outbox discovery hint. Settlement resolves the actual target
+    /// from each message's original Outbox so rotations and multiple active Outboxes are safe.
+    /// Retained for config compatibility; this address is not an acknowledgment routing override.
     pub validator_address: Address,
     /// EVM key used to sign `submitAcknowledgment` txs on the Creditcoin chain. Submission is
     /// permissionless (the proof is self-validating), so this only needs gas, not authority.
     pub signer_key: String,
-    /// Blocks to lag behind the destination chain tip when scanning for `MessageDelivered`, so the
+    /// Blocks to lag behind the destination chain tip when scanning for `MessageReceived`, so the
     /// ack watcher does not act on the unsafe head (a destination reorg could otherwise enqueue an
     /// ack for a delivery that later disappears). 0 for instant-finality destinations.
     pub confirmation_depth: u64,
@@ -346,7 +347,7 @@ impl Config {
             cc3_rpc_url,
             creditcoin_eth_rpc_url,
             p2p,
-            spy: None,
+            observer: None,
             vote_cache: VoteCacheConfig::default(),
             delivery: DeliveryConfig::default(),
             routes: vec![route],
@@ -404,7 +405,7 @@ pub struct ConfigFile {
     #[serde(default)]
     pub p2p: P2pConfigFile,
     #[serde(default)]
-    pub spy: Option<crate::spy_client::SpyClientConfig>,
+    pub observer: Option<crate::observer_client::ObserverClientConfig>,
     #[serde(default)]
     pub vote_cache: VoteCacheConfigFile,
     #[serde(default)]
@@ -618,7 +619,7 @@ impl ConfigFile {
                 no_mdns: self.p2p.no_mdns,
                 identity: self.p2p.identity,
             },
-            spy: self.spy,
+            observer: self.observer,
             vote_cache: VoteCacheConfig {
                 ttl_seconds: self.vote_cache.ttl_seconds,
                 max_messages: self.vote_cache.max_messages,
