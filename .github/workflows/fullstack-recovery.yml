@@ -38,14 +38,14 @@ jobs:
     name: Real stack / delivery, restart and attestor rotation
     # This SHA pins the workflow definition. The source/run/artifact pins below identify
     # the existing native build and must be updated together after its full CI succeeds.
-    uses: gluwa/creditcoin3/.github/workflows/write-ability-e2e.yml@6289af511d0bc4b86027aa9e1d01bbcf85976514
+    uses: gluwa/creditcoin3/.github/workflows/write-ability-e2e.yml@fa1c5b826ad1f7676ac2033cdf110036f2049875
     with:
       # The native producer checked out this PR merge commit, not the workflow definition SHA.
       creditcoin-ref: ${{ inputs.creditcoin-ref || 'bdb2d754dad675948224fd14ce35d5a13b465079' }}
       creditcoin-run-id: ${{ inputs.creditcoin-run-id || '39441223115' }}
       creditcoin-artifact-id: ${{ inputs.creditcoin-artifact-id || '12276875560' }}
       # Pin the updated controller independently; retain the verified native build.
-      runner-ref: 6289af511d0bc4b86027aa9e1d01bbcf85976514
+      runner-ref: fa1c5b826ad1f7676ac2033cdf110036f2049875
       relayer-repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
       # Exercise the candidate itself, rather than a moving branch or the synthetic merge SHA.
       relayer-ref: ${{ github.event.pull_request.head.sha || github.sha }}
