@@ -184,7 +184,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: gluwa/asc-contracts
-          ref: 3f9259e9764b1a77d9c329e2be59d61e7eae676a # main @ 2026-09-25 (#54 merged: messageId is now the signed digest directly, deliverMessage's sequence arg, MessagePublished carries sequence, Inbox retryFailedMessage/isRetryable, MessageReceived/MessageExecuted/DestinationFailed replace MessageDelivered/MessageExecutionFailed) — bump deliberately
+          ref: 9223d179f7a9de30a7dad2b390e9dcff45cddc69 # main @ 2026-10-21 (#62 approval epochs; includes decoder v2)
           path: asc-contracts
           # asc-contracts is private; the default GITHUB_TOKEN is scoped to this repo only and
           # gets "Repository not found". Same org bot PAT creditcoin3's e2e uses cross-repo.
