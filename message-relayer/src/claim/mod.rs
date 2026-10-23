@@ -44,9 +44,9 @@ use tracing::{debug, info, warn};
 
 use crate::checkpoint::CheckpointStore;
 use crate::config::{ChainRoute, ClaimConfig};
-use crate::pending::{BoundedSeen, PendingTxs};
+use crate::pending::{BoundedSeen, PendingTxs, TRANSIENT_BACKOFF_MAX};
 use crate::prom::Metrics;
-use crate::proofgen::{ProofFetch, ProofGenClient};
+use crate::proofgen::{ProofFetch, ProofGenClient, ProofRejected};
 
 /// Poll cadence for the client-chain intent watcher and the pending-proof retry queue.
 pub const CLAIM_POLL_INTERVAL_SECS: u64 = 6;
@@ -508,6 +508,21 @@ async fn process_pending<P: Provider>(
                     pending.defer(&tx_hash, now + NOT_READY_RETRY);
                 }
             }
+            Ok(ClaimOutcome::Rejected(reason)) => {
+                // Retrying the same request cannot help until proof-gen or its archiver changes:
+                // go straight to the capped cadence rather than the transient ramp, and keep the
+                // claim (see the no-drop rationale on the error arm below).
+                warn!(
+                    chain_key,
+                    %tx_hash,
+                    %reason,
+                    retry_in_secs = TRANSIENT_BACKOFF_MAX.as_secs(),
+                    "proof-gen permanently rejects this proof request (retriable=false), so the \
+                     claim cannot settle until proof-gen or its archiver is fixed; retaining the \
+                     claim and retrying at the capped backoff"
+                );
+                pending.defer(&tx_hash, now + TRANSIENT_BACKOFF_MAX);
+            }
             Err(err) => {
                 let attempts = pending.record_transient_failure(&tx_hash, now);
                 // Do NOT drop after a fixed budget (C1r/C2): the old give-up permanently abandoned
@@ -545,6 +560,10 @@ enum ClaimOutcome {
     Claimed,
     /// The proof block is not yet attested (`BlockNotReady`); retry later.
     NotReady,
+    /// Proof-gen permanently refuses the proof request (HTTP 4xx, `retriable: false`, e.g. an
+    /// archiver `/roots` cap below the span the proof needs). The claim is retained, never
+    /// dropped: it succeeds once proof-gen or its archiver is fixed.
+    Rejected(ProofRejected),
     /// A permanent condition (already claimed, wrong emitter, proof rejected, …).
     Terminal(String),
 }
@@ -584,6 +603,7 @@ async fn claim_tx<P: Provider>(
     let proof = match client.proof_by_tx(chain_key, tx_hash).await? {
         ProofFetch::Ready(p) => p,
         ProofFetch::NotReady(_) => return Ok(ClaimOutcome::NotReady),
+        ProofFetch::Rejected(reason) => return Ok(ClaimOutcome::Rejected(reason)),
     };
 
     let encoded_tx = proof.encoded_transaction()?;
