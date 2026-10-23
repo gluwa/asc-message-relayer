@@ -20,7 +20,16 @@
 //!   existed also answers 404 — the caller's bounded fast-poll window and capped slow backoff
 //!   prevent hot-looping while preserving any outstanding settlement obligation.
 //!
-//! Everything else (5xx, connection errors, an unparseable proof) is an `Err`.
+//! A third class is a *permanent* refusal: a 4xx (other than 404/422) whose body says
+//! `"retriable": false`, proof-gen's own statement that repeating the identical request cannot
+//! help. It maps to [`ProofFetch::Rejected`]. On asc-devnet (2026-10-23) every ck2 proof that needed
+//! a whole checkpoint span answered `400 ArchiverRangeRejected`, because the archiver's `/roots`
+//! cap (1000 blocks) was below the 6000-block span; the acks backed off as transient errors under a
+//! log that pointed at the signer balance. Callers keep the obligation (the proof is servable again
+//! once proof-gen or its archiver is fixed) but skip the exponential ramp and say what is wrong.
+//!
+//! Everything else (5xx, connection errors, a 4xx without that flag, an unparseable proof) is an
+//! `Err`.
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -44,6 +53,10 @@ pub enum ProofFetch {
     /// Proof-gen cannot serve this proof *yet* (HTTP 422 / 404 — see the module docs). Not an
     /// error: callers poll on a steady cadence instead of backing off.
     NotReady(ProofNotReady),
+    /// Proof-gen refuses this request and says repeating it unchanged cannot help (HTTP 4xx with
+    /// `"retriable": false` — see the module docs). The request is not retriable, but the
+    /// settlement obligation stays: it can succeed once proof-gen or its archiver is fixed.
+    Rejected(ProofRejected),
 }
 
 /// Why proof-gen could not serve a proof yet — carried on [`ProofFetch::NotReady`] so the
@@ -63,14 +76,59 @@ impl std::fmt::Display for ProofNotReady {
     }
 }
 
+/// Why proof-gen permanently refused a request — carried on [`ProofFetch::Rejected`] so the
+/// caller's log names the cause (`ArchiverRangeRejected`, the archiver's own wording) instead of
+/// a bare status.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProofRejected {
+    /// HTTP status proof-gen answered with (a 4xx other than 404/422).
+    pub status: u16,
+    /// proof-gen's `code` from its JSON error body (`ArchiverRangeRejected`, …).
+    pub code: String,
+    /// proof-gen's human-readable `message` (empty when the body carried none).
+    pub message: String,
+}
+
+impl std::fmt::Display for ProofRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP {} {}", self.status, self.code)?;
+        if !self.message.is_empty() {
+            write!(f, ": {}", self.message)?;
+        }
+        Ok(())
+    }
+}
+
 /// The subset of proof-gen's `ErrorResponse` body we read back (`code` names its `ServiceError`
-/// variant). Everything else in the body is ignored.
+/// variant, `retriable` says whether repeating the identical request can succeed). Everything else
+/// in the body is ignored.
 #[derive(Debug, Deserialize)]
 struct ProofGenErrorBody {
     code: Option<String>,
+    message: Option<String>,
+    retriable: Option<bool>,
 }
 
-/// Classify one proof-gen response into ready / not-ready / error. Pure, so the mapping is
+/// `Some` when a 4xx response carries proof-gen's JSON error body with an explicit
+/// `"retriable": false` and a code. A missing flag, `true`, an unparseable body and every non-4xx
+/// status stay errors: only proof-gen's own word makes a refusal permanent.
+fn rejection(status: reqwest::StatusCode, body: &str) -> Option<ProofRejected> {
+    if !status.is_client_error() {
+        return None;
+    }
+    let parsed = serde_json::from_str::<ProofGenErrorBody>(body).ok()?;
+    if parsed.retriable != Some(false) {
+        return None;
+    }
+    let code = parsed.code.filter(|c| !c.trim().is_empty())?;
+    Some(ProofRejected {
+        status: status.as_u16(),
+        code,
+        message: parsed.message.unwrap_or_default(),
+    })
+}
+
+/// Classify one proof-gen response into ready / not-ready / rejected / error. Pure, so the mapping is
 /// unit-tested without a server: `status` and `body` are the raw HTTP response, `url` only feeds
 /// error messages.
 pub fn classify_proof_response(
@@ -95,6 +153,9 @@ pub fn classify_proof_response(
             status: status.as_u16(),
             code,
         }));
+    }
+    if let Some(rejected) = rejection(status, body) {
+        return Ok(ProofFetch::Rejected(rejected));
     }
     if !status.is_success() {
         anyhow::bail!("proof-gen returned {status} for {url}: {body}");
@@ -280,6 +341,7 @@ mod tests {
         match classify_proof_response(status, body, "http://pg/api/v1/proof-by-tx/8/0x1").unwrap() {
             ProofFetch::NotReady(r) => r,
             ProofFetch::Ready(_) => panic!("{status} must not classify as Ready"),
+            ProofFetch::Rejected(_) => panic!("{status} must not classify as Rejected"),
         }
     }
 
@@ -339,6 +401,73 @@ mod tests {
             classify_proof_response(reqwest::StatusCode::OK, SAMPLE, url).unwrap(),
             ProofFetch::Ready(p) if p.header_number == 42
         ));
+    }
+
+    /// The 2026-10-23 asc-devnet shape: the archiver's `/roots` cap (1000) was below the 6000-block
+    /// checkpoint span, so proof-gen answered 400 `ArchiverRangeRejected` with `retriable: false`
+    /// for every ck2 proof that needed a whole span.
+    #[test]
+    fn classifies_retriable_false_4xx_as_rejected() {
+        let url = "http://pg/api/v1/proof-by-tx/2/0x1";
+        let body = r#"{"code":"ArchiverRangeRejected","message":"archiver cannot serve roots for range 48996001..49002000: range too large (max 1000 blocks)","retriable":false}"#;
+        let rejected =
+            match classify_proof_response(reqwest::StatusCode::BAD_REQUEST, body, url).unwrap() {
+                ProofFetch::Rejected(r) => r,
+                _ => panic!("a retriable:false 400 must classify as Rejected"),
+            };
+        assert_eq!(rejected.status, 400);
+        assert_eq!(rejected.code, "ArchiverRangeRejected");
+        assert!(rejected
+            .message
+            .contains("range too large (max 1000 blocks)"));
+        assert_eq!(
+            rejected.to_string(),
+            "HTTP 400 ArchiverRangeRejected: archiver cannot serve roots for range \
+             48996001..49002000: range too large (max 1000 blocks)"
+        );
+
+        // The message is optional; Display must not leave a dangling ": ".
+        let bare = rejection(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"code":"Forbidden","retriable":false}"#,
+        )
+        .unwrap();
+        assert_eq!(bare.to_string(), "HTTP 403 Forbidden");
+    }
+
+    /// Only proof-gen's own explicit word makes a refusal permanent. Everything else keeps taking
+    /// the transient backoff, exactly as before.
+    #[test]
+    fn rejected_requires_an_explicit_retriable_false_on_a_4xx() {
+        let url = "http://pg/api/v1/proof-by-tx/2/0x1";
+        let is_err = |status: u16, body: &str| {
+            classify_proof_response(reqwest::StatusCode::from_u16(status).unwrap(), body, url)
+                .is_err()
+        };
+        // Flag missing, or true: still a (transient) error.
+        assert!(is_err(400, r#"{"code":"ArchiverRangeRejected"}"#));
+        assert!(is_err(400, r#"{"code":"X","retriable":true}"#));
+        // No usable code, or a body that is not proof-gen's JSON (a proxy's page, an empty body).
+        assert!(is_err(400, r#"{"retriable":false}"#));
+        assert!(is_err(400, r#"{"code":"","retriable":false}"#));
+        assert!(is_err(400, "<html>bad request</html>"));
+        assert!(is_err(400, ""));
+        // 5xx stays an error even when the body claims retriable:false: that is infrastructure.
+        assert!(is_err(500, r#"{"code":"Internal","retriable":false}"#));
+        assert!(is_err(503, r#"{"code":"Unavailable","retriable":false}"#));
+        // 404 and 422 keep their "not yet" meaning regardless of the flag.
+        for status in [404u16, 422] {
+            let r = classify_proof_response(
+                reqwest::StatusCode::from_u16(status).unwrap(),
+                r#"{"code":"TxHashNotFound","retriable":false}"#,
+                url,
+            )
+            .unwrap();
+            assert!(
+                matches!(r, ProofFetch::NotReady(_)),
+                "{status} stays NotReady"
+            );
+        }
     }
 
     #[test]

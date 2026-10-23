@@ -82,9 +82,9 @@ use tracing::{debug, info, warn};
 use crate::abi::IInbox;
 use crate::checkpoint::CheckpointStore;
 use crate::config::{AckConfig, ChainRoute};
-use crate::pending::{BoundedSeen, PendingTxs};
+use crate::pending::{BoundedSeen, PendingTxs, TRANSIENT_BACKOFF_MAX};
 use crate::prom::{Metrics, ProofFetchOutcome, SettlementOutcome};
-use crate::proofgen::{ProofFetch, ProofGenClient, ProofNotReady};
+use crate::proofgen::{ProofFetch, ProofGenClient, ProofNotReady, ProofRejected};
 
 mod routes;
 
@@ -667,6 +667,24 @@ async fn process_pending<P: Provider>(
                 }
                 pending.defer(&tx_hash, now + retry_in);
             }
+            Ok(AckOutcome::Rejected(reason)) => {
+                // Retrying the same request cannot help until proof-gen or its archiver changes,
+                // so go straight to the capped cadence instead of climbing the transient ramp, and
+                // keep the settlement: dropping it would lose the ack for good (the discovery
+                // cursor has moved past it), even though a fix would let it settle.
+                warn!(
+                    chain_key,
+                    %tx_hash,
+                    message_ids = ?message_ids,
+                    %reason,
+                    waited_secs = pending.age(&tx_hash, now).unwrap_or_default().as_secs(),
+                    retry_in_secs = TRANSIENT_BACKOFF_MAX.as_secs(),
+                    "proof-gen permanently rejects this proof request (retriable=false), so the ack \
+                     cannot settle until proof-gen or its archiver is fixed; retaining the \
+                     settlement and retrying at the capped backoff"
+                );
+                pending.defer(&tx_hash, now + TRANSIENT_BACKOFF_MAX);
+            }
             Err(err) => {
                 let attempts = pending.record_transient_failure(&tx_hash, now);
                 // Do NOT drop after a fixed budget. The old give-up removed the tx and marked it
@@ -728,6 +746,10 @@ enum AckOutcome {
     /// Proof-gen cannot serve the proof yet (block not attested / its chain view lagging — see
     /// [`crate::proofgen`]); re-poll per the route's [`crate::pending::NotReadyPolicy`].
     NotReady(ProofNotReady),
+    /// Proof-gen permanently refuses this proof request (HTTP 4xx, `retriable: false` — see
+    /// [`crate::proofgen`]), e.g. its archiver's `/roots` cap is below the span a proof needs. The
+    /// settlement is retained, never dropped: it succeeds once proof-gen or its archiver is fixed.
+    Rejected(ProofRejected),
     /// A permanent condition (e.g. on-chain revert: already acknowledged / does not require ack).
     Terminal(String),
 }
@@ -908,6 +930,22 @@ async fn acknowledge_tx<P: Provider>(
                 return Err(err.context(format!("delivery proof also not ready: {reason}")));
             }
             return Ok(AckOutcome::NotReady(reason));
+        }
+        Ok(ProofFetch::Rejected(reason)) => {
+            metrics.inc_ack_proof_fetch(chain_key, ProofFetchOutcome::Rejected);
+            // Settlement is still failing, so it stays on the `Failed` counters exactly as the
+            // error arm below leaves it: alerts keyed on them keep firing for a stuck ack.
+            if needs_ack {
+                metrics.inc_ack_submission(chain_key, SettlementOutcome::Failed);
+            }
+            if !claim_ids.is_empty() {
+                metrics.inc_claim_submission(chain_key, SettlementOutcome::Failed);
+            }
+            if let Some(err) = failure {
+                // Preserve the routing error, as for `NotReady`.
+                return Err(err.context(format!("delivery proof also rejected: {reason}")));
+            }
+            return Ok(AckOutcome::Rejected(reason));
         }
         Err(err) => {
             metrics.inc_ack_proof_fetch(chain_key, ProofFetchOutcome::Error);
@@ -1410,6 +1448,106 @@ mod tests {
                 .len(),
             1
         );
+        assert!(rpc.read_q().is_empty());
+    }
+
+    /// The 2026-10-23 asc-devnet shape: proof-gen answers `400 ArchiverRangeRejected` with
+    /// `retriable: false` (the archiver's `/roots` cap was below the 6000-block checkpoint span).
+    /// That is a permanent refusal of the request, not a transient fault: the settlement is
+    /// retained, never dropped (the discovery cursor has moved past it, so a drop loses the ack
+    /// for good), and it goes straight to the capped cadence instead of starting the 30 s ramp.
+    #[tokio::test]
+    async fn rejected_proof_is_retained_and_deferred_to_the_capped_backoff() {
+        let rpc = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(rpc.clone());
+        let outbox = Address::repeat_byte(1);
+        let validator = Address::repeat_byte(2);
+        let message = crate::abi::OutboxMessage {
+            emitter: Address::repeat_byte(3),
+            sequence: 4,
+            timestamp: 5,
+            canAck: true,
+            acknowledged: false,
+            payloadHash: B256::repeat_byte(6),
+        };
+        let id = alloy::primitives::keccak256(
+            (
+                outbox,
+                message.emitter,
+                message.sequence,
+                message.payloadHash,
+                U256::from(42),
+            )
+                .abi_encode_params(),
+        );
+        rpc.push_success(&Bytes::from(message.abi_encode()));
+        rpc.push_success(&Bytes::from(validator.abi_encode()));
+        rpc.push_success(&Bytes::from(outbox.abi_encode()));
+        rpc.push_success(&Bytes::from(2u64.abi_encode()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(|| async {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "code": "ArchiverRangeRejected",
+                    "message": "archiver cannot serve roots for range 48996001..49002000: \
+                                range too large (max 1000 blocks)",
+                    "retriable": false,
+                })),
+            )
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let ack = AckConfig {
+            proof_gen_url: url.clone(),
+            validator_address: validator,
+            signer_key: String::new(),
+            confirmation_depth: 0,
+            start_block: None,
+            not_ready_poll_secs: 6,
+            not_ready_poll_window_secs: 600,
+        };
+        let tx = B256::repeat_byte(9);
+        let mut pending = PendingTxs::new(1);
+        let mut done = BoundedSeen::new(10);
+        pending.insert(
+            tx,
+            Instant::now(),
+            12,
+            vec![DeliveryEvent {
+                message_id: id,
+                executed: true,
+            }],
+        );
+        process_pending(
+            2,
+            &ack,
+            &SettlementMode::Ack,
+            42,
+            &BTreeSet::from([outbox]),
+            &ProofGenClient::new(&url).unwrap(),
+            &provider,
+            Address::repeat_byte(8),
+            &crate::broadcast::BroadcastLocks::new(),
+            &(crate::prom::NoopMetrics::new() as Metrics),
+            &mut pending,
+            &mut done,
+        )
+        .await;
+        let after = Instant::now();
+        server.abort();
+        assert!(
+            pending.contains(&tx),
+            "a permanently rejected proof must not abandon custody"
+        );
+        assert!(!done.contains(&tx));
+        assert_eq!(pending.oldest_pending_block(), Some(12));
+        // Not the transient ramp (30 s first, then 60 s, ...): nothing is due before the capped
+        // delay, and it is due once that delay has passed.
+        assert!(pending
+            .ready(1, after + TRANSIENT_BACKOFF_MAX - Duration::from_secs(30))
+            .is_empty());
+        assert_eq!(pending.ready(1, after + TRANSIENT_BACKOFF_MAX).len(), 1);
         assert!(rpc.read_q().is_empty());
     }
 
