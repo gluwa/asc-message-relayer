@@ -73,10 +73,16 @@ impl FailedRetries {
             },
             None => None,
         };
-        Ok(match (memory, disk) {
+        let merged = match (memory, disk) {
             (Some(a), Some(b)) => Some(stricter(a, b)),
             (a, b) => a.or(b),
-        })
+        };
+        // Cache what was read: a later read failure in this process (e.g. between `gate` and
+        // `record_attempt`) then falls back to it instead of to an empty counter.
+        if let Some(state) = merged {
+            self.memory().insert(message_id, state);
+        }
+        Ok(merged)
     }
 
     async fn put(&self, message_id: B256, state: FailedRetryState) {
@@ -157,14 +163,13 @@ impl FailedRetries {
         policy: &FailedRetryPolicy,
         now: u64,
     ) -> FailedRetryState {
-        // `gate` read the entry just before the broadcast; if that read now fails, the in-memory
-        // copy (or a first attempt) is the best available floor.
+        // `gate` read (and cached) the entry just before the broadcast; if this read fails, `get`
+        // falls back to that cached copy, so the count cannot drop below what `gate` saw.
         let previous = self
             .get(message_id)
             .await
             .ok()
             .flatten()
-            .or_else(|| self.memory().get(&message_id).copied())
             .unwrap_or_default();
         let attempts = previous.attempts.saturating_add(1);
         let state = FailedRetryState {
@@ -339,6 +344,34 @@ mod tests {
         assert_eq!(
             std::fs::read(failed.join(format!("{id}.json"))).unwrap(),
             b"{"
+        );
+    }
+
+    /// After a restart, a read that fails between `gate` and `record_attempt` must not write a
+    /// zeroed counter over the persisted one.
+    #[tokio::test]
+    async fn read_failure_after_gate_keeps_the_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = dir.path().join("cp");
+        let id = B256::repeat_byte(1);
+        let work = Arc::new(WorkStore::for_checkpoint(&checkpoint));
+        let persisted = FailedRetryState {
+            attempts: 3,
+            next_attempt_at: NOW,
+            gave_up_at: None,
+        };
+        work.put_failed_retry(2, id, persisted).await.unwrap();
+        let retries = FailedRetries::new(2, Some(work));
+        assert_eq!(retries.gate(id, &policy(5), NOW).await, Gate::Proceed);
+        let path = checkpoint
+            .with_extension("messages")
+            .join("2")
+            .join("failed")
+            .join(format!("{id}.json"));
+        std::fs::write(&path, b"{").unwrap();
+        assert_eq!(
+            retries.record_attempt(id, &policy(5), NOW).await.attempts,
+            4
         );
     }
 
