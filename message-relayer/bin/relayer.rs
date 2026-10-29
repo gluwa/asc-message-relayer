@@ -415,6 +415,7 @@ fn single_route_config(cli: Cli) -> Result<Config> {
         max_native_coin_value_wei,
         max_gas_limit: cli.max_gas_limit,
         auto_request_top_up: cli.auto_request_top_up,
+        failed_retry: Default::default(),
     };
     // Same cross-field rules as the YAML path (non-zero gas cap; the top-up opt-in needs the
     // relayer contract and a Creditcoin signer).

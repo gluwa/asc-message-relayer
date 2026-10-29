@@ -55,6 +55,16 @@ pub const DEFAULT_MAX_NATIVE_COIN_VALUE_WEI: U256 = U256::ZERO;
 /// can never be delivered by anyone; refusing it up front (terminal, with a metric) beats retrying
 /// an unincludable tx forever. 5M sits comfortably under every mainstream block gas limit.
 pub const DEFAULT_MAX_GAS_LIMIT: u64 = 5_000_000;
+/// Default budget of `retryFailedMessage` transactions per message whose destination call failed
+/// (`DestinationFailed`). A destination that reverts deterministically can never be fixed by the
+/// relayer resending the same call, and each attempt costs a full destination execution in gas
+/// (asc-devnet, Oct 2026: ~177k gas every ~10 min per Multicall3 probe drained a Sepolia signer).
+/// Past the budget the relayer gives up; the message stays `isRetryable` on-chain for anyone.
+pub const DEFAULT_FAILED_RETRY_MAX_ATTEMPTS: u32 = 5;
+/// Default wait before the first `retryFailedMessage`; each further attempt doubles it.
+pub const DEFAULT_FAILED_RETRY_INITIAL_BACKOFF_SECS: u64 = 60;
+/// Default ceiling on the doubling wait between `retryFailedMessage` attempts.
+pub const DEFAULT_FAILED_RETRY_MAX_BACKOFF_SECS: u64 = 4 * 3600;
 
 // ---------------------------------------------------------------------------
 // Validated runtime config
@@ -147,6 +157,61 @@ pub struct ChainRoute {
     /// signer. `requestTopUp` is permissionless; calling it is relayer-service policy and the
     /// default is off. Requires `relayer_contract_address` and an `ack` or `claim` signer key.
     pub auto_request_top_up: bool,
+    /// Bounded `retryFailedMessage` schedule for messages whose destination call failed. Resolved
+    /// from the global `delivery` section plus this route's optional overrides.
+    pub failed_retry: FailedRetryPolicy,
+}
+
+/// How the relayer retries a message whose destination call failed (`DestinationFailed`):
+/// `retryFailedMessage` after `initial_backoff`, doubling up to `max_backoff`, at most
+/// `max_attempts` times. Does not apply to `retryPendingMessage` (queued/deferred dispatch) or to
+/// transport-level delivery retries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailedRetryPolicy {
+    /// `retryFailedMessage` transactions to spend before giving up. 0 gives up on the first
+    /// `DestinationFailed` without ever retrying.
+    pub max_attempts: u32,
+    pub initial_backoff_secs: u64,
+    pub max_backoff_secs: u64,
+}
+
+impl Default for FailedRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: DEFAULT_FAILED_RETRY_MAX_ATTEMPTS,
+            initial_backoff_secs: DEFAULT_FAILED_RETRY_INITIAL_BACKOFF_SECS,
+            max_backoff_secs: DEFAULT_FAILED_RETRY_MAX_BACKOFF_SECS,
+        }
+    }
+}
+
+impl FailedRetryPolicy {
+    /// A zero backoff would retry a reverting destination on every pool tick; an initial wait above
+    /// the ceiling is a typo rather than a schedule.
+    pub fn validate(&self, origin: &str) -> Result<()> {
+        if self.initial_backoff_secs == 0 {
+            bail!("{origin}: failed_retry_initial_backoff_secs must be > 0");
+        }
+        if self.initial_backoff_secs > self.max_backoff_secs {
+            bail!(
+                "{origin}: failed_retry_initial_backoff_secs ({}) must not exceed \
+                 failed_retry_max_backoff_secs ({})",
+                self.initial_backoff_secs,
+                self.max_backoff_secs
+            );
+        }
+        Ok(())
+    }
+
+    /// Delay before the next `retryFailedMessage`, given how many have already been spent.
+    pub fn backoff(&self, attempts: u32) -> std::time::Duration {
+        let factor = 1u64.checked_shl(attempts).unwrap_or(u64::MAX);
+        std::time::Duration::from_secs(
+            self.initial_backoff_secs
+                .saturating_mul(factor)
+                .min(self.max_backoff_secs),
+        )
+    }
 }
 
 impl ChainRoute {
@@ -163,6 +228,7 @@ impl ChainRoute {
     pub fn validate(&self) -> Result<()> {
         let origin = format!("chain_key {}", self.chain_key);
         validate_max_gas_limit(self.max_gas_limit, &origin)?;
+        self.failed_retry.validate(&origin)?;
         if self.auto_request_top_up {
             if self.relayer_contract_address.is_none() {
                 bail!(
@@ -309,6 +375,8 @@ pub struct DeliveryConfig {
     pub simulate_before_send: bool,
     pub max_retries: u32,
     pub gas_multiplier: f64,
+    /// Global `retryFailedMessage` schedule; routes may override each field.
+    pub failed_retry: FailedRetryPolicy,
 }
 
 impl Config {
@@ -378,6 +446,7 @@ impl Default for DeliveryConfig {
             simulate_before_send: DEFAULT_SIMULATE_BEFORE_SEND,
             max_retries: DEFAULT_DELIVERY_MAX_RETRIES,
             gas_multiplier: DEFAULT_GAS_MULTIPLIER,
+            failed_retry: FailedRetryPolicy::default(),
         }
     }
 }
@@ -454,6 +523,15 @@ pub struct DeliveryConfigFile {
     pub max_retries: u32,
     #[serde(default = "default_gas_multiplier")]
     pub gas_multiplier: f64,
+    /// See [`FailedRetryPolicy::max_attempts`].
+    #[serde(default = "default_failed_retry_max_attempts")]
+    pub failed_retry_max_attempts: u32,
+    /// See [`FailedRetryPolicy::initial_backoff_secs`].
+    #[serde(default = "default_failed_retry_initial_backoff_secs")]
+    pub failed_retry_initial_backoff_secs: u64,
+    /// See [`FailedRetryPolicy::max_backoff_secs`].
+    #[serde(default = "default_failed_retry_max_backoff_secs")]
+    pub failed_retry_max_backoff_secs: u64,
 }
 
 impl Default for DeliveryConfigFile {
@@ -462,6 +540,19 @@ impl Default for DeliveryConfigFile {
             simulate_before_send: DEFAULT_SIMULATE_BEFORE_SEND,
             max_retries: DEFAULT_DELIVERY_MAX_RETRIES,
             gas_multiplier: DEFAULT_GAS_MULTIPLIER,
+            failed_retry_max_attempts: DEFAULT_FAILED_RETRY_MAX_ATTEMPTS,
+            failed_retry_initial_backoff_secs: DEFAULT_FAILED_RETRY_INITIAL_BACKOFF_SECS,
+            failed_retry_max_backoff_secs: DEFAULT_FAILED_RETRY_MAX_BACKOFF_SECS,
+        }
+    }
+}
+
+impl DeliveryConfigFile {
+    fn failed_retry(&self) -> FailedRetryPolicy {
+        FailedRetryPolicy {
+            max_attempts: self.failed_retry_max_attempts,
+            initial_backoff_secs: self.failed_retry_initial_backoff_secs,
+            max_backoff_secs: self.failed_retry_max_backoff_secs,
         }
     }
 }
@@ -503,6 +594,13 @@ pub struct ChainRouteFile {
     /// See [`ChainRoute::auto_request_top_up`].
     #[serde(default)]
     pub auto_request_top_up: bool,
+    /// Per-route overrides of the `delivery.failed_retry_*` schedule (see [`FailedRetryPolicy`]).
+    #[serde(default)]
+    pub failed_retry_max_attempts: Option<u32>,
+    #[serde(default)]
+    pub failed_retry_initial_backoff_secs: Option<u64>,
+    #[serde(default)]
+    pub failed_retry_max_backoff_secs: Option<u64>,
 }
 
 /// On-disk spelling of a wei amount: bare YAML integer or a string (decimal / `0x`-hex).
@@ -587,6 +685,15 @@ fn default_ack_not_ready_poll_window_secs() -> u64 {
 fn default_max_gas_limit() -> u64 {
     DEFAULT_MAX_GAS_LIMIT
 }
+fn default_failed_retry_max_attempts() -> u32 {
+    DEFAULT_FAILED_RETRY_MAX_ATTEMPTS
+}
+fn default_failed_retry_initial_backoff_secs() -> u64 {
+    DEFAULT_FAILED_RETRY_INITIAL_BACKOFF_SECS
+}
+fn default_failed_retry_max_backoff_secs() -> u64 {
+    DEFAULT_FAILED_RETRY_MAX_BACKOFF_SECS
+}
 
 impl ConfigFile {
     fn into_config(
@@ -598,13 +705,15 @@ impl ConfigFile {
         if self.routes.is_empty() {
             bail!("config must include at least one entry in `routes`");
         }
+        let failed_retry = self.delivery.failed_retry();
+        failed_retry.validate("delivery")?;
         let mut seen: HashSet<u64> = HashSet::new();
         let mut routes = Vec::with_capacity(self.routes.len());
         for r in self.routes {
             if !seen.insert(r.chain_key) {
                 bail!("duplicate chain_key {} in config", r.chain_key);
             }
-            routes.push(r.into_route()?);
+            routes.push(r.into_route(failed_retry)?);
         }
 
         Ok(Config {
@@ -628,6 +737,7 @@ impl ConfigFile {
                 simulate_before_send: self.delivery.simulate_before_send,
                 max_retries: self.delivery.max_retries,
                 gas_multiplier: self.delivery.gas_multiplier,
+                failed_retry,
             },
             routes,
             checkpoint_path,
@@ -637,7 +747,7 @@ impl ConfigFile {
 }
 
 impl ChainRouteFile {
-    fn into_route(self) -> Result<ChainRoute> {
+    fn into_route(self, failed_retry: FailedRetryPolicy) -> Result<ChainRoute> {
         let inbox_address = parse_address(&self.inbox_address)
             .with_context(|| format!("invalid inbox_address for chain_key {}", self.chain_key))?;
         let outbox_address = self
@@ -775,6 +885,17 @@ impl ChainRouteFile {
             max_native_coin_value_wei,
             max_gas_limit: self.max_gas_limit,
             auto_request_top_up: self.auto_request_top_up,
+            failed_retry: FailedRetryPolicy {
+                max_attempts: self
+                    .failed_retry_max_attempts
+                    .unwrap_or(failed_retry.max_attempts),
+                initial_backoff_secs: self
+                    .failed_retry_initial_backoff_secs
+                    .unwrap_or(failed_retry.initial_backoff_secs),
+                max_backoff_secs: self
+                    .failed_retry_max_backoff_secs
+                    .unwrap_or(failed_retry.max_backoff_secs),
+            },
         };
         route.validate()?;
         Ok(route)
@@ -869,6 +990,66 @@ routes:
         assert_eq!(cfg.routes[0].max_gas_limit, DEFAULT_MAX_GAS_LIMIT);
         assert_eq!(cfg.routes[0].max_gas_limit, 5_000_000);
         assert!(!cfg.routes[0].auto_request_top_up);
+        // Existing configs gain the bounded retryFailedMessage schedule without edits.
+        assert_eq!(cfg.delivery.failed_retry, FailedRetryPolicy::default());
+        assert_eq!(cfg.routes[0].failed_retry, FailedRetryPolicy::default());
+        assert_eq!(cfg.routes[0].failed_retry.max_attempts, 5);
+    }
+
+    #[test]
+    fn failed_retry_policy_is_global_with_per_route_overrides() {
+        let yaml = with_route_fields("    failed_retry_max_attempts: 2\n").replace(
+            "  gas_multiplier: 1.5\n",
+            "  gas_multiplier: 1.5\n  failed_retry_max_attempts: 7\n  \
+             failed_retry_initial_backoff_secs: 30\n  failed_retry_max_backoff_secs: 600\n",
+        );
+        let cfg = serde_yaml::from_str::<ConfigFile>(&yaml)
+            .unwrap()
+            .into_config("ws://cc3".into(), "http://cc3-eth".into(), None)
+            .unwrap();
+        let global = FailedRetryPolicy {
+            max_attempts: 7,
+            initial_backoff_secs: 30,
+            max_backoff_secs: 600,
+        };
+        assert_eq!(cfg.delivery.failed_retry, global);
+        // Only the overridden field changes; the rest is inherited from `delivery`.
+        assert_eq!(
+            cfg.routes[0].failed_retry,
+            FailedRetryPolicy {
+                max_attempts: 2,
+                ..global
+            }
+        );
+
+        for (bad, needle) in [
+            (
+                "    failed_retry_initial_backoff_secs: 0\n",
+                "initial_backoff_secs must be > 0",
+            ),
+            (
+                "    failed_retry_initial_backoff_secs: 7200\n    failed_retry_max_backoff_secs: 60\n",
+                "must not exceed",
+            ),
+        ] {
+            let err = serde_yaml::from_str::<ConfigFile>(&with_route_fields(bad))
+                .unwrap()
+                .into_config("ws://cc3".into(), "http://cc3-eth".into(), None)
+                .unwrap_err();
+            assert!(err.to_string().contains(needle), "{err}");
+        }
+    }
+
+    #[test]
+    fn failed_retry_backoff_doubles_to_the_cap_without_overflow() {
+        let policy = FailedRetryPolicy::default();
+        let secs: Vec<u64> = (0..10).map(|n| policy.backoff(n).as_secs()).collect();
+        assert_eq!(
+            secs,
+            [60, 120, 240, 480, 960, 1920, 3840, 7680, 14_400, 14_400]
+        );
+        assert_eq!(policy.backoff(64).as_secs(), 14_400);
+        assert_eq!(policy.backoff(u32::MAX).as_secs(), 14_400);
     }
 
     fn with_route_fields(extra: &str) -> String {

@@ -25,6 +25,9 @@
 //!  5. Keep queued/failed execution in the durable pool. Its serial worker reconciles the Inbox
 //!     and runs one permissionless retry per scheduled job, honoring `RetryDeferred(retryAfter)`.
 //!     Restart probes reconstruct execution state without requiring another committee quorum.
+//!     `retryFailedMessage` (failed destination call) is bounded by the route's
+//!     [`FailedRetryPolicy`](crate::config::FailedRetryPolicy): exponential backoff, then the work
+//!     is dropped and the message left retryable on-chain — see [`failed_retry`].
 //!  6. On RPC-level failure, retry up to `delivery.max_retries` with backoff.
 //!
 //! The worker processes one job at a time per route — serial nonce management is the simplest
@@ -55,6 +58,9 @@ use crate::prom::{DeliveryStatus, Metrics};
 use crate::revert::{is_revert, revert_data, revert_selector};
 
 pub mod encode;
+pub mod failed_retry;
+
+use failed_retry::{FailedRetries, Gate};
 
 /// Initial retry backoff. Subsequent attempts double the wait, capped by [`MAX_BACKOFF`].
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -201,10 +207,12 @@ pub async fn run(
     health: Arc<crate::health::Health>,
     broadcast_locks: Arc<crate::broadcast::BroadcastLocks>,
     outcomes: Arc<OutcomeStore>,
+    work: Option<Arc<crate::work::WorkStore>>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let chain_key = route.chain_key;
     let health_key = format!("delivery:{chain_key}");
+    let failed_retries = FailedRetries::new(chain_key, work);
 
     // Register with the health watchdog BEFORE any fallible or blocking setup, because
     // `Health::status` only inspects components that have registered: a worker that never called
@@ -380,6 +388,7 @@ pub async fn run(
                     metrics.as_ref(),
                     top_up.as_mut(),
                     &outcomes,
+                    &failed_retries,
                     ) => result,
                 };
                 let outcome = match result {
@@ -1071,6 +1080,8 @@ async fn settle_duplicate_revert<P: Provider + Clone + 'static>(
     route: &ChainRoute,
     message_id: B256,
     outcomes: &Arc<OutcomeStore>,
+    failed_retries: &FailedRetries,
+    metrics: &dyn crate::prom::MetricsTrait,
 ) -> DeliveryResultKind {
     let result = reconcile_execution(
         provider,
@@ -1079,6 +1090,8 @@ async fn settle_duplicate_revert<P: Provider + Clone + 'static>(
         route,
         message_id,
         outcomes,
+        failed_retries,
+        metrics,
     )
     .await;
     // A duplicate with no observable execution state is ambiguous, never proof of delivery.
@@ -1143,6 +1156,7 @@ async fn handle_job<P: Provider + Clone + 'static>(
     metrics: &dyn crate::prom::MetricsTrait,
     top_up: Option<&mut TopUpRequester>,
     outcomes: &Arc<OutcomeStore>,
+    failed_retries: &FailedRetries,
 ) -> Result<DeliveryResultKind> {
     let inbox = IInbox::new(route.inbox_address, provider);
     if job.reconcile_only {
@@ -1153,6 +1167,8 @@ async fn handle_job<P: Provider + Clone + 'static>(
             route,
             job.message_id,
             outcomes,
+            failed_retries,
+            metrics,
         )
         .await);
     }
@@ -1253,6 +1269,8 @@ async fn handle_job<P: Provider + Clone + 'static>(
                         route,
                         job.message_id,
                         outcomes,
+                        failed_retries,
+                        metrics,
                     )
                     .await);
                 }
@@ -1361,6 +1379,8 @@ async fn handle_job<P: Provider + Clone + 'static>(
                         route,
                         job.message_id,
                         outcomes,
+                        failed_retries,
+                        metrics,
                     )
                     .await);
                 }
@@ -1725,7 +1745,27 @@ async fn handle_job<P: Provider + Clone + 'static>(
                          retryFailedMessage scheduled"
                     )),
             );
-            Ok(DeliveryResultKind::AwaitingExecution { retry_after: None })
+            let state = failed_retries
+                .start(
+                    job.message_id,
+                    &route.failed_retry,
+                    now_unix().unwrap_or_default(),
+                )
+                .await;
+            if state.attempts >= route.failed_retry.max_attempts {
+                return Ok(give_up_failed_retries(
+                    route,
+                    job.message_id,
+                    state,
+                    failed_retries,
+                    outcomes,
+                    metrics,
+                )
+                .await);
+            }
+            Ok(DeliveryResultKind::AwaitingExecution {
+                retry_after: Some(state.next_attempt_at),
+            })
         }
         SendOutcome::AlreadyValidated => {
             metrics.inc_deliver_tx(route.chain_key, DeliveryStatus::AlreadyValidated);
@@ -1736,6 +1776,8 @@ async fn handle_job<P: Provider + Clone + 'static>(
                 route,
                 job.message_id,
                 outcomes,
+                failed_retries,
+                metrics,
             )
             .await)
         }
@@ -1892,6 +1934,9 @@ enum ExecutionState {
 
 /// One supervised execution attempt. The pool owns durable retention and scheduling. All RPCs
 /// are bounded; accepted work survives outages, gas-cap refusals and destination reorganizations.
+/// `retryFailedMessage` additionally goes through `failed_retries`: it is only sent once its
+/// backoff has elapsed, and the work is given up (`Terminal`) once the route's budget is spent.
+#[allow(clippy::too_many_arguments)]
 async fn reconcile_execution<P: Provider>(
     provider: &P,
     signer_address: Address,
@@ -1899,6 +1944,8 @@ async fn reconcile_execution<P: Provider>(
     route: &ChainRoute,
     message_id: B256,
     outcomes: &OutcomeStore,
+    failed_retries: &FailedRetries,
+    metrics: &dyn crate::prom::MetricsTrait,
 ) -> DeliveryResultKind {
     let chain_key = route.chain_key;
     let inbox_address = route.inbox_address;
@@ -1938,6 +1985,7 @@ async fn reconcile_execution<P: Provider>(
     .await;
     let state = match state {
         Ok(Ok(ExecutionState::Executed)) => {
+            failed_retries.forget(message_id).await;
             outcomes.record(
                 message_id,
                 DeliveryOutcome::new(OutcomeKind::Delivered, chain_key).with_reason(
@@ -1959,6 +2007,36 @@ async fn reconcile_execution<P: Provider>(
         }
     };
     let pending = state == ExecutionState::Pending;
+    // Bound only the failed-destination path: a pending (queued/deferred) message is waiting on the
+    // dispatcher, not reverting, and keeps the existing `RetryDeferred`-driven schedule.
+    if !pending {
+        match failed_retries
+            .gate(
+                message_id,
+                &route.failed_retry,
+                now_unix().unwrap_or_default(),
+            )
+            .await
+        {
+            Gate::Proceed => {}
+            Gate::Wait(at) => {
+                return DeliveryResultKind::AwaitingExecution {
+                    retry_after: Some(at),
+                }
+            }
+            Gate::GiveUp(state) => {
+                return give_up_failed_retries(
+                    route,
+                    message_id,
+                    state,
+                    failed_retries,
+                    outcomes,
+                    metrics,
+                )
+                .await
+            }
+        }
+    }
     let estimate = tokio::time::timeout(FUNDED_GAS_READ_TIMEOUT, async {
         if pending {
             inbox
@@ -2050,32 +2128,87 @@ async fn reconcile_execution<P: Provider>(
         }
         Err(err) => {
             warn!(chain_key, %message_id, %err, "execution retry broadcast timed out; retaining work");
+            // The tx may still have reached the node; count it so ambiguity cannot be unbounded.
+            if !pending {
+                let spent = failed_retries
+                    .record_attempt(
+                        message_id,
+                        &route.failed_retry,
+                        now_unix().unwrap_or_default(),
+                    )
+                    .await;
+                return after_failed_retry(
+                    route,
+                    message_id,
+                    spent,
+                    None,
+                    failed_retries,
+                    outcomes,
+                    metrics,
+                )
+                .await;
+            }
             return retry;
         }
     };
-    match tokio::time::timeout(RECEIPT_TIMEOUT, crate::receipt::await_receipt(&builder)).await {
+    // Count the attempt as soon as the node accepted it, before the receipt wait: a crash or a
+    // receipt timeout must not forget gas that is (about to be) spent.
+    let spent = if pending {
+        None
+    } else {
+        Some(
+            failed_retries
+                .record_attempt(
+                    message_id,
+                    &route.failed_retry,
+                    now_unix().unwrap_or_default(),
+                )
+                .await,
+        )
+    };
+    // Whether the destination is still failing after this attempt (as opposed to executed or
+    // handed to the dispatcher's queue), i.e. whether the attempt counts against the budget.
+    let mut failed_again = true;
+    let result = match tokio::time::timeout(
+        RECEIPT_TIMEOUT,
+        crate::receipt::await_receipt(&builder),
+    )
+    .await
+    {
         Ok(Ok(receipt)) if receipt.status() => {
             let (kind, result) =
                 match classify_success_logs(inbox_address, message_id, receipt.inner.logs()) {
                     ReceiptClass::Delivered if route.block_confirmation_depth == 0 => {
-                        (OutcomeKind::Delivered, DeliveryResultKind::Delivered)
+                        (Some(OutcomeKind::Delivered), DeliveryResultKind::Delivered)
                     }
                     ReceiptClass::Delivered | ReceiptClass::Pending => {
-                        (OutcomeKind::Pending, retry)
+                        (Some(OutcomeKind::Pending), retry)
                     }
                     ReceiptClass::DestinationFailed { .. } => {
-                        (OutcomeKind::DestinationFailed, retry)
+                        (Some(OutcomeKind::DestinationFailed), retry)
                     }
-                    ReceiptClass::Unknown => return retry,
+                    ReceiptClass::Unknown => (None, retry),
                 };
-            outcomes.record(
-                message_id,
-                DeliveryOutcome::new(kind, chain_key)
-                    .with_tx(receipt.transaction_hash)
-                    .with_reason(
-                        "execution retry observed; completion follows configured confirmations",
+            if let Some(kind) = kind {
+                failed_again = kind == OutcomeKind::DestinationFailed;
+                let reason = match spent {
+                    Some(spent) if failed_again => format!(
+                        "retryFailedMessage attempt {}/{} hit DestinationFailed again",
+                        spent.attempts, route.failed_retry.max_attempts
                     ),
-            );
+                    _ => "execution retry observed; completion follows configured confirmations"
+                        .into(),
+                };
+                outcomes.record(
+                    message_id,
+                    DeliveryOutcome::new(kind, chain_key)
+                        .with_tx(receipt.transaction_hash)
+                        .with_reason(reason),
+                );
+            }
+            if result == DeliveryResultKind::Delivered {
+                failed_retries.forget(message_id).await;
+            }
             result
         }
         Ok(Ok(receipt)) => {
@@ -2111,7 +2244,92 @@ async fn reconcile_execution<P: Provider>(
             DeliveryResultKind::AwaitingExecution { retry_after }
         }
         _ => retry,
+    };
+    match spent {
+        Some(spent) if failed_again => {
+            let hint = match result {
+                DeliveryResultKind::AwaitingExecution { retry_after } => retry_after,
+                _ => None,
+            };
+            after_failed_retry(
+                route,
+                message_id,
+                spent,
+                hint,
+                failed_retries,
+                outcomes,
+                metrics,
+            )
+            .await
+        }
+        _ => result,
     }
+}
+
+/// A `retryFailedMessage` was spent and the destination is (or may be) still failing: give up if
+/// that was the last allowed attempt, otherwise wait for the later of our backoff and any
+/// `RetryDeferred` hint.
+async fn after_failed_retry(
+    route: &ChainRoute,
+    message_id: B256,
+    spent: crate::work::FailedRetryState,
+    retry_deferred: Option<u64>,
+    failed_retries: &FailedRetries,
+    outcomes: &OutcomeStore,
+    metrics: &dyn crate::prom::MetricsTrait,
+) -> DeliveryResultKind {
+    if spent.attempts >= route.failed_retry.max_attempts {
+        return give_up_failed_retries(route, message_id, spent, failed_retries, outcomes, metrics)
+            .await;
+    }
+    DeliveryResultKind::AwaitingExecution {
+        retry_after: Some(
+            retry_deferred.map_or(spent.next_attempt_at, |at| at.max(spent.next_attempt_at)),
+        ),
+    }
+}
+
+/// Stop paying for a destination that keeps reverting. The work leaves the durable store (the pool
+/// completes `Terminal` results) and a tombstone keeps a rescan from reopening the budget. Nothing
+/// changes on-chain: the message stays `isRetryable` for anyone to `retryFailedMessage` later.
+async fn give_up_failed_retries(
+    route: &ChainRoute,
+    message_id: B256,
+    state: crate::work::FailedRetryState,
+    failed_retries: &FailedRetries,
+    outcomes: &OutcomeStore,
+    metrics: &dyn crate::prom::MetricsTrait,
+) -> DeliveryResultKind {
+    let chain_key = route.chain_key;
+    if state.gave_up_at.is_some() {
+        // Abandoned before a restart and re-recorded by the startup rescan: already counted and
+        // logged, so only restore the outcome and drop the work again.
+        debug!(chain_key, %message_id, attempts = state.attempts,
+            "retryFailedMessage budget already exhausted; dropping re-discovered work");
+    } else {
+        failed_retries
+            .give_up(message_id, state, now_unix().unwrap_or_default())
+            .await;
+        metrics.inc_destination_failed_retries_exhausted(chain_key);
+        warn!(
+            chain_key,
+            %message_id,
+            attempts = state.attempts,
+            max_attempts = route.failed_retry.max_attempts,
+            "🛑 destination kept reverting; gave up on retryFailedMessage — message remains \
+             retryable on-chain"
+        );
+    }
+    let mut outcome =
+        DeliveryOutcome::new(OutcomeKind::DestinationFailed, chain_key).with_reason(format!(
+            "destination kept reverting; gave up after {} retryFailedMessage attempts; message \
+             remains retryable on-chain",
+            state.attempts
+        ));
+    // Keep pointing at the last destination tx we know of.
+    outcome.tx_hash = outcomes.get(&message_id).and_then(|o| o.tx_hash);
+    outcomes.record(message_id, outcome);
+    DeliveryResultKind::Terminal
 }
 
 #[cfg(test)]
@@ -2139,6 +2357,7 @@ mod tests {
             max_native_coin_value_wei: U256::ZERO,
             max_gas_limit: 5_000_000,
             auto_request_top_up: false,
+            failed_retry: Default::default(),
         };
         let job = DeliveryJob {
             chain_key: 2,
@@ -2207,6 +2426,7 @@ mod tests {
                     NoopMetrics::new().as_ref(),
                     None,
                     &outcomes,
+                    &FailedRetries::in_memory(2),
                 )
                 .await
                 .unwrap();
@@ -2231,7 +2451,8 @@ mod tests {
                     MessageFunding::unknown(),
                     NoopMetrics::new().as_ref(),
                     None,
-                    &outcomes
+                    &outcomes,
+                    &FailedRetries::in_memory(2),
                 )
                 .await
                 .unwrap(),
@@ -2271,7 +2492,8 @@ mod tests {
                 MessageFunding::unknown(),
                 NoopMetrics::new().as_ref(),
                 None,
-                &outcomes
+                &outcomes,
+                &FailedRetries::in_memory(2),
             )
             .await
             .unwrap(),
@@ -2279,6 +2501,231 @@ mod tests {
         );
         assert!(outcomes.get(&job.message_id).is_none());
         assert!(rpc.read_q().is_empty());
+    }
+
+    fn destination_failed_log(route: &ChainRoute, job: &DeliveryJob) -> Log {
+        inbox_event_log(
+            route.inbox_address,
+            IInbox::DestinationFailed {
+                messageId: job.message_id,
+                emitterAddress: job.emitter,
+                destination: Address::repeat_byte(5),
+                dispatcher: Address::repeat_byte(6),
+                relayer: Address::repeat_byte(4),
+                messagePayload: Bytes::new(),
+            }
+            .encode_log_data(),
+        )
+    }
+
+    /// asc-devnet, Oct 2026: probes aimed at an always-reverting destination were retried every
+    /// ~10 min forever. retryFailedMessage is now spent at most `max_attempts` times, then the work
+    /// is dropped (Terminal) with an outcome and a metric, and a later rescan does not reopen it.
+    #[tokio::test]
+    async fn failed_destination_retries_give_up_after_the_budget() {
+        let rpc = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_mocked_client(rpc.clone());
+        let (mut route, job) = execution_job_fixture();
+        // No backoff, so consecutive calls are due; the schedule is covered separately.
+        route.failed_retry = crate::config::FailedRetryPolicy {
+            max_attempts: 2,
+            initial_backoff_secs: 0,
+            max_backoff_secs: 0,
+        };
+        let locks = crate::broadcast::BroadcastLocks::new();
+        let outcomes = OutcomeStore::new(8);
+        let retries = FailedRetries::in_memory(2);
+        let metrics = crate::prom::RelayerMetrics::new(&[2]);
+        let reconcile = || {
+            reconcile_execution(
+                &provider,
+                Address::repeat_byte(4),
+                &locks,
+                &route,
+                job.message_id,
+                &outcomes,
+                &retries,
+                &metrics,
+            )
+        };
+
+        mock_state(&rpc, false, true);
+        mock_retry_receipt(&rpc, vec![destination_failed_log(&route, &job)], true);
+        assert!(matches!(
+            reconcile().await,
+            DeliveryResultKind::AwaitingExecution {
+                retry_after: Some(_)
+            }
+        ));
+        let outcome = outcomes.get(&job.message_id).unwrap();
+        assert_eq!(outcome.kind, OutcomeKind::DestinationFailed);
+        assert!(outcome.reason.unwrap().contains("attempt 1/2"));
+        assert!(rpc.read_q().is_empty());
+
+        // The second failure is the last allowed one: give up without waiting another round.
+        mock_state(&rpc, false, true);
+        mock_retry_receipt(&rpc, vec![destination_failed_log(&route, &job)], true);
+        assert_eq!(reconcile().await, DeliveryResultKind::Terminal);
+        let outcome = outcomes.get(&job.message_id).unwrap();
+        assert_eq!(outcome.kind, OutcomeKind::DestinationFailed);
+        assert_eq!(outcome.tx_hash, Some(B256::repeat_byte(0x44)));
+        let reason = outcome.reason.unwrap();
+        assert!(
+            reason.contains("gave up after 2 retryFailedMessage attempts")
+                && reason.contains("remains retryable on-chain"),
+            "{reason}"
+        );
+        assert!(rpc.read_q().is_empty());
+        let exhausted = "relayer_destination_failed_retries_exhausted_total{chain_key=\"2\"} 1";
+        assert!(metrics.encode().contains(exhausted));
+
+        // Re-discovered (e.g. by the startup rescan): dropped again with no estimate, preflight
+        // or broadcast, and not double-counted.
+        mock_state(&rpc, false, true);
+        assert_eq!(reconcile().await, DeliveryResultKind::Terminal);
+        assert!(rpc.read_q().is_empty());
+        assert!(metrics.encode().contains(exhausted));
+
+        // Pending (queued/deferred) execution of the same message is not subject to the budget.
+        for _ in 0..3 {
+            mock_state(&rpc, true, false);
+            mock_retry_receipt(&rpc, vec![], true);
+            assert_eq!(
+                reconcile().await,
+                DeliveryResultKind::AwaitingExecution { retry_after: None }
+            );
+            assert!(rpc.read_q().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_destination_retry_waits_for_its_backoff() {
+        let rpc = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_mocked_client(rpc.clone());
+        let (route, job) = execution_job_fixture();
+        let locks = crate::broadcast::BroadcastLocks::new();
+        let outcomes = OutcomeStore::new(8);
+        let retries = FailedRetries::in_memory(2);
+        let metrics = NoopMetrics::new();
+        let reconcile = || {
+            reconcile_execution(
+                &provider,
+                Address::repeat_byte(4),
+                &locks,
+                &route,
+                job.message_id,
+                &outcomes,
+                &retries,
+                metrics.as_ref(),
+            )
+        };
+        let before = now_unix().unwrap();
+        mock_state(&rpc, false, true);
+        mock_retry_receipt(&rpc, vec![destination_failed_log(&route, &job)], true);
+        let DeliveryResultKind::AwaitingExecution {
+            retry_after: Some(next),
+        } = reconcile().await
+        else {
+            panic!("a failed retry must schedule the next attempt");
+        };
+        // One attempt spent: the default schedule waits 2 × 60 s before the next.
+        assert!((before + 120..=now_unix().unwrap() + 120).contains(&next));
+        assert!(rpc.read_q().is_empty());
+
+        // Redispatched early (e.g. a restart probe): only the state read, no estimate or send.
+        mock_state(&rpc, false, true);
+        assert_eq!(
+            reconcile().await,
+            DeliveryResultKind::AwaitingExecution {
+                retry_after: Some(next)
+            }
+        );
+        assert!(rpc.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn initial_destination_failed_schedules_the_first_retry() {
+        for max_attempts in [5, 0] {
+            let rpc = Asserter::new();
+            let provider = ProviderBuilder::new()
+                .disable_recommended_fillers()
+                .connect_mocked_client(rpc.clone());
+            let (mut route, mut job) = execution_job_fixture();
+            route.failed_retry.max_attempts = max_attempts;
+            job.reconcile_only = false;
+            rpc.push_success(&Bytes::from(true.abi_encode()));
+            mock_execution_receipt(&rpc, vec![destination_failed_log(&route, &job)], true);
+            let outcomes = Arc::new(OutcomeStore::new(8));
+            let retries = FailedRetries::in_memory(2);
+            let before = now_unix().unwrap();
+            let result = handle_job(
+                &route,
+                &DeliveryConfig {
+                    simulate_before_send: false,
+                    ..Default::default()
+                },
+                &provider,
+                Address::repeat_byte(4),
+                &crate::broadcast::BroadcastLocks::new(),
+                &job,
+                MessageFunding::unknown(),
+                NoopMetrics::new().as_ref(),
+                None,
+                &outcomes,
+                &retries,
+            )
+            .await
+            .unwrap();
+            if max_attempts == 0 {
+                assert_eq!(result, DeliveryResultKind::Terminal);
+                continue;
+            }
+            let DeliveryResultKind::AwaitingExecution {
+                retry_after: Some(next),
+            } = result
+            else {
+                panic!("first DestinationFailed must schedule retryFailedMessage: {result:?}");
+            };
+            assert!((before + 60..=now_unix().unwrap() + 60).contains(&next));
+            assert_eq!(retries.get(job.message_id).await.unwrap().attempts, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_failed_retry_budget_never_broadcasts() {
+        let rpc = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_mocked_client(rpc.clone());
+        let (mut route, job) = execution_job_fixture();
+        route.failed_retry.max_attempts = 0;
+        let outcomes = OutcomeStore::new(8);
+        mock_state(&rpc, false, true);
+        assert_eq!(
+            reconcile_execution(
+                &provider,
+                Address::repeat_byte(4),
+                &crate::broadcast::BroadcastLocks::new(),
+                &route,
+                job.message_id,
+                &outcomes,
+                &FailedRetries::in_memory(2),
+                NoopMetrics::new().as_ref(),
+            )
+            .await,
+            DeliveryResultKind::Terminal
+        );
+        assert!(rpc.read_q().is_empty());
+        assert!(outcomes
+            .get(&job.message_id)
+            .unwrap()
+            .reason
+            .unwrap()
+            .contains("gave up after 0 retryFailedMessage attempts"));
     }
 
     #[tokio::test]
@@ -2318,7 +2765,8 @@ mod tests {
                 MessageFunding::unknown(),
                 NoopMetrics::new().as_ref(),
                 None,
-                &outcomes
+                &outcomes,
+                &FailedRetries::in_memory(2),
             )
             .await
             .unwrap(),
@@ -2356,7 +2804,8 @@ mod tests {
                 MessageFunding::unknown(),
                 NoopMetrics::new().as_ref(),
                 None,
-                &outcomes
+                &outcomes,
+                &FailedRetries::in_memory(2),
             )
             .await
             .unwrap(),
@@ -2382,7 +2831,9 @@ mod tests {
                 &locks,
                 &route,
                 job.message_id,
-                &outcomes
+                &outcomes,
+                &FailedRetries::in_memory(2),
+                NoopMetrics::new().as_ref(),
             )
             .await,
             DeliveryResultKind::AwaitingVotes
@@ -2395,7 +2846,9 @@ mod tests {
                 &locks,
                 &route,
                 job.message_id,
-                &outcomes
+                &outcomes,
+                &FailedRetries::in_memory(2),
+                NoopMetrics::new().as_ref(),
             )
             .await,
             DeliveryResultKind::Retryable
@@ -2414,7 +2867,9 @@ mod tests {
                 &locks,
                 &route,
                 job.message_id,
-                &outcomes
+                &outcomes,
+                &FailedRetries::in_memory(2),
+                NoopMetrics::new().as_ref(),
             )
             .await,
             DeliveryResultKind::AwaitingExecution {
@@ -2431,7 +2886,9 @@ mod tests {
                 &locks,
                 &route,
                 job.message_id,
-                &outcomes
+                &outcomes,
+                &FailedRetries::in_memory(2),
+                NoopMetrics::new().as_ref(),
             )
             .await,
             DeliveryResultKind::AwaitingExecution {
@@ -2461,7 +2918,9 @@ mod tests {
                 &locks,
                 &route,
                 job.message_id,
-                &outcomes
+                &outcomes,
+                &FailedRetries::in_memory(2),
+                NoopMetrics::new().as_ref(),
             )
             .await,
             DeliveryResultKind::AwaitingExecution { retry_after: None }
@@ -2480,7 +2939,9 @@ mod tests {
                 &locks,
                 &route,
                 job.message_id,
-                &outcomes
+                &outcomes,
+                &FailedRetries::in_memory(2),
+                NoopMetrics::new().as_ref(),
             )
             .await,
             DeliveryResultKind::AwaitingVotes
@@ -2496,7 +2957,9 @@ mod tests {
                 &locks,
                 &route,
                 job.message_id,
-                &outcomes
+                &outcomes,
+                &FailedRetries::in_memory(2),
+                NoopMetrics::new().as_ref(),
             )
             .await,
             DeliveryResultKind::AwaitingExecution { retry_after: None }
@@ -2512,7 +2975,9 @@ mod tests {
                 &locks,
                 &route,
                 job.message_id,
-                &outcomes
+                &outcomes,
+                &FailedRetries::in_memory(2),
+                NoopMetrics::new().as_ref(),
             )
             .await,
             DeliveryResultKind::Delivered
@@ -2564,7 +3029,8 @@ mod tests {
                     MessageFunding::unknown(),
                     NoopMetrics::new().as_ref(),
                     None,
-                    &outcomes
+                    &outcomes,
+                    &FailedRetries::in_memory(2),
                 )
                 .await
                 .unwrap(),
@@ -2598,7 +3064,9 @@ mod tests {
                     &locks,
                     &route,
                     job.message_id,
-                    &outcomes
+                    &outcomes,
+                    &FailedRetries::in_memory(2),
+                    NoopMetrics::new().as_ref(),
                 )
                 .await,
                 DeliveryResultKind::AwaitingExecution { retry_after: None }
@@ -2614,7 +3082,9 @@ mod tests {
                     &locks,
                     &route,
                     job.message_id,
-                    &outcomes
+                    &outcomes,
+                    &FailedRetries::in_memory(2),
+                    NoopMetrics::new().as_ref(),
                 )
                 .await,
                 DeliveryResultKind::AwaitingExecution { retry_after: None }
@@ -2653,6 +3123,7 @@ mod tests {
                 crate::health::Health::new(crate::health::PROGRESS_DEADLINE),
                 crate::broadcast::BroadcastLocks::new(),
                 Arc::new(OutcomeStore::new(8)),
+                None,
                 cancel.clone(),
             ));
             tokio::time::timeout(Duration::from_secs(5), request_rx)
@@ -2697,6 +3168,7 @@ mod tests {
             max_native_coin_value_wei: U256::ZERO,
             max_gas_limit: 5_000_000,
             auto_request_top_up: false,
+            failed_retry: Default::default(),
         };
         let job = DeliveryJob {
             chain_key: route.chain_key,
@@ -2764,6 +3236,7 @@ mod tests {
                 NoopMetrics::new().as_ref(),
                 None,
                 &outcomes,
+                &FailedRetries::in_memory(2),
             )
             .await
             .unwrap();
@@ -2816,7 +3289,8 @@ mod tests {
                     funding,
                     NoopMetrics::new().as_ref(),
                     None,
-                    &outcomes
+                    &outcomes,
+                    &FailedRetries::in_memory(2),
                 )
                 .await
                 .unwrap(),
@@ -2859,7 +3333,8 @@ mod tests {
                     funding,
                     NoopMetrics::new().as_ref(),
                     None,
-                    &outcomes
+                    &outcomes,
+                    &FailedRetries::in_memory(2),
                 )
                 .await
                 .unwrap(),
@@ -2963,6 +3438,7 @@ mod tests {
                 NoopMetrics::new().as_ref(),
                 None,
                 &outcomes,
+                &FailedRetries::in_memory(2),
             )
             .await
             .unwrap();
@@ -3007,6 +3483,7 @@ mod tests {
                     NoopMetrics::new().as_ref(),
                     None,
                     &outcomes,
+                    &FailedRetries::in_memory(2),
                 )
                 .await
                 .unwrap(),

@@ -45,6 +45,17 @@ delivery:
   # RPC-level retries inside the delivery worker (the pool adds its own bounded redispatch on top).
   max_retries: 5
   gas_multiplier: 1.2
+  # Bounded retryFailedMessage for messages whose destination call failed (DestinationFailed).
+  # A destination that reverts deterministically cannot be fixed by resending the same call, and
+  # each attempt pays for a full destination execution. The first retry waits
+  # failed_retry_initial_backoff_secs, each further one doubles up to failed_retry_max_backoff_secs;
+  # after failed_retry_max_attempts the relayer drops the work (outcome + WARN +
+  # relayer_destination_failed_retries_exhausted_total). The message stays retryable on-chain.
+  # 0 attempts = never retry. Routes may override any of the three. retryPendingMessage
+  # (queued/deferred dispatch) is not affected.
+  failed_retry_max_attempts: 5
+  failed_retry_initial_backoff_secs: 60
+  failed_retry_max_backoff_secs: 14400
 
 # Blocks to rewind the persisted scan cursors on startup. Pool votes and the pending-ack queue are
 # memory-only, so work in flight when the process died is re-discovered by re-scanning a recent

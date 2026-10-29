@@ -108,9 +108,17 @@ and repeated failures escalate in logs and metrics:
   `MessageAlreadyValidated` triggers confirmed Inbox-state reconciliation: it can mean executed,
   queued, or failed, so acceptance alone is not success.
 - **Execution outcomes** — `MessageQueued`/`MessageDeferred` select `retryPendingMessage`, and
-  `DestinationFailed` selects `retryFailedMessage`. These obligations stay in the durable work
-  store until confirmed execution; scheduled retries do not consume a fixed lifetime budget.
-  `RetryDeferred(retryAfter)` controls the next attempt. Permanent envelope/cap failures remain
+  `DestinationFailed` selects `retryFailedMessage`. Pending obligations stay in the durable work
+  store until confirmed execution, without a fixed lifetime budget. `retryFailedMessage` is
+  bounded, because a destination that reverts deterministically never succeeds and every attempt
+  pays for its execution: exponential backoff (`delivery.failed_retry_initial_backoff_secs`,
+  default 60 s, doubling to `failed_retry_max_backoff_secs`, default 4 h), at most
+  `failed_retry_max_attempts` (default 5) attempts, all overridable per route. Past the budget the
+  work is dropped with a `destination_failed` outcome, a WARN and
+  `relayer_destination_failed_retries_exhausted_total`; the message stays retryable on-chain for
+  anyone. The attempt count is persisted next to the durable work
+  (`<checkpoint>.messages/<chain_key>/failed/`), so restarts and rescans do not reset it.
+  `RetryDeferred(retryAfter)` can push the next attempt later. Permanent envelope/cap failures remain
   explicit refusal outcomes. Gas escalation stays within the route cap, and every broadcast
   preflights the final transaction gas limit. `relayer_deliver_tx{status="Unclassified"}` identifies
   mined reverts whose selector is not recognized; those remain retryable.
