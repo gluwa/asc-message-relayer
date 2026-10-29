@@ -2,6 +2,12 @@
 //! checkpoint; the pool loads only as many records as fit in its bounded vote cache. Records are
 //! immutable and keyed by route and message ID (which binds the source Outbox), so rotations do
 //! not change their identity. Keeping separate files avoids rewriting or loading the backlog.
+//!
+//! Each route directory also holds a `failed/` subdirectory with the `retryFailedMessage` budget
+//! of messages whose destination call failed ([`FailedRetryState`]). It is kept apart from the
+//! records so their format is unchanged (older directories simply have no `failed/`), and so the
+//! state outlives the record: after the relayer gives up, the entry is the tombstone that stops a
+//! startup rescan from granting the same message a fresh budget.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -11,6 +17,24 @@ use alloy::primitives::B256;
 use anyhow::{Context, Result};
 
 use crate::events::IndexedMessage;
+
+/// Subdirectory of a route's work directory holding [`FailedRetryState`] entries. Has no `.json`
+/// extension, so record scans skip it like any other non-record entry.
+const FAILED_RETRY_DIR: &str = "failed";
+
+/// Durable `retryFailedMessage` bookkeeping for one message (see `delivery::failed_retry`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct FailedRetryState {
+    /// `retryFailedMessage` transactions already broadcast.
+    pub attempts: u32,
+    /// Unix seconds before which the next attempt must not be sent.
+    pub next_attempt_at: u64,
+    /// Unix seconds when the relayer stopped retrying. A tombstone: the message is never retried
+    /// by this relayer again, even if a rescan re-records it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gave_up_at: Option<u64>,
+}
 
 #[derive(Debug)]
 pub struct WorkStore {
@@ -225,6 +249,68 @@ impl WorkStore {
         .await
         .context("joining completed-message removal")?
     }
+
+    fn failed_retry_path(&self, chain_key: u64, message_id: B256) -> PathBuf {
+        self.path
+            .join(chain_key.to_string())
+            .join(FAILED_RETRY_DIR)
+            .join(format!("{message_id}.json"))
+    }
+
+    /// The persisted `retryFailedMessage` state of a message, if any.
+    pub async fn failed_retry(
+        &self,
+        chain_key: u64,
+        message_id: B256,
+    ) -> Result<Option<FailedRetryState>> {
+        let path = self.failed_retry_path(chain_key, message_id);
+        tokio::task::spawn_blocking(move || match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .with_context(|| format!("decoding failed-retry state {}", path.display())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err).context("reading failed-retry state"),
+        })
+        .await
+        .context("joining failed-retry read")?
+    }
+
+    /// Durably replace a message's `retryFailedMessage` state. Called after a retry is broadcast
+    /// and before its receipt is awaited, so a crash cannot forget gas already spent.
+    pub async fn put_failed_retry(
+        &self,
+        chain_key: u64,
+        message_id: B256,
+        state: FailedRetryState,
+    ) -> Result<()> {
+        let path = self.failed_retry_path(chain_key, message_id);
+        tokio::task::spawn_blocking(move || {
+            let dir = path.parent().expect("failed-retry path has a parent");
+            create_dir_durable(dir)?;
+            let existed = path.try_exists().context("checking failed-retry state")?;
+            let bytes = serde_json::to_vec(&state).context("serializing failed-retry state")?;
+            crate::checkpoint::write_atomic(&path, &bytes)?;
+            if existed {
+                Ok(())
+            } else {
+                sync_directory(dir)
+            }
+        })
+        .await
+        .context("joining failed-retry write")?
+    }
+
+    /// Drop a message's `retryFailedMessage` state once its execution is confirmed.
+    pub async fn forget_failed_retry(&self, chain_key: u64, message_id: B256) -> Result<()> {
+        let path = self.failed_retry_path(chain_key, message_id);
+        tokio::task::spawn_blocking(move || match std::fs::remove_file(&path) {
+            Ok(()) => sync_directory(path.parent().expect("failed-retry path has a parent")),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err).context("removing failed-retry state"),
+        })
+        .await
+        .context("joining failed-retry removal")?
+    }
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
@@ -402,6 +488,68 @@ mod tests {
         assert!(work.pending(2, HashSet::new(), 10).await.is_err());
         std::fs::write(&path, serde_json::to_vec(&message(2, 2)).unwrap()).unwrap();
         assert!(work.pending(2, HashSet::new(), 10).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_retry_state_round_trips_without_disturbing_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = dir.path().join("cp");
+        let work = WorkStore::for_checkpoint(&checkpoint);
+        let id = B256::repeat_byte(1);
+        // A pre-existing work directory has no `failed/`: no state, not an error.
+        work.record(message(2, 1)).await.unwrap();
+        assert_eq!(work.failed_retry(2, id).await.unwrap(), None);
+
+        let state = FailedRetryState {
+            attempts: 3,
+            next_attempt_at: 1_900_000_000,
+            gave_up_at: None,
+        };
+        work.put_failed_retry(2, id, state).await.unwrap();
+        // Survives a restart, and the sidecar is invisible to the record scan and its count.
+        let work = WorkStore::for_checkpoint(&checkpoint);
+        assert_eq!(work.failed_retry(2, id).await.unwrap(), Some(state));
+        let restored = work.pending(2, HashSet::new(), 10).await.unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(work.readers.lock().unwrap()[&2].live_records, 1);
+
+        // The tombstone outlives completion of the record itself.
+        let tombstone = FailedRetryState {
+            gave_up_at: Some(1_900_000_100),
+            ..state
+        };
+        work.put_failed_retry(2, id, tombstone).await.unwrap();
+        work.complete(2, id).await.unwrap();
+        assert!(work
+            .pending(2, HashSet::new(), 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(work.failed_retry(2, id).await.unwrap(), Some(tombstone));
+
+        work.forget_failed_retry(2, id).await.unwrap();
+        work.forget_failed_retry(2, id).await.unwrap(); // idempotent
+        assert_eq!(work.failed_retry(2, id).await.unwrap(), None);
+    }
+
+    #[test]
+    fn failed_retry_state_decodes_older_and_newer_shapes() {
+        // Fields added later default; unknown fields from a newer relayer are ignored.
+        let old: FailedRetryState = serde_json::from_str(r#"{"attempts":2}"#).unwrap();
+        assert_eq!(
+            old,
+            FailedRetryState {
+                attempts: 2,
+                ..Default::default()
+            }
+        );
+        let newer: FailedRetryState =
+            serde_json::from_str(r#"{"attempts":1,"next_attempt_at":5,"future":true}"#).unwrap();
+        assert_eq!(newer.next_attempt_at, 5);
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            r#"{"attempts":2,"next_attempt_at":0}"#
+        );
     }
 
     #[tokio::test]

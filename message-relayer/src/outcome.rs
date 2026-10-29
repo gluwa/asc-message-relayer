@@ -35,11 +35,12 @@ pub enum OutcomeKind {
     /// Mined with `MessageReceived` + `DestinationFailed` (asc-contracts #54): the destination call
     /// failed, but the message is NOT consumed. Not re-deliverable via `deliverMessage` (Inbox
     /// marks it `isRetryable`, so a second `deliverMessage` for the same id reverts
-    /// `MessageAlreadyValidated`) — the delivery worker hands it to a bounded, detached
-    /// `retryFailedMessage` loop and reports `DeliveryResultKind::Delivered` from the pool's
-    /// perspective (votes are already consumed). This kind is recorded both when that loop is
-    /// first scheduled and, informationally, each time a `retryFailedMessage` attempt fails again.
-    /// The relay fee is claimable either way via `MessageReceived`.
+    /// `MessageAlreadyValidated`) — the pool keeps the work and the delivery worker sends
+    /// supervised `retryFailedMessage` attempts with backoff, bounded by the route's
+    /// `failed_retry_max_attempts`. This kind is recorded when the first failure is seen, each time
+    /// an attempt fails again, and finally when the relayer gives up (the reason then says so; the
+    /// message remains retryable on-chain). The relay fee is claimable either way via
+    /// `MessageReceived`.
     DestinationFailed,
     /// Mined with `MessageQueued` or `MessageDeferred`: the dispatcher queued/deferred it; bounded
     /// `retryPendingMessage` attempts follow.

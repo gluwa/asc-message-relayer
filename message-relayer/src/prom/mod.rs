@@ -75,6 +75,9 @@ pub trait MetricsTrait: Send + Sync + Debug {
     /// a message stuck here for a persistently misbehaving destination (bad gas limit, dead
     /// signer) is now dashboard-visible instead of log-grep-only.
     fn inc_delivery_retries_exceeded(&self, chain_key: u64);
+    /// A message whose destination call kept failing (`DestinationFailed`) exhausted its
+    /// `retryFailedMessage` budget and was dropped from durable work. It stays retryable on-chain.
+    fn inc_destination_failed_retries_exhausted(&self, chain_key: u64);
 }
 
 /// Shared trait object — used to plumb metrics through services without leaking the concrete type.
@@ -115,6 +118,7 @@ impl MetricsTrait for NoopMetrics {
     }
     fn inc_checkpoint_write_failure(&self, _chain_key: u64) {}
     fn inc_delivery_retries_exceeded(&self, _chain_key: u64) {}
+    fn inc_destination_failed_retries_exhausted(&self, _chain_key: u64) {}
 }
 
 /// Concrete metrics container.
@@ -145,6 +149,7 @@ pub struct RelayerMetrics {
     worker_degraded: Family<LabelWorker, Gauge<i64, AtomicI64>>,
     checkpoint_write_failures: Family<LabelChain, Counter<u64, AtomicU64>>,
     delivery_retries_exceeded: Family<LabelChain, Counter<u64, AtomicU64>>,
+    destination_failed_retries_exhausted: Family<LabelChain, Counter<u64, AtomicU64>>,
     outcome_store_size: Gauge<i64, AtomicI64>,
     outcome_store_evictions: Gauge<i64, AtomicI64>,
 }
@@ -340,6 +345,15 @@ impl RelayerMetrics {
             delivery_retries_exceeded.clone(),
         );
 
+        let destination_failed_retries_exhausted = Family::default();
+        registry.register(
+            "relayer_destination_failed_retries_exhausted",
+            "Messages whose destination call kept reverting (DestinationFailed) and that exhausted \
+             the route's retryFailedMessage budget, per chain_key. The relayer stops spending gas \
+             on them; they remain retryable on-chain by anyone.",
+            destination_failed_retries_exhausted.clone(),
+        );
+
         let outcome_store_size = Gauge::default();
         registry.register(
             "relayer_outcome_store_size",
@@ -397,6 +411,7 @@ impl RelayerMetrics {
             worker_degraded,
             checkpoint_write_failures,
             delivery_retries_exceeded,
+            destination_failed_retries_exhausted,
             outcome_store_size,
             outcome_store_evictions,
         }
@@ -605,6 +620,12 @@ impl MetricsTrait for RelayerMetrics {
 
     fn inc_delivery_retries_exceeded(&self, chain_key: u64) {
         self.delivery_retries_exceeded
+            .get_or_create(&LabelChain { chain_key })
+            .inc();
+    }
+
+    fn inc_destination_failed_retries_exhausted(&self, chain_key: u64) {
+        self.destination_failed_retries_exhausted
             .get_or_create(&LabelChain { chain_key })
             .inc();
     }
@@ -1105,6 +1126,7 @@ mod tests {
         m.inc_claim_submission(1, SettlementOutcome::Confirmed);
         m.inc_checkpoint_write_failure(1);
         m.inc_delivery_retries_exceeded(1);
+        m.inc_destination_failed_retries_exhausted(1);
     }
 
     /// A checkpoint write failure must be attributable to a chain_key, not just a log line — the
@@ -1130,6 +1152,17 @@ mod tests {
         let body = m.encode();
         assert!(
             body.contains("relayer_delivery_retries_exceeded_total{chain_key=\"8\"} 1"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn destination_failed_retries_exhausted_is_labeled_by_chain() {
+        let m = RelayerMetrics::new(&[8]);
+        m.inc_destination_failed_retries_exhausted(8);
+        let body = m.encode();
+        assert!(
+            body.contains("relayer_destination_failed_retries_exhausted_total{chain_key=\"8\"} 1"),
             "{body}"
         );
     }

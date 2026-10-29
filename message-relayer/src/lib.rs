@@ -201,6 +201,7 @@ impl Server {
                     health.clone(),
                     broadcast_locks.clone(),
                     outcomes.clone(),
+                    work.clone(),
                     cancel.clone(),
                 ),
             );
