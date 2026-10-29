@@ -932,6 +932,12 @@ pub enum ProofFetchOutcome {
     /// destination chain lags the tx). Re-polled on the flat not-ready cadence; a steady stream
     /// here with matching `Ready` growth is attestation latency, not a fault.
     NotReady,
+    /// Proof-gen refused the request and marked it `retriable: false` (a 4xx such as
+    /// `ArchiverRangeRejected`). Retried only at the capped slow cadence, with the settlement
+    /// retained: a sustained rise with no `Ready` growth means proof-gen or its archiver needs a
+    /// fix, not that the relayer is failing. These used to be counted as `Error`; the settlement
+    /// `Failed` counters still tick for them, so alerts on those keep firing.
+    Rejected,
     /// A real failure (5xx, connection error, undecodable body). Backed off exponentially; a
     /// sustained rise with no `Ready` growth is the proof-gen-outage shape.
     Error,
@@ -1065,6 +1071,7 @@ mod tests {
         m.inc_ack_proof_fetch(7, ProofFetchOutcome::NotReady);
         m.inc_ack_proof_fetch(7, ProofFetchOutcome::NotReady);
         m.inc_ack_proof_fetch(7, ProofFetchOutcome::Error);
+        m.inc_ack_proof_fetch(7, ProofFetchOutcome::Rejected);
         let body = m.encode();
         assert!(body.contains("relayer_messages_indexed"));
         assert!(body.contains("relayer_votes_received"));
@@ -1079,6 +1086,13 @@ mod tests {
         );
         assert!(
             body.contains("relayer_ack_proof_fetches_total{chain_key=\"7\",outcome=\"Error\"} 1"),
+            "{body}"
+        );
+        // A permanent proof-gen refusal is its own label value, apart from `Error`.
+        assert!(
+            body.contains(
+                "relayer_ack_proof_fetches_total{chain_key=\"7\",outcome=\"Rejected\"} 1"
+            ),
             "{body}"
         );
         assert!(body.contains("relayer_claim_submissions"));

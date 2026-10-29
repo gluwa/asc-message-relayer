@@ -137,7 +137,11 @@ and repeated failures escalate in logs and metrics:
   `ack.not_ready_poll_secs` (default 20 s) for `ack.not_ready_poll_window_secs` (default 30 min),
   then back off to a capped 10 min cadence. After 24 h, overdue proofs trigger warnings and
   remain pending. Transient submit failures similarly retain work and escalate after 20 attempts.
-  A full queue applies scan backpressure; the checkpoint stays behind unfinished settlements so
+  A proof request that proof-gen permanently refuses (HTTP 4xx with `retriable: false`, e.g.
+  `ArchiverRangeRejected`) is counted as `outcome="Rejected"` on `relayer_ack_proof_fetches_total`,
+  logged with proof-gen's own message, and retried at the capped 10 min cadence without climbing
+  the transient ramp; the settlement is retained, never dropped, so it settles once proof-gen or
+  its archiver is fixed. A full queue applies scan backpressure; the checkpoint stays behind unfinished settlements so
   restart can recover them. A receipt or revert alone never releases an executed acknowledgment
   or funded relay fee: source state must confirm settlement at `finalized`.
 - **Settlement across Outbox rotations** — recover every Outbox ever supported by the destination
