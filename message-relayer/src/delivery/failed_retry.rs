@@ -58,23 +58,25 @@ impl FailedRetries {
         Self::new(chain_key, None)
     }
 
-    pub(crate) async fn get(&self, message_id: B256) -> Option<FailedRetryState> {
+    /// `Err` only when the persisted entry cannot be read and this process holds no copy of its
+    /// own: the state is then unknown (possibly a tombstone) and callers must not spend gas on it.
+    pub(crate) async fn get(&self, message_id: B256) -> Result<Option<FailedRetryState>, ()> {
         let memory = self.memory().get(&message_id).copied();
         let disk = match &self.work {
             Some(work) => match work.failed_retry(self.chain_key, message_id).await {
                 Ok(state) => state,
                 Err(err) => {
                     error!(chain_key = self.chain_key, %message_id, %err,
-                        "could not read retryFailedMessage state; using the in-memory copy");
-                    None
+                        "could not read retryFailedMessage state");
+                    return memory.map(Some).ok_or(());
                 }
             },
             None => None,
         };
-        match (memory, disk) {
+        Ok(match (memory, disk) {
             (Some(a), Some(b)) => Some(stricter(a, b)),
             (a, b) => a.or(b),
-        }
+        })
     }
 
     async fn put(&self, message_id: B256, state: FailedRetryState) {
@@ -110,27 +112,35 @@ impl FailedRetries {
         policy: &FailedRetryPolicy,
         now: u64,
     ) -> FailedRetryState {
-        if let Some(state) = self.get(message_id).await {
-            return state;
-        }
         let state = FailedRetryState {
             attempts: 0,
             next_attempt_at: now.saturating_add(policy.backoff(0).as_secs()),
             gave_up_at: None,
         };
-        self.put(message_id, state).await;
-        state
+        match self.get(message_id).await {
+            Ok(Some(existing)) => existing,
+            Ok(None) => {
+                self.put(message_id, state).await;
+                state
+            }
+            // Never overwrite an entry we cannot read; `gate` keeps waiting on it.
+            Err(()) => state,
+        }
     }
 
     /// May a `retryFailedMessage` be sent now? A message with no entry (first seen before this
-    /// relayer version, or a lost first receipt) starts with a full budget and no wait.
+    /// relayer version, or a lost first receipt) starts with a full budget and no wait. An entry
+    /// that cannot be read fails closed: wait and look again rather than assume a fresh budget.
     pub(crate) async fn gate(
         &self,
         message_id: B256,
         policy: &FailedRetryPolicy,
         now: u64,
     ) -> Gate {
-        let state = self.get(message_id).await.unwrap_or_default();
+        let Ok(state) = self.get(message_id).await else {
+            return Gate::Wait(now.saturating_add(policy.backoff(0).as_secs()));
+        };
+        let state = state.unwrap_or_default();
         if state.gave_up_at.is_some() || state.attempts >= policy.max_attempts {
             Gate::GiveUp(state)
         } else if now < state.next_attempt_at {
@@ -147,7 +157,15 @@ impl FailedRetries {
         policy: &FailedRetryPolicy,
         now: u64,
     ) -> FailedRetryState {
-        let previous = self.get(message_id).await.unwrap_or_default();
+        // `gate` read the entry just before the broadcast; if that read now fails, the in-memory
+        // copy (or a first attempt) is the best available floor.
+        let previous = self
+            .get(message_id)
+            .await
+            .ok()
+            .flatten()
+            .or_else(|| self.memory().get(&message_id).copied())
+            .unwrap_or_default();
         let attempts = previous.attempts.saturating_add(1);
         let state = FailedRetryState {
             attempts,
@@ -245,7 +263,7 @@ mod tests {
             })
         ));
         retries.forget(id).await;
-        assert_eq!(retries.get(id).await, None);
+        assert_eq!(retries.get(id).await, Ok(None));
     }
 
     #[tokio::test]
@@ -272,7 +290,7 @@ mod tests {
 
         // A new process (empty memory) resumes the count and the wait.
         let retries = FailedRetries::new(2, Some(store()));
-        assert_eq!(retries.get(id).await.unwrap().attempts, 1);
+        assert_eq!(retries.get(id).await.unwrap().unwrap().attempts, 1);
         assert_eq!(
             retries.gate(id, &policy, NOW + 61).await,
             Gate::Wait(NOW + 60 + 120)
@@ -298,6 +316,32 @@ mod tests {
         ));
     }
 
+    /// An unreadable entry may be a tombstone; after a restart it must not look like a fresh
+    /// budget.
+    #[tokio::test]
+    async fn unreadable_state_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = dir.path().join("cp");
+        let id = B256::repeat_byte(1);
+        let failed = checkpoint
+            .with_extension("messages")
+            .join("2")
+            .join("failed");
+        std::fs::create_dir_all(&failed).unwrap();
+        std::fs::write(failed.join(format!("{id}.json")), b"{").unwrap();
+        let retries = FailedRetries::new(2, Some(Arc::new(WorkStore::for_checkpoint(&checkpoint))));
+        assert_eq!(
+            retries.gate(id, &policy(5), NOW).await,
+            Gate::Wait(NOW + 60)
+        );
+        // Nor does a first-failure notice overwrite it.
+        retries.start(id, &policy(5), NOW).await;
+        assert_eq!(
+            std::fs::read(failed.join(format!("{id}.json"))).unwrap(),
+            b"{"
+        );
+    }
+
     #[tokio::test]
     async fn memory_and_disk_merge_to_the_stricter_view() {
         let dir = tempfile::tempdir().unwrap();
@@ -318,7 +362,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let merged = retries.get(id).await.unwrap();
+        let merged = retries.get(id).await.unwrap().unwrap();
         assert_eq!(merged.attempts, 2);
         assert_eq!(merged.next_attempt_at, NOW + 1_000_000);
     }

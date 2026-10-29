@@ -2169,6 +2169,9 @@ async fn reconcile_execution<P: Provider>(
     // Whether the destination is still failing after this attempt (as opposed to executed or
     // handed to the dispatcher's queue), i.e. whether the attempt counts against the budget.
     let mut failed_again = true;
+    // The receipt carried `DestinationFailed`. After a `retryPendingMessage` this is where the
+    // failed-destination schedule starts.
+    let mut destination_failed = false;
     let result = match tokio::time::timeout(
         RECEIPT_TIMEOUT,
         crate::receipt::await_receipt(&builder),
@@ -2190,7 +2193,8 @@ async fn reconcile_execution<P: Provider>(
                     ReceiptClass::Unknown => (None, retry),
                 };
             if let Some(kind) = kind {
-                failed_again = kind == OutcomeKind::DestinationFailed;
+                destination_failed = kind == OutcomeKind::DestinationFailed;
+                failed_again = destination_failed;
                 let reason = match spent {
                     Some(spent) if failed_again => format!(
                         "retryFailedMessage attempt {}/{} hit DestinationFailed again",
@@ -2261,6 +2265,31 @@ async fn reconcile_execution<P: Provider>(
                 metrics,
             )
             .await
+        }
+        None if destination_failed => {
+            // Queued/deferred dispatch ran and the destination call failed: from here on the
+            // message is `isRetryable`, so its first `retryFailedMessage` waits like any other.
+            let state = failed_retries
+                .start(
+                    message_id,
+                    &route.failed_retry,
+                    now_unix().unwrap_or_default(),
+                )
+                .await;
+            if state.attempts >= route.failed_retry.max_attempts {
+                return give_up_failed_retries(
+                    route,
+                    message_id,
+                    state,
+                    failed_retries,
+                    outcomes,
+                    metrics,
+                )
+                .await;
+            }
+            DeliveryResultKind::AwaitingExecution {
+                retry_after: Some(state.next_attempt_at),
+            }
         }
         _ => result,
     }
@@ -2691,7 +2720,10 @@ mod tests {
                 panic!("first DestinationFailed must schedule retryFailedMessage: {result:?}");
             };
             assert!((before + 60..=now_unix().unwrap() + 60).contains(&next));
-            assert_eq!(retries.get(job.message_id).await.unwrap().attempts, 0);
+            assert_eq!(
+                retries.get(job.message_id).await.unwrap().unwrap().attempts,
+                0
+            );
         }
     }
 
@@ -2737,6 +2769,8 @@ mod tests {
         let (route, job) = execution_job_fixture();
         let outcomes = Arc::new(OutcomeStore::new(8));
         let locks = crate::broadcast::BroadcastLocks::new();
+        let retries = FailedRetries::in_memory(2);
+        let before = now_unix().unwrap();
         mock_state(&rpc, true, false);
         mock_retry_receipt(
             &rpc,
@@ -2754,7 +2788,7 @@ mod tests {
             )],
             true,
         );
-        assert_eq!(
+        assert!(matches!(
             handle_job(
                 &route,
                 &DeliveryConfig::default(),
@@ -2766,16 +2800,24 @@ mod tests {
                 NoopMetrics::new().as_ref(),
                 None,
                 &outcomes,
-                &FailedRetries::in_memory(2),
+                &retries,
             )
             .await
             .unwrap(),
-            DeliveryResultKind::AwaitingExecution { retry_after: None }
+            DeliveryResultKind::AwaitingExecution {
+                retry_after: Some(next)
+            } if (before + 60..=now_unix().unwrap() + 60).contains(&next)
+        ));
+        // The pending retry does not count against the failed-destination budget.
+        assert_eq!(
+            retries.get(job.message_id).await.unwrap().unwrap().attempts,
+            0
         );
         assert_eq!(
             outcomes.get(&job.message_id).unwrap().kind,
             OutcomeKind::DestinationFailed
         );
+        // Redispatched once the backoff has elapsed (a fresh ledger stands in for the wait).
         mock_state(&rpc, false, true);
         mock_retry_receipt(
             &rpc,
