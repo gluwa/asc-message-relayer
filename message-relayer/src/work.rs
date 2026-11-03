@@ -9,7 +9,7 @@
 //! state outlives the record: after the relayer gives up, the entry is the tombstone that stops a
 //! startup rescan from granting the same message a fresh budget.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -44,11 +44,32 @@ pub struct WorkStore {
     readers: Arc<Mutex<HashMap<u64, RouteCursor>>>,
 }
 
+/// How many upcoming IDs a cursor holds in memory (32 bytes each, so 128 KiB per route). Larger
+/// backlogs are walked in successive windows, each found by one scan of the route directory.
+const WINDOW_SIZE: usize = 4096;
+/// Most window entries one `pending` call examines. Bounds the record reads (and the skipping of
+/// IDs the caller already holds) per refill; the cursor persists, so the next call carries on.
+const MAX_EXAMINED_PER_CALL: usize = 4096;
+
+/// Position of a route's walk through its records, ordered by message ID.
+///
+/// The order is the IDs' own, never the filesystem's: `read_dir` order is whatever the filesystem
+/// gives (insertion order on tmpfs, hash order on ext4), and a live `ReadDir` also surfaces files
+/// created while it is open at positions the filesystem picks. A cursor built on it therefore
+/// covers an arbitrary, arrival-dependent subset of the backlog on a busy route, and a record at
+/// the wrong place in the hash order can go unvisited for as long as arrivals keep up.
 #[derive(Debug)]
 struct RouteCursor {
-    reader: Option<std::fs::ReadDir>,
     live_records: usize,
-    remaining: usize,
+    /// The last ID handed to the walk; the next window starts strictly after it. `None` at the
+    /// start of a lap.
+    after: Option<B256>,
+    /// Upcoming IDs in ascending order, all greater than `after` and no greater than `lap_end`.
+    window: VecDeque<B256>,
+    /// The largest record ID present when the current lap began. A lap never walks past it, so
+    /// arrivals sorting after it (a sequence-numbered or otherwise increasing ID would always)
+    /// cannot extend the lap and keep the start of the range from being revisited.
+    lap_end: Option<B256>,
 }
 
 impl RouteCursor {
@@ -62,10 +83,49 @@ impl RouteCursor {
             }
         }
         Ok(Self {
-            reader: None,
             live_records,
-            remaining: 0,
+            after: None,
+            window: VecDeque::new(),
+            lap_end: None,
         })
+    }
+
+    /// Fill the window with the smallest [`WINDOW_SIZE`] record IDs greater than `after` (and no
+    /// greater than the lap's end), in one pass over the directory and constant memory. A lap's
+    /// first refill also fixes its end at the largest ID present. Every record that existed when a
+    /// lap began is therefore offered during it, however many arrive meanwhile; later arrivals
+    /// are offered by the lap that reaches their position, or the next one.
+    fn refill(&mut self, route: &Path) -> Result<()> {
+        let new_lap = self.after.is_none();
+        let mut largest: Option<B256> = None;
+        let mut smallest: BinaryHeap<B256> = BinaryHeap::with_capacity(WINDOW_SIZE + 1);
+        for entry in std::fs::read_dir(route).context("reading pending-message directory")? {
+            let path = entry?.path();
+            if !is_record(&path) {
+                continue; // Ignore an interrupted atomic write's temporary file.
+            }
+            let id: B256 = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .context("invalid pending-message filename")?
+                .parse()
+                .context("invalid pending-message ID")?;
+            largest = largest.max(Some(id));
+            if self.after.is_some_and(|after| id <= after)
+                || (!new_lap && self.lap_end.is_some_and(|end| id > end))
+            {
+                continue;
+            }
+            smallest.push(id);
+            if smallest.len() > WINDOW_SIZE {
+                smallest.pop(); // drops the largest
+            }
+        }
+        if new_lap {
+            self.lap_end = largest;
+        }
+        self.window = smallest.into_sorted_vec().into();
+        Ok(())
     }
 }
 
@@ -161,47 +221,39 @@ impl WorkStore {
                     }
                 }
             };
+            // One lap at most per call: a lap ends where this call started, so IDs this call
+            // already examined are not examined again.
+            let start = cursor.after;
             let mut wrapped = false;
-            // After the one-time population count, bound each refill's directory IO even if a
-            // route has millions of records or temporary files.
-            // Each generation has a finite population budget: arrivals cannot indefinitely
-            // extend the iterator and prevent parked execution from being visited again.
-            for _ in 0..4096 {
-                if cursor.reader.is_none() {
+            let mut examined = 0;
+            while examined < MAX_EXAMINED_PER_CALL {
+                if cursor.window.is_empty() {
                     if cursor.live_records == 0 {
+                        cursor.after = None;
                         break;
                     }
-                    cursor.reader = Some(
-                        std::fs::read_dir(&route).context("reading pending-message directory")?,
-                    );
-                    cursor.remaining = cursor.live_records;
-                }
-                if cursor.remaining == 0 {
-                    cursor.reader = None;
-                    if wrapped {
-                        break;
+                    cursor.refill(&route)?;
+                    if cursor.window.is_empty() {
+                        // Past the last record: start the next lap, once per call.
+                        cursor.after = None;
+                        if wrapped || start.is_none() {
+                            break;
+                        }
+                        wrapped = true;
+                        continue;
                     }
-                    wrapped = true;
-                    continue;
                 }
-                let Some(entry) = cursor.reader.as_mut().expect("reader inserted").next() else {
-                    cursor.remaining = 0;
-                    continue;
-                };
-                let path = entry?.path();
-                if !is_record(&path) {
-                    continue; // Ignore an interrupted atomic write's temporary file.
+                let id = cursor.window[0];
+                if wrapped && start.is_some_and(|start| id > start) {
+                    break; // Back where this call began: every record was offered once.
                 }
-                cursor.remaining -= 1;
-                let id: B256 = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .context("invalid pending-message filename")?
-                    .parse()
-                    .context("invalid pending-message ID")?;
+                cursor.window.pop_front();
+                cursor.after = Some(id);
+                examined += 1;
                 if loaded.contains(&id) {
                     continue;
                 }
+                let path = route.join(format!("{id}.json"));
                 let bytes = match std::fs::read(&path) {
                     Ok(bytes) => bytes,
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -422,10 +474,10 @@ mod tests {
         let parked = first[0].clone();
         let mut loaded = first.iter().map(|m| m.message_id).collect();
         let mut visits: HashMap<B256, usize> = HashMap::new();
-        let original_remaining = work.readers.lock().unwrap()[&2].remaining;
         for batch in 0..100 {
-            // Arrivals outpace both reads and completions throughout the test. An EOF-only
-            // cursor must not depend on catching up with this increasing population.
+            // Arrivals outpace both reads and completions throughout the test. A lap must not
+            // depend on catching up with this increasing population, nor on where the filesystem
+            // happens to place new directory entries.
             for offset in 0..48 {
                 work.record(indexed(513 + batch * 48 + offset))
                     .await
@@ -435,7 +487,6 @@ mod tests {
             work.record(parked.clone()).await.unwrap();
             if batch == 0 {
                 let readers = work.readers.lock().unwrap();
-                assert_eq!(readers[&2].remaining, original_remaining);
                 assert_eq!(readers[&2].live_records, 512 + 48);
             }
             let next = work.pending(2, loaded, 32).await.unwrap();
@@ -470,6 +521,55 @@ mod tests {
             .join("2")
             .join(format!("{}.json", parked.message_id))
             .exists());
+    }
+
+    /// The walk follows the message IDs' own order, not the filesystem's, and wraps into a new lap
+    /// after the last record. IDs are written out of order on purpose.
+    #[tokio::test]
+    async fn walk_is_ordered_by_message_id_and_wraps_into_laps() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = WorkStore::for_checkpoint(&dir.path().join("cp"));
+        for id in [5, 1, 4, 2, 3] {
+            work.record(message(2, id)).await.unwrap();
+        }
+        let seqs = |batch: &[IndexedMessage]| batch.iter().map(|m| m.sequence).collect::<Vec<_>>();
+        let mut loaded = HashSet::new();
+        let a = work.pending(2, loaded.clone(), 2).await.unwrap();
+        assert_eq!(seqs(&a), [1, 2]);
+        loaded.extend(a.iter().map(|m| m.message_id));
+        let b = work.pending(2, loaded.clone(), 2).await.unwrap();
+        assert_eq!(seqs(&b), [3, 4]);
+        loaded.extend(b.iter().map(|m| m.message_id));
+        // The last record, then the wrap: the already-held 1..=4 are skipped, not re-offered.
+        let c = work.pending(2, loaded.clone(), 10).await.unwrap();
+        assert_eq!(seqs(&c), [5]);
+        // The cursor sits just past the wrap's last skipped ID, so with nothing held the walk
+        // continues from 5 and wraps into the next lap.
+        let d = work.pending(2, HashSet::new(), 2).await.unwrap();
+        assert_eq!(seqs(&d), [5, 1]);
+    }
+
+    /// A record that arrives behind the cursor is offered on the next lap, and a record that
+    /// arrives ahead of it is offered on this one.
+    #[tokio::test]
+    async fn arrivals_are_offered_on_the_lap_that_reaches_their_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = WorkStore::for_checkpoint(&dir.path().join("cp"));
+        for id in [10, 20, 30] {
+            work.record(message(2, id)).await.unwrap();
+        }
+        let first = work.pending(2, HashSet::new(), 2).await.unwrap(); // 10, 20
+        assert_eq!(first.len(), 2);
+        work.record(message(2, 5)).await.unwrap(); // behind the cursor
+        work.record(message(2, 25)).await.unwrap(); // ahead of it, but after the window was taken
+        let loaded: HashSet<_> = first.iter().map(|m| m.message_id).collect();
+        let rest = work.pending(2, loaded.clone(), 10).await.unwrap();
+        // The window held 10/20/30, so 25 waits for the next lap; the wrap then offers 5.
+        let mut seen: Vec<u64> = rest.iter().map(|m| m.sequence).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, [5, 30]);
+        let next_lap = work.pending(2, HashSet::new(), 10).await.unwrap();
+        assert_eq!(next_lap.len(), 5, "every record is offered once a lap");
     }
 
     #[tokio::test]
