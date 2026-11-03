@@ -155,8 +155,8 @@ const RETRY_DEFERRED_MARGIN: Duration = Duration::from_secs(5);
 /// hint must not suppress observation of execution by another party indefinitely.
 const MAX_RETRY_DEFERRED_WAIT: Duration = Duration::from_secs(6 * 3600);
 
-/// Job dispatched by the pool when a `messageId` (also the signed digest since asc-contracts #54)
-/// clears the threshold.
+/// Job dispatched by the pool when a `messageId` clears the threshold (votes recovered over the
+/// route's EIP-712 digest of it).
 #[derive(Clone, Debug)]
 pub struct DeliveryJob {
     pub chain_key: u64,
@@ -2379,7 +2379,10 @@ mod tests {
             relayer_contract_address: None,
             block_confirmation_depth: 0,
             start_block: None,
-            attestor_set: crate::config::AttestorSet::Static(vec![Address::repeat_byte(0x22)]),
+            attestor_set: crate::config::AttestorSet::Static {
+                addresses: vec![Address::repeat_byte(0x22)],
+                validator: Address::repeat_byte(0x06),
+            },
             threshold_override: None,
             ack: None,
             claim: None,
@@ -3203,7 +3206,10 @@ mod tests {
             relayer_contract_address: None,
             block_confirmation_depth: 0,
             start_block: None,
-            attestor_set: crate::config::AttestorSet::Static(vec![Address::repeat_byte(0x22)]),
+            attestor_set: crate::config::AttestorSet::Static {
+                addresses: vec![Address::repeat_byte(0x22)],
+                validator: Address::repeat_byte(0x06),
+            },
             threshold_override: None,
             ack: None,
             claim: None,

@@ -16,4 +16,5 @@ parity-scale-codec = { workspace = true, features = ["derive"] }
 sha3 = { workspace = true, default-features = false }
 
 [dev-dependencies]
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

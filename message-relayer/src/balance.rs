@@ -182,9 +182,10 @@ mod tests {
             relayer_contract_address: None,
             block_confirmation_depth: 0,
             start_block: None,
-            attestor_set: AttestorSet::Static(vec![address!(
-                "000000000000000000000000000000000000000a"
-            )]),
+            attestor_set: AttestorSet::Static {
+                addresses: vec![address!("000000000000000000000000000000000000000a")],
+                validator: address!("0000000000000000000000000000000000000006"),
+            },
             threshold_override: None,
             ack: None,
             claim: None,

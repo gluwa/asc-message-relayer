@@ -98,6 +98,11 @@ struct Cli {
     #[arg(long, env = "RELAYER_ATTESTOR_SET", required = false)]
     attestor_set: Option<String>,
 
+    /// Destination `EOAValidator` the Inbox verifies votes with. Required for `--single-route`:
+    /// message votes are EIP-712 signatures whose `verifyingContract` is this validator.
+    #[arg(long, env = "RELAYER_VALIDATOR_ADDRESS", required = false)]
+    validator_address: Option<String>,
+
     /// Override the `2N/3 + 1` quorum threshold (development).
     #[arg(long, env = "RELAYER_THRESHOLD_OVERRIDE", required = false)]
     threshold_override: Option<u32>,
@@ -298,6 +303,12 @@ fn single_route_config(cli: Cli) -> Result<Config> {
         })
         .transpose()?;
 
+    let validator_raw = cli.validator_address.context(
+        "--validator-address is required for --single-route (message votes are EIP-712 signatures \
+         bound to the destination EOAValidator)",
+    )?;
+    let validator = Address::from_str(validator_raw.trim())
+        .with_context(|| format!("invalid --validator-address: {validator_raw}"))?;
     let attestor_addresses: Vec<Address> = attestor_csv
         .split(',')
         .map(str::trim)
@@ -408,7 +419,10 @@ fn single_route_config(cli: Cli) -> Result<Config> {
         relayer_contract_address,
         block_confirmation_depth: DEFAULT_BLOCK_CONFIRMATION_DEPTH,
         start_block: None,
-        attestor_set: AttestorSet::Static(attestor_addresses),
+        attestor_set: AttestorSet::Static {
+            addresses: attestor_addresses,
+            validator,
+        },
         threshold_override: cli.threshold_override,
         ack,
         claim,

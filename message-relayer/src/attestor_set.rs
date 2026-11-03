@@ -53,7 +53,7 @@ pub async fn run(
         }
         // Defensive: static routes are not spawned (lib.rs filters them out), but park rather than
         // exit-as-fatal if one ever reaches here.
-        AttestorSet::Static(_) => {
+        AttestorSet::Static { .. } => {
             cancel.cancelled().await;
             return Ok(());
         }

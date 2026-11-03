@@ -10,8 +10,9 @@
 //!    pushes [`IndexedMessage`]s into the pool's "chain-first allowlist".
 //!  * `p2p::run` (one shared swarm) — subscribes to `{chain_key}/message-votes/v1` topics,
 //!    decodes [`MessageVote`] envelopes, forwards to the pool.
-//!  * `pool::run` — applies PoC §6.2 validation rules and dispatches a [`DeliveryJob`] per
-//!    route once `2N/3 + 1` distinct signers have been observed.
+//!  * `pool::run` — applies PoC §6.2 validation rules (recovering each vote over the route's
+//!    EIP-712 digest, see [`vote_domain`]) and dispatches a [`DeliveryJob`] per route once
+//!    `2N/3 + 1` distinct signers have been observed.
 //!  * `delivery::run` (per route) — simulates, sends, classifies the outcome, retries.
 //!  * Plus `prom::build_router` + a hardware-stats updater.
 //!
@@ -55,6 +56,7 @@ pub mod receipt;
 pub mod revert;
 pub mod rpc;
 pub mod set_update;
+pub mod vote_domain;
 pub mod work;
 
 pub use config::{
@@ -63,7 +65,7 @@ pub use config::{
 pub use delivery::DeliveryJob;
 pub use events::IndexedMessage;
 pub use p2p::MessageVote;
-pub use pool::{calculate_threshold, RouteAttestors};
+pub use pool::{calculate_threshold, PoolRoute, RouteAttestors};
 pub use prom::{Metrics, MetricsTrait, NoopMetrics, RelayerMetrics};
 
 /// Capacities tuned for "indexer pace": Outbox events are slow, votes can spike. Both are
@@ -160,10 +162,16 @@ impl Server {
             .as_ref()
             .map(|path| Arc::new(work::WorkStore::for_checkpoint(path)));
 
-        // Resolve attestor sets up-front so the pool only sees concrete addresses.
-        let mut route_attestors: Vec<RouteAttestors> = Vec::with_capacity(self.config.routes.len());
+        // Resolve attestor sets and the EIP-712 message-vote domain up-front so the pool only sees
+        // concrete addresses. The domain needs the destination chain id and a compatible
+        // validator; a route that cannot provide either can never verify a vote, so it fails
+        // startup instead of running silently dead.
+        let mut pool_routes: Vec<PoolRoute> = Vec::with_capacity(self.config.routes.len());
         for route in &self.config.routes {
-            route_attestors.push(resolve_attestors(route)?);
+            pool_routes.push(PoolRoute {
+                attestors: resolve_attestors(route)?,
+                vote_domain: vote_domain::resolve(route).await?,
+            });
         }
 
         // Channels.
@@ -213,7 +221,7 @@ impl Server {
             &mut tasks,
             "vote pool",
             pool::run(
-                route_attestors,
+                pool_routes,
                 self.config.vote_cache.clone(),
                 pool::PoolHandles {
                     indexed_rx,
@@ -484,8 +492,8 @@ fn spawn_worker(
 /// translate directly; on-chain sets are not implemented in PoC and yield an explanatory error.
 fn resolve_attestors(route: &ChainRoute) -> Result<RouteAttestors> {
     match &route.attestor_set {
-        AttestorSet::Static(addrs) => {
-            let attestors = addrs.clone();
+        AttestorSet::Static { addresses, .. } => {
+            let attestors = addresses.clone();
             let n = attestors.len();
             let threshold = route
                 .threshold_override
@@ -530,7 +538,13 @@ fn redact_url_query(url: &str) -> String {
 
 fn attestor_set_summary(set: &AttestorSet) -> String {
     match set {
-        AttestorSet::Static(addresses) => format!("static({} addresses)", addresses.len()),
+        AttestorSet::Static {
+            addresses,
+            validator,
+        } => format!(
+            "static({} addresses, validator {validator})",
+            addresses.len()
+        ),
         AttestorSet::OnChain { source } => match source {
             AttestorSource::Evm { address } => format!("evm_contract({address})"),
             AttestorSource::Cc3 { chain_key } => format!("cc3_active_set(chain_key={chain_key})"),

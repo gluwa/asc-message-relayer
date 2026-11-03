@@ -120,13 +120,21 @@ routes:
     # auto_request_top_up: false
 
     # Attestor allowlist + quorum. Threshold is ⌊2N/3⌋+1 unless threshold_override is set.
+    #
+    # The validator named here is also the EIP-712 verifyingContract of every message vote:
+    # attestors sign keccak256(0x1901 ‖ domainSeparator ‖ hashStruct(MessageVote(messageId, inbox)))
+    # with domain ("ASC EOAValidator", "1", destination chainId, this validator) and inbox =
+    # inbox_address above. At startup the relayer reads the destination chainId and checks the
+    # validator's eip712Domain() matches; a pre-EIP-712 validator fails startup for this route.
     attestor_set:
       # On-chain source (recommended): read attestors()/threshold() from the EOAValidator on the
       # destination chain, hot-reloaded every 30s — set changes need no relayer restart.
       kind: evm_contract
       address: "0x71A21Ea8d28D3a0618d61d478Ee20DCB64be8082"
-      # -- or a static list (must match EOAValidator.threshold() or delivery reverts): --
+      # -- or a static list (must match EOAValidator.threshold() or delivery reverts). The
+      # destination EOAValidator is still required, for the EIP-712 vote domain: --
       # kind: static
+      # validator_address: "0x71A21Ea8d28D3a0618d61d478Ee20DCB64be8082"
       # addresses:
       #   - "0x000000000000000000000000000000000000000a"
       #   - "0x000000000000000000000000000000000000000b"
