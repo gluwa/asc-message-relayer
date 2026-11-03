@@ -26,6 +26,11 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
+# `.git/` is dockerignored, so the build cannot read the commit itself: CI passes it in
+# (`--build-arg GIT_COMMIT=$(git rev-parse HEAD)` locally) and message-relayer/build.rs embeds it
+# in the proof-gen User-Agent. Without it the User-Agent carries `unknown` instead.
+ARG GIT_COMMIT=""
+ENV GIT_COMMIT=${GIT_COMMIT}
 COPY . .
 # The target dir lives in a cache mount (not an image layer), so copy the binary out within the
 # same RUN step.
