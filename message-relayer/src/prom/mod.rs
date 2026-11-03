@@ -928,9 +928,12 @@ pub struct LabelSettlement {
 pub enum ProofFetchOutcome {
     /// A proof came back and was handed to the submit path.
     Ready,
-    /// Proof-gen answered "not yet" (HTTP 422 `BlockNotReady`, or 404 while its view of the
-    /// destination chain lags the tx). Re-polled on the flat not-ready cadence; a steady stream
-    /// here with matching `Ready` growth is attestation latency, not a fault.
+    /// Proof-gen answered "not yet" (HTTP 422 `BlockNotReady`, 404 while its view of the
+    /// destination chain lags the tx, or a 5xx whose body says `retriable: true`, such as
+    /// `ArchiverDataUnavailable` during an archiver backfill). Re-polled on the flat not-ready
+    /// cadence; a steady stream here with matching `Ready` growth is attestation latency, not a
+    /// fault. A proof-gen stuck answering retriable 5xx forever shows up here, not on `Error`:
+    /// watch the overdue-proof warnings and `relayer_settlement_queue_depth`.
     NotReady,
     /// Proof-gen refused the request and marked it `retriable: false` (a 4xx such as
     /// `ArchiverRangeRejected`). Retried only at the capped slow cadence, with the settlement
