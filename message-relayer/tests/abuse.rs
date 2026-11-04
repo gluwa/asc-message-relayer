@@ -16,22 +16,17 @@ use alloy::primitives::address;
 use message_relayer::config::VoteCacheConfig;
 use message_relayer::events::IndexedMessage;
 use message_relayer::p2p::MessageVote;
-use message_relayer::pool::{run as run_pool, PoolHandles, PoolRoute, RouteAttestors};
+use message_relayer::pool::{run as run_pool, PoolHandles, RouteAttestors};
 use message_relayer::prom::NoopMetrics;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use write_ability::hash::MessageVoteDomain;
 
-fn pool_route(attestors: RouteAttestors) -> PoolRoute {
-    PoolRoute {
-        attestors,
-        vote_domain: MessageVoteDomain {
-            chain_id: 11_155_111,
-            validator: address!("71a21ea8d28d3a0618d61d478ee20dcb64be8082"),
-            inbox: address!("5fbdb2315678afecb367f032d93f642f64180aa3"),
-        },
-    }
-}
+const DOMAIN: MessageVoteDomain = MessageVoteDomain {
+    chain_id: 11_155_111,
+    validator: address!("71a21ea8d28d3a0618d61d478ee20dcb64be8082"),
+    inbox: address!("5fbdb2315678afecb367f032d93f642f64180aa3"),
+};
 
 #[tokio::test]
 async fn pool_drops_unknown_messages_and_emits_no_jobs() {
@@ -44,6 +39,7 @@ async fn pool_drops_unknown_messages_and_emits_no_jobs() {
         chain_key: 2,
         attestors: vec![address!("000000000000000000000000000000000000000a")],
         threshold: 1,
+        vote_domain: Some(DOMAIN),
     };
 
     let mut delivery_txs = HashMap::new();
@@ -58,7 +54,7 @@ async fn pool_drops_unknown_messages_and_emits_no_jobs() {
     let (_set_tx, set_rx) = mpsc::channel::<RouteAttestors>(4);
 
     let handle = tokio::spawn(run_pool(
-        vec![pool_route(route)],
+        vec![route],
         cache,
         PoolHandles {
             indexed_rx,
@@ -114,6 +110,7 @@ async fn pool_drops_votes_from_unknown_signers() {
         chain_key: 2,
         attestors: vec![allowed],
         threshold: 1,
+        vote_domain: Some(DOMAIN),
     };
     let mut delivery_txs = HashMap::new();
     delivery_txs.insert(2u64, delivery_tx);
@@ -122,7 +119,7 @@ async fn pool_drops_votes_from_unknown_signers() {
     let cancel_for_pool = cancel.clone();
     let (_set_tx, set_rx) = mpsc::channel::<RouteAttestors>(4);
     let handle = tokio::spawn(run_pool(
-        vec![pool_route(route)],
+        vec![route],
         VoteCacheConfig {
             ttl_seconds: 60,
             max_messages: 100,

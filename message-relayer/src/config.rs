@@ -76,8 +76,7 @@ pub const DEFAULT_FAILED_RETRY_MAX_BACKOFF_SECS: u64 = 4 * 3600;
 pub struct Config {
     pub bind_host: String,
     pub bind_port: u16,
-    /// Creditcoin Substrate RPC. Reserved for future on-chain attestor-set resolution; not
-    /// strictly required when all routes use a static `attestor_set`.
+    /// Creditcoin Substrate RPC. Reserved; the relayer does not currently read from it.
     pub cc3_rpc_url: String,
     /// Creditcoin EVM RPC. The relayer reads `MessagePublished` events from the configured
     /// Outboxes and `eth_chainId` from this endpoint.
@@ -130,7 +129,6 @@ pub struct ChainRoute {
     /// to block 1, including migration from legacy single-Outbox checkpoints.
     pub start_block: Option<u64>,
     pub attestor_set: AttestorSet,
-    pub threshold_override: Option<u32>,
     /// Opt-in trust-minimized acknowledgment. When set, the relayer watches the destination
     /// Inbox for `MessageReceived`, fetches a native USC delivery proof from the proof-gen API,
     /// and submits it to the source-chain `AcknowledgmentValidator`. `None` disables ack for the
@@ -229,14 +227,6 @@ impl ChainRoute {
         let origin = format!("chain_key {}", self.chain_key);
         validate_max_gas_limit(self.max_gas_limit, &origin)?;
         self.failed_retry.validate(&origin)?;
-        if self.attestor_set.vote_validator().is_none() {
-            bail!(
-                "{origin}: attestor_set names no destination EOAValidator. Message votes are \
-                 EIP-712 signatures whose domain is bound to that validator, so the route cannot \
-                 verify them; use `kind: evm_contract` (recommended) or `kind: static` with a \
-                 `validator_address`"
-            );
-        }
         if self.auto_request_top_up {
             if self.relayer_contract_address.is_none() {
                 bail!(
@@ -347,46 +337,14 @@ pub struct ClaimConfig {
     pub start_block: Option<u64>,
 }
 
+/// Where a route's attestor allowlist and quorum come from: the destination `EOAValidator`. The
+/// per-route watcher (`attestor_set::run`) polls its `attestors()` / `threshold()` and hot-reloads
+/// the pool, so the relayer always enforces exactly the set and threshold the Inbox will accept.
 #[derive(Debug, Clone)]
-pub enum AttestorSet {
-    /// Static EVM-address allowlist supplied in config. Used for the PoC.
-    ///
-    /// `validator` is the destination `EOAValidator` the route's Inbox verifies votes with. A
-    /// static allowlist still needs it: message votes are signed over an EIP-712 digest whose
-    /// `verifyingContract` is that validator (see [`write_ability::hash::MessageVoteDomain`]), so
-    /// without it the relayer cannot recover a single vote.
-    Static {
-        addresses: Vec<Address>,
-        validator: Address,
-    },
-    /// On-chain `IVoteValidator` introspection (stub until validator contract is finalized).
-    OnChain { source: AttestorSource },
-}
-
-impl AttestorSet {
-    /// The destination `EOAValidator` message votes are EIP-712-bound to (`verifyingContract`):
-    /// the `evm_contract` address, or a static set's explicit `validator_address`. `None` for the
-    /// `cc3_active_set` source, which names no destination contract and so cannot verify votes.
-    #[must_use]
-    pub fn vote_validator(&self) -> Option<Address> {
-        match self {
-            Self::Static { validator, .. } => Some(*validator),
-            Self::OnChain {
-                source: AttestorSource::Evm { address },
-            } => Some(*address),
-            Self::OnChain {
-                source: AttestorSource::Cc3 { .. },
-            } => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum AttestorSource {
-    /// Validator contract on the destination chain.
-    Evm { address: Address },
-    /// Active attestor set on the Creditcoin runtime for `chain_key`.
-    Cc3 { chain_key: u64 },
+pub struct AttestorSet {
+    /// The destination `EOAValidator`. Also the EIP-712 `verifyingContract` of every message vote
+    /// (see [`write_ability::hash::MessageVoteDomain`]).
+    pub validator: Address,
 }
 
 #[derive(Debug, Clone)]
@@ -612,8 +570,6 @@ pub struct ChainRouteFile {
     pub start_block: Option<u64>,
     pub attestor_set: AttestorSetFile,
     #[serde(default)]
-    pub threshold_override: Option<u32>,
-    #[serde(default)]
     pub ack: Option<AckConfigFile>,
     #[serde(default)]
     pub claim: Option<ClaimConfigFile>,
@@ -681,22 +637,12 @@ pub struct ClaimConfigFile {
     pub start_block: Option<u64>,
 }
 
+/// On-disk `attestor_set`. `evm_contract` is the only source; the `kind` tag is kept so existing
+/// configs parse unchanged and a removed kind (`static`, `cc3_active_set`) fails loudly at load.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum AttestorSetFile {
-    Static {
-        addresses: Vec<String>,
-        /// Destination `EOAValidator` (EIP-712 `verifyingContract` of every message vote).
-        /// Required; optional here only so a missing key gets a pointed error instead of serde's.
-        #[serde(default)]
-        validator_address: Option<String>,
-    },
-    EvmContract {
-        address: String,
-    },
-    Cc3ActiveSet {
-        chain_key: u64,
-    },
+    EvmContract { address: String },
 }
 
 fn default_p2p_port() -> u16 {
@@ -812,59 +758,14 @@ impl ChainRouteFile {
                 )
             })?;
 
-        let attestor_set = match self.attestor_set {
-            AttestorSetFile::Static {
-                addresses,
-                validator_address,
-            } => {
-                let mut parsed = Vec::with_capacity(addresses.len());
-                for raw in addresses {
-                    parsed.push(parse_address(&raw).with_context(|| {
-                        format!(
-                            "invalid attestor address `{raw}` for chain_key {}",
-                            self.chain_key
-                        )
-                    })?);
-                }
-                if parsed.is_empty() {
-                    bail!(
-                        "attestor_set.static.addresses must be non-empty for chain_key {}",
-                        self.chain_key
-                    );
-                }
-                let Some(raw_validator) = validator_address else {
-                    bail!(
-                        "attestor_set.static.validator_address is required for chain_key {}: \
-                         message votes are EIP-712 signatures bound to the destination \
-                         EOAValidator, so the relayer must know its address",
-                        self.chain_key
-                    );
-                };
-                let validator = parse_address(&raw_validator).with_context(|| {
-                    format!(
-                        "invalid attestor_set.static.validator_address for chain_key {}",
-                        self.chain_key
-                    )
-                })?;
-                AttestorSet::Static {
-                    addresses: parsed,
-                    validator,
-                }
-            }
-            AttestorSetFile::EvmContract { address } => {
-                let address = parse_address(&address).with_context(|| {
-                    format!(
-                        "invalid attestor_set.evm_contract.address for chain_key {}",
-                        self.chain_key
-                    )
-                })?;
-                AttestorSet::OnChain {
-                    source: AttestorSource::Evm { address },
-                }
-            }
-            AttestorSetFile::Cc3ActiveSet { chain_key } => AttestorSet::OnChain {
-                source: AttestorSource::Cc3 { chain_key },
-            },
+        let AttestorSetFile::EvmContract { address } = self.attestor_set;
+        let attestor_set = AttestorSet {
+            validator: parse_address(&address).with_context(|| {
+                format!(
+                    "invalid attestor_set.evm_contract.address for chain_key {}",
+                    self.chain_key
+                )
+            })?,
         };
 
         let ack = self
@@ -943,7 +844,6 @@ impl ChainRouteFile {
             block_confirmation_depth: self.block_confirmation_depth,
             start_block: self.start_block,
             attestor_set,
-            threshold_override: self.threshold_override,
             ack,
             claim,
             max_native_coin_value_wei,
@@ -999,11 +899,8 @@ routes:
     inbox_address: "0x0000000000000000000000000000000000000002"
     block_confirmation_depth: 12
     attestor_set:
-      kind: static
-      validator_address: "0x0000000000000000000000000000000000000006"
-      addresses:
-        - "0x000000000000000000000000000000000000000a"
-        - "0x000000000000000000000000000000000000000b"
+      kind: evm_contract
+      address: "0x0000000000000000000000000000000000000006"
     ack:
       proof_gen_url: "http://localhost:3100"
       validator_address: "0x0000000000000000000000000000000000000005"
@@ -1026,17 +923,11 @@ routes:
         assert_eq!(cfg.routes.len(), 1);
         assert_eq!(cfg.routes[0].chain_key, 2);
         assert_eq!(cfg.cc3_rpc_url, "ws://cc3:9944");
-        assert!(matches!(
-            cfg.routes[0].attestor_set,
-            AttestorSet::Static { .. }
-        ));
         assert_eq!(
-            cfg.routes[0].attestor_set.vote_validator(),
-            Some(
-                "0x0000000000000000000000000000000000000006"
-                    .parse::<Address>()
-                    .unwrap()
-            )
+            cfg.routes[0].attestor_set.validator,
+            "0x0000000000000000000000000000000000000006"
+                .parse::<Address>()
+                .unwrap()
         );
         let claim = cfg.routes[0].claim.as_ref().expect("claim block parsed");
         assert_eq!(claim.confirmation_depth, 64);
@@ -1281,17 +1172,15 @@ routes:
     destination_rpc_url: "http://x"
     inbox_address: "0x0000000000000000000000000000000000000002"
     attestor_set:
-      kind: static
-      validator_address: "0x0000000000000000000000000000000000000006"
-      addresses: ["0x000000000000000000000000000000000000000a"]
+      kind: evm_contract
+      address: "0x0000000000000000000000000000000000000006"
   - chain_key: 2
     creditcoin_chain_id: 1
     destination_rpc_url: "http://y"
     inbox_address: "0x0000000000000000000000000000000000000003"
     attestor_set:
-      kind: static
-      validator_address: "0x0000000000000000000000000000000000000006"
-      addresses: ["0x000000000000000000000000000000000000000a"]
+      kind: evm_contract
+      address: "0x0000000000000000000000000000000000000006"
 "#;
         let file: ConfigFile = serde_yaml::from_str(yaml).unwrap();
         let err = file
@@ -1310,9 +1199,16 @@ routes:
         assert!(err.to_string().contains("at least one entry"));
     }
 
+    /// The static and `cc3_active_set` sources were removed: the attestor set always comes from
+    /// the destination EOAValidator. A config still naming either must fail at load, not run.
     #[test]
-    fn empty_static_attestor_set_rejected() {
-        let yaml = r#"
+    fn removed_attestor_set_kinds_rejected() {
+        for attestor_set in [
+            "kind: static\n      addresses: [\"0x000000000000000000000000000000000000000a\"]",
+            "kind: cc3_active_set\n      chain_key: 2",
+        ] {
+            let yaml = format!(
+                r#"
 bind_host: "0.0.0.0"
 bind_port: 3200
 routes:
@@ -1321,69 +1217,12 @@ routes:
     destination_rpc_url: "http://x"
     inbox_address: "0x0000000000000000000000000000000000000002"
     attestor_set:
-      kind: static
-      validator_address: "0x0000000000000000000000000000000000000006"
-      addresses: []
-"#;
-        let file: ConfigFile = serde_yaml::from_str(yaml).unwrap();
-        let err = file
-            .into_config("ws://cc3".into(), "http://cc3-eth".into(), None)
-            .unwrap_err();
-        assert!(err.to_string().contains("must be non-empty"));
-    }
-
-    /// Message votes are EIP-712-bound to the destination validator, so a static set without one
-    /// would reject every vote at runtime. Refuse it at load time instead.
-    #[test]
-    fn static_attestor_set_without_validator_rejected() {
-        let yaml = r#"
-bind_host: "0.0.0.0"
-bind_port: 3200
-routes:
-  - chain_key: 2
-    creditcoin_chain_id: 1
-    destination_rpc_url: "http://x"
-    inbox_address: "0x0000000000000000000000000000000000000002"
-    attestor_set:
-      kind: static
-      addresses: ["0x000000000000000000000000000000000000000a"]
-"#;
-        let file: ConfigFile = serde_yaml::from_str(yaml).unwrap();
-        let err = file
-            .into_config("ws://cc3".into(), "http://cc3-eth".into(), None)
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("attestor_set.static.validator_address is required"),
-            "{err:#}"
-        );
-    }
-
-    /// `cc3_active_set` names no destination contract, so there is no EIP-712 domain to verify
-    /// message votes against.
-    #[test]
-    fn cc3_active_set_rejected_for_lack_of_vote_validator() {
-        let yaml = r#"
-bind_host: "0.0.0.0"
-bind_port: 3200
-routes:
-  - chain_key: 2
-    creditcoin_chain_id: 1
-    destination_rpc_url: "http://x"
-    inbox_address: "0x0000000000000000000000000000000000000002"
-    attestor_set:
-      kind: cc3_active_set
-      chain_key: 2
-"#;
-        let file: ConfigFile = serde_yaml::from_str(yaml).unwrap();
-        let err = file
-            .into_config("ws://cc3".into(), "http://cc3-eth".into(), None)
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("names no destination EOAValidator"),
-            "{err:#}"
-        );
+      {attestor_set}
+"#
+            );
+            let err = serde_yaml::from_str::<ConfigFile>(&yaml).unwrap_err();
+            assert!(err.to_string().contains("unknown variant"), "{err}");
+        }
     }
 
     #[test]
@@ -1397,9 +1236,8 @@ routes:
     destination_rpc_url: "http://x"
     inbox_address: "not-an-address"
     attestor_set:
-      kind: static
-      validator_address: "0x0000000000000000000000000000000000000006"
-      addresses: ["0x000000000000000000000000000000000000000a"]
+      kind: evm_contract
+      address: "0x0000000000000000000000000000000000000006"
 "#;
         let file: ConfigFile = serde_yaml::from_str(yaml).unwrap();
         let err = file

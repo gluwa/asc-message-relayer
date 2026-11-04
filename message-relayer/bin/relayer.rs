@@ -42,7 +42,7 @@ struct Cli {
     #[arg(long, default_value_t = 3200, env = "RELAYER_BIND_PORT")]
     bind_port: u16,
 
-    /// Creditcoin Substrate RPC (WebSocket). Used by future on-chain attestor resolution.
+    /// Creditcoin Substrate RPC (WebSocket). Reserved; the relayer does not currently read from it.
     #[arg(
         long,
         default_value = "ws://localhost:9944",
@@ -94,18 +94,11 @@ struct Cli {
     #[arg(long, env = "RELAYER_OUTBOX_ADDRESS", required = false)]
     outbox_address: Option<String>,
 
-    /// Comma-separated EVM addresses of trusted attestors (static allowlist).
-    #[arg(long, env = "RELAYER_ATTESTOR_SET", required = false)]
-    attestor_set: Option<String>,
-
     /// Destination `EOAValidator` the Inbox verifies votes with. Required for `--single-route`:
-    /// message votes are EIP-712 signatures whose `verifyingContract` is this validator.
+    /// the route's attestor set and threshold are read from its `attestors()` / `threshold()`,
+    /// and message votes are EIP-712 signatures whose `verifyingContract` is this validator.
     #[arg(long, env = "RELAYER_VALIDATOR_ADDRESS", required = false)]
     validator_address: Option<String>,
-
-    /// Override the `2N/3 + 1` quorum threshold (development).
-    #[arg(long, env = "RELAYER_THRESHOLD_OVERRIDE", required = false)]
-    threshold_override: Option<u32>,
 
     /// `RelayerContract(Lite)` on the Creditcoin (source) chain — the fee ledger (usc-contracts
     /// #23 moved `getMessageInfo`/`claimDelivery` off the RelayerFeeVault). When set, the delivery
@@ -288,9 +281,6 @@ fn single_route_config(cli: Cli) -> Result<Config> {
     let inbox_raw = cli
         .inbox_address
         .context("--inbox-address is required for --single-route")?;
-    let attestor_csv = cli
-        .attestor_set
-        .context("--attestor-set is required for --single-route")?;
 
     let inbox_address = Address::from_str(inbox_raw.trim())
         .with_context(|| format!("invalid --inbox-address: {inbox_raw}"))?;
@@ -304,20 +294,11 @@ fn single_route_config(cli: Cli) -> Result<Config> {
         .transpose()?;
 
     let validator_raw = cli.validator_address.context(
-        "--validator-address is required for --single-route (message votes are EIP-712 signatures \
-         bound to the destination EOAValidator)",
+        "--validator-address is required for --single-route (the destination EOAValidator is the \
+         route's attestor-set source)",
     )?;
     let validator = Address::from_str(validator_raw.trim())
         .with_context(|| format!("invalid --validator-address: {validator_raw}"))?;
-    let attestor_addresses: Vec<Address> = attestor_csv
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| Address::from_str(s).with_context(|| format!("invalid attestor address: {s}")))
-        .collect::<Result<Vec<_>>>()?;
-    if attestor_addresses.is_empty() {
-        bail!("--attestor-set must contain at least one EVM address");
-    }
 
     // Ack submitter is opt-in: enabled only when all three flags are present.
     let ack = match (
@@ -419,11 +400,7 @@ fn single_route_config(cli: Cli) -> Result<Config> {
         relayer_contract_address,
         block_confirmation_depth: DEFAULT_BLOCK_CONFIRMATION_DEPTH,
         start_block: None,
-        attestor_set: AttestorSet::Static {
-            addresses: attestor_addresses,
-            validator,
-        },
-        threshold_override: cli.threshold_override,
+        attestor_set: AttestorSet { validator },
         ack,
         claim,
         max_native_coin_value_wei,

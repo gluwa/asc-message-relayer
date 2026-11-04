@@ -13,8 +13,8 @@
 //! source-chain pre-indexing — the relayer recomputes the digest itself from the envelope and only
 //! aggregates votes whose nonce matches the validator's current `attestorSetUpdateNonce`.
 //!
-//! Runs only for routes whose attestor set is sourced on-chain (`AttestorSet::OnChain { Evm }`) and
-//! that have a `signer_key` (to pay gas — submission is permissionless, authority is in the sigs).
+//! Runs only for routes that have a `signer_key` (to pay gas; submission is permissionless,
+//! authority is in the sigs).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -33,7 +33,7 @@ use write_ability::abi::IVoteValidator;
 use write_ability::envelope::SetUpdateVote;
 use write_ability::hash::{attestor_set_update_digest, canonical_attestor_order};
 
-use crate::config::{AttestorSet, AttestorSource, ChainRoute};
+use crate::config::ChainRoute;
 use crate::delivery::encode::encode_votes;
 use crate::pool::recover_signer;
 
@@ -255,31 +255,25 @@ pub async fn run(
 ) -> Result<()> {
     let mut states: HashMap<u64, RouteState> = HashMap::new();
     for route in &routes {
-        // Only on-chain-sourced sets have a validator to update; only routes with a signer can pay
-        // for submission.
-        if let AttestorSet::OnChain {
-            source: AttestorSource::Evm { address },
-        } = &route.attestor_set
-        {
-            let Some(signer_key) = route.signer_key.clone() else {
-                warn!(
-                    chain_key = route.chain_key,
-                    "attestor-set-update: on-chain set but no signer_key — skipping route"
-                );
-                continue;
-            };
-            states.insert(
-                route.chain_key,
-                RouteState {
-                    validator: *address,
-                    signer_key,
-                    dest_rpc_url: route.destination_rpc_url.clone(),
-                    current: None,
-                    votes: HashMap::new(),
-                    in_flight: HashSet::new(),
-                },
+        // Only routes with a signer can pay for submission.
+        let Some(signer_key) = route.signer_key.clone() else {
+            warn!(
+                chain_key = route.chain_key,
+                "attestor-set-update: no signer_key, skipping route"
             );
-        }
+            continue;
+        };
+        states.insert(
+            route.chain_key,
+            RouteState {
+                validator: route.attestor_set.validator,
+                signer_key,
+                dest_rpc_url: route.destination_rpc_url.clone(),
+                current: None,
+                votes: HashMap::new(),
+                in_flight: HashSet::new(),
+            },
+        );
     }
 
     if states.is_empty() {

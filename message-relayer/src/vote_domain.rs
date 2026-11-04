@@ -5,24 +5,29 @@
 //! `verifyingContract`) and the destination Inbox. The pool recovers signers against that digest,
 //! so every route needs its domain before it can count a single vote:
 //!
-//! * `chain_id` is read once from the destination RPC (`eth_chainId`) at startup;
-//! * `validator` is the route's `attestor_set` validator ([`AttestorSet::vote_validator`]);
+//! * `chain_id` is read from the destination RPC (`eth_chainId`);
+//! * `validator` is the route's `attestor_set` validator ([`AttestorSet::validator`]);
 //! * `inbox` is the route's configured `inbox_address`.
 //!
-//! Before trusting the domain, [`resolve`] asks the validator for its ERC-5267 `eip712Domain()`
-//! and requires it to match. That catches a relayer pointed at a pre-EIP-712 validator (which
-//! verifies raw-`messageId` signatures and has no `eip712Domain()`) or at a validator deployed with
-//! a different name/version: in both cases every bundle the relayer assembled would revert on
-//! delivery, so failing the route at startup is the useful outcome.
+//! Before trusting the domain, [`read`] asks the validator for its ERC-5267 `eip712Domain()` and
+//! requires it to match. That catches a relayer pointed at a pre-EIP-712 validator (which verifies
+//! raw-`messageId` signatures and has no `eip712Domain()`) or at a validator deployed with a
+//! different name/version: in both cases every bundle the relayer assembled would revert on
+//! delivery.
 //!
-//! [`AttestorSet::vote_validator`]: crate::config::AttestorSet::vote_validator
+//! None of this happens at startup. The per-route attestor-set watcher (`attestor_set::run`) calls
+//! [`read`] on every poll together with `attestors()` / `threshold()`, and only hands the pool a
+//! set once all of it succeeded. Until then the route accepts no vote; an incompatible validator
+//! is logged as an error and reported on `/health` as a degraded route, and the relayer keeps
+//! running (and journaling source messages) meanwhile.
+//!
+//! [`AttestorSet::validator`]: crate::config::AttestorSet::validator
 
 use std::time::Duration;
 
-use alloy::primitives::{Address, FixedBytes, U256};
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::primitives::{FixedBytes, U256};
+use alloy::providers::Provider;
 use anyhow::{anyhow, bail, Context, Result};
-use tracing::{info, warn};
 use write_ability::hash::{
     MessageVoteDomain, MESSAGE_VOTE_DOMAIN_NAME, MESSAGE_VOTE_DOMAIN_VERSION,
 };
@@ -50,88 +55,32 @@ alloy::sol! {
 /// (bits 0..=3; bit 4 would be a salt, which [`MessageVoteDomain`] does not use).
 const EXPECTED_DOMAIN_FIELDS: u8 = 0x0f;
 
-/// Per-call timeout for the startup reads.
+/// Per-call timeout for the domain reads.
 const CALL_TIMEOUT: Duration = Duration::from_secs(15);
-/// Startup attempts for transient (transport) failures. Permanent failures, a revert or a domain
-/// mismatch, are not retried.
-const ATTEMPTS: u32 = 4;
-const BACKOFF_BASE: Duration = Duration::from_secs(1);
 
-/// One startup failure, split by whether retrying can help.
-enum ResolveError {
-    /// RPC unreachable / timed out. Retried.
+/// Why the domain could not be read, split by whether the next poll can help.
+#[derive(Debug)]
+pub enum DomainError {
+    /// RPC unreachable / timed out. The next poll retries.
     Transient(anyhow::Error),
-    /// The validator is not an EIP-712 `EOAValidator` matching this route. Never retried.
+    /// The validator is not an EIP-712 `EOAValidator` matching this route (a revert, no data, or
+    /// a domain mismatch). Retrying only helps once the validator or config changes.
     Incompatible(anyhow::Error),
 }
 
-/// Resolve and verify the EIP-712 domain for `route`'s message votes. Fails (naming the route)
-/// when the destination chain id cannot be read, or when the validator does not report the
-/// expected ERC-5267 domain.
-pub async fn resolve(route: &ChainRoute) -> Result<MessageVoteDomain> {
-    let chain_key = route.chain_key;
-    // `ChainRoute::validate` rejects routes without one, so this only trips on a hand-built route.
-    let validator = route.attestor_set.vote_validator().with_context(|| {
-        format!(
-            "chain_key {chain_key}: attestor_set names no destination EOAValidator, so message \
-             votes (EIP-712, bound to that validator) cannot be verified"
-        )
-    })?;
-
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        match try_resolve(route, validator).await {
-            Ok(domain) => {
-                info!(
-                    chain_key,
-                    chain_id = domain.chain_id,
-                    validator = %domain.validator,
-                    inbox = %domain.inbox,
-                    "🔏 message-vote EIP-712 domain verified against the validator's eip712Domain()"
-                );
-                return Ok(domain);
-            }
-            Err(ResolveError::Incompatible(err)) => {
-                return Err(err.context(format!(
-                    "chain_key {chain_key}: destination validator {validator} is not compatible \
-                     with EIP-712 message votes"
-                )));
-            }
-            Err(ResolveError::Transient(err)) if attempt < ATTEMPTS => {
-                let backoff = BACKOFF_BASE * 2u32.pow(attempt - 1);
-                warn!(
-                    chain_key, attempt, %err,
-                    backoff_ms = backoff.as_millis() as u64,
-                    "could not resolve the message-vote EIP-712 domain; retrying"
-                );
-                tokio::time::sleep(backoff).await;
-            }
-            Err(ResolveError::Transient(err)) => {
-                return Err(err.context(format!(
-                    "chain_key {chain_key}: could not resolve the message-vote EIP-712 domain \
-                     after {ATTEMPTS} attempts"
-                )));
-            }
-        }
-    }
-}
-
-async fn try_resolve(
+/// Read the destination chain id and verify the validator's ERC-5267 domain for `route`'s message
+/// votes. Called by the attestor-set watcher on every poll.
+pub async fn read<P: Provider>(
+    provider: &P,
     route: &ChainRoute,
-    validator: Address,
-) -> Result<MessageVoteDomain, ResolveError> {
-    let provider = ProviderBuilder::new()
-        .connect(&route.destination_rpc_url)
-        .await
-        .context("connect destination RPC")
-        .map_err(ResolveError::Transient)?;
+) -> Result<MessageVoteDomain, DomainError> {
+    let validator = route.attestor_set.validator;
 
     let chain_id = tokio::time::timeout(CALL_TIMEOUT, provider.get_chain_id())
         .await
-        .map_err(|_| ResolveError::Transient(anyhow!("eth_chainId timed out")))?
+        .map_err(|_| DomainError::Transient(anyhow!("eth_chainId timed out")))?
         .context("eth_chainId")
-        .map_err(ResolveError::Transient)?;
+        .map_err(DomainError::Transient)?;
 
     let domain = MessageVoteDomain {
         chain_id,
@@ -141,22 +90,22 @@ async fn try_resolve(
 
     let reported = tokio::time::timeout(
         CALL_TIMEOUT,
-        IERC5267::new(validator, &provider).eip712Domain().call(),
+        IERC5267::new(validator, provider).eip712Domain().call(),
     )
     .await
-    .map_err(|_| ResolveError::Transient(anyhow!("eip712Domain() timed out")))?
+    .map_err(|_| DomainError::Transient(anyhow!("eip712Domain() timed out")))?
     .map_err(|err| {
         if is_permanent_call_error(&err) {
-            ResolveError::Incompatible(anyhow!(
+            DomainError::Incompatible(anyhow!(
                 "eip712Domain() is not answered ({err}); a pre-EIP-712 validator that verifies \
                  raw-messageId votes, or not a validator at all"
             ))
         } else {
-            ResolveError::Transient(anyhow!(err).context("eip712Domain()"))
+            DomainError::Transient(anyhow!(err).context("eip712Domain()"))
         }
     })?;
 
-    check_reported_domain(&domain, &reported).map_err(ResolveError::Incompatible)?;
+    check_reported_domain(&domain, &reported).map_err(DomainError::Incompatible)?;
     Ok(domain)
 }
 
@@ -226,7 +175,7 @@ fn check_reported_domain(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::{address, B256};
+    use alloy::primitives::{address, Address, B256};
 
     const DOMAIN: MessageVoteDomain = MessageVoteDomain {
         chain_id: 11_155_111,

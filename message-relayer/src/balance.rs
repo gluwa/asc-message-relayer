@@ -182,11 +182,9 @@ mod tests {
             relayer_contract_address: None,
             block_confirmation_depth: 0,
             start_block: None,
-            attestor_set: AttestorSet::Static {
-                addresses: vec![address!("000000000000000000000000000000000000000a")],
+            attestor_set: AttestorSet {
                 validator: address!("0000000000000000000000000000000000000006"),
             },
-            threshold_override: None,
             ack: None,
             claim: None,
             max_native_coin_value_wei: crate::config::DEFAULT_MAX_NATIVE_COIN_VALUE_WEI,

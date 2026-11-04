@@ -82,13 +82,16 @@ digest  = keccak256(0x1901 ‖ domainSeparator ‖ hashStruct(MessageVote))
 ```
 
 Signatures stay 65-byte `(r, s, v)` with EIP-2 canonical checks (`v` ∈ {27, 28}, low `s`); the
-attestor-set-update digest is unchanged. Per route, the relayer reads the destination chain id
-once at startup (`eth_chainId`), takes the validator from `attestor_set` (the `evm_contract`
-address, or a static set's `validator_address`) and the Inbox from `inbox_address`. Before
-accepting votes it calls the validator's ERC-5267 `eip712Domain()` and requires name, version,
-chain id and verifying contract to match. A pre-EIP-712 validator has no `eip712Domain()`, so a
-relayer pointed at one refuses to start (naming the route) instead of assembling bundles that
-would revert. `cc3_active_set` names no validator and is therefore rejected at config load.
+attestor-set-update digest is unchanged. Per route, the domain takes the validator from
+`attestor_set.address`, the Inbox from `inbox_address` and the chain id from the destination RPC
+(`eth_chainId`). The attestor-set watcher reads the chain id and the validator's ERC-5267
+`eip712Domain()` on every poll, alongside `attestors()` / `threshold()`, and requires name,
+version, chain id and verifying contract to match. Nothing is read from the destination at
+startup, so the relayer starts and keeps journaling while a destination RPC is down; the route
+just accepts no votes until the watcher's first fully successful poll. A pre-EIP-712 validator
+has no `eip712Domain()`, so a route pointed at one never accepts a vote: the watcher logs an
+error naming the route and `/health` reports `attestor-set:<chain_key>` as degraded, instead of
+the relayer assembling bundles that would revert.
 
 Shared wire and ABI bindings, and the digest with its golden vectors
 (`write-ability/vectors/message_vote_eip712.json`), live in [`write-ability`](write-ability/);
@@ -108,7 +111,7 @@ Workers communicate over `mpsc` channels only — the pool owns all aggregation 
 | Delivery worker (per route) | `src/delivery/` | Preflight delivery/retries, reconcile confirmed execution, retain retryable work |
 | Ack submitter (per route, opt-in) | `src/ack/` | Execution/acceptance logs → proof-gen → original-Outbox acknowledgment + independent fee claim |
 | Claim submitter (per route, opt-in) | `src/claim/` | bridge `Locked` → proof-gen → `CcBridge.claim` on Creditcoin ("relayer on both sides": users only send the lock tx) |
-| Attestor-set watcher (per on-chain route) | `src/attestor_set.rs` | Poll `EOAValidator.attestors()/threshold()` every 30 s, hot-reload the pool |
+| Attestor-set watcher (per route) | `src/attestor_set.rs` | Poll `EOAValidator.attestors()/threshold()` every 30 s, hot-reload the pool |
 | HTTP + metrics | `src/prom/` | `/health`, `/metrics`, `/votes/{message_hash}` |
 
 ## Liveness & failure semantics
@@ -234,8 +237,7 @@ message-relayer --single-route \
   --inbox-address 0x… \
   --destination-rpc-url http://localhost:8545 \
   --signer-key 0x… \
-  --attestor-set 0xA…,0xB…,0xC… \
-  --validator-address 0x…   # destination EOAValidator (EIP-712 verifyingContract)
+  --validator-address 0x…   # destination EOAValidator: attestor-set source + EIP-712 verifyingContract
 ```
 
 Every flag has a `RELAYER_*` env twin (`--help` lists them); `.env` is loaded via dotenvy.
@@ -367,9 +369,6 @@ Dockerfile               two-stage image build
 
 ## Known gaps
 
-- **`cc3_active_set` attestor source is unimplemented**, and is rejected at config load because
-  it names no destination validator for the EIP-712 vote domain — use `evm_contract`
-  (hot-reloaded) or `static` with `validator_address`.
 - **Generic intent target** — the claim submitter currently targets the bridge PoC's
   `CcBridge.claim`; when the reviewed `IUSCBridgeInbound.bridgeFromIntent` contracts deploy, the
   swap is an ABI + config change confined to `src/claim/` (identical proof arguments).

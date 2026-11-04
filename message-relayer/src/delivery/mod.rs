@@ -2379,11 +2379,9 @@ mod tests {
             relayer_contract_address: None,
             block_confirmation_depth: 0,
             start_block: None,
-            attestor_set: crate::config::AttestorSet::Static {
-                addresses: vec![Address::repeat_byte(0x22)],
+            attestor_set: crate::config::AttestorSet {
                 validator: Address::repeat_byte(0x06),
             },
-            threshold_override: None,
             ack: None,
             claim: None,
             max_native_coin_value_wei: U256::ZERO,
@@ -3206,11 +3204,9 @@ mod tests {
             relayer_contract_address: None,
             block_confirmation_depth: 0,
             start_block: None,
-            attestor_set: crate::config::AttestorSet::Static {
-                addresses: vec![Address::repeat_byte(0x22)],
+            attestor_set: crate::config::AttestorSet {
                 validator: Address::repeat_byte(0x06),
             },
-            threshold_override: None,
             ack: None,
             claim: None,
             max_native_coin_value_wei: U256::ZERO,
