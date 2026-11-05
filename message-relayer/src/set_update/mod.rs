@@ -266,7 +266,7 @@ pub async fn run(
         states.insert(
             route.chain_key,
             RouteState {
-                validator: route.attestor_set.validator,
+                validator: route.vote_validator,
                 signer_key,
                 dest_rpc_url: route.destination_rpc_url.clone(),
                 current: None,

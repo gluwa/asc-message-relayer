@@ -164,7 +164,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AckConfig, AttestorSet};
+    use crate::config::AckConfig;
     use alloy::primitives::address;
 
     // Anvil's default #0 key — appears in every e2e config, safe to use as a fixture.
@@ -182,9 +182,7 @@ mod tests {
             relayer_contract_address: None,
             block_confirmation_depth: 0,
             start_block: None,
-            attestor_set: AttestorSet {
-                validator: address!("0000000000000000000000000000000000000006"),
-            },
+            vote_validator: address!("0000000000000000000000000000000000000006"),
             ack: None,
             claim: None,
             max_native_coin_value_wei: crate::config::DEFAULT_MAX_NATIVE_COIN_VALUE_WEI,

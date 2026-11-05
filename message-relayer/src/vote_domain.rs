@@ -6,7 +6,7 @@
 //! so every route needs its domain before it can count a single vote:
 //!
 //! * `chain_id` is read from the destination RPC (`eth_chainId`);
-//! * `validator` is the route's `attestor_set` validator ([`AttestorSet::validator`]);
+//! * `validator` is the route's [`vote_validator`];
 //! * `inbox` is the route's configured `inbox_address`.
 //!
 //! Before trusting the domain, [`read`] asks the validator for its ERC-5267 `eip712Domain()` and
@@ -21,7 +21,7 @@
 //! is logged as an error and reported on `/health` as a degraded route, and the relayer keeps
 //! running (and journaling source messages) meanwhile.
 //!
-//! [`AttestorSet::validator`]: crate::config::AttestorSet::validator
+//! [`vote_validator`]: crate::config::ChainRoute::vote_validator
 
 use std::time::Duration;
 
@@ -74,7 +74,7 @@ pub async fn read<P: Provider>(
     provider: &P,
     route: &ChainRoute,
 ) -> Result<MessageVoteDomain, DomainError> {
-    let validator = route.attestor_set.validator;
+    let validator = route.vote_validator;
 
     let chain_id = tokio::time::timeout(CALL_TIMEOUT, provider.get_chain_id())
         .await

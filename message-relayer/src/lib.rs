@@ -59,7 +59,7 @@ pub mod set_update;
 pub mod vote_domain;
 pub mod work;
 
-pub use config::{AttestorSet, ChainRoute, Config, DeliveryConfig, P2pConfig, VoteCacheConfig};
+pub use config::{ChainRoute, Config, DeliveryConfig, P2pConfig, VoteCacheConfig};
 pub use delivery::DeliveryJob;
 pub use events::IndexedMessage;
 pub use p2p::MessageVote;
@@ -103,7 +103,7 @@ impl Server {
                 creditcoin_chain_id = route.creditcoin_chain_id,
                 inbox = %route.inbox_address,
                 destination_rpc = %redact_url_query(&route.destination_rpc_url),
-                attestor_validator = %route.attestor_set.validator,
+                attestor_validator = %route.vote_validator,
                 max_native_coin_value_wei = %route.max_native_coin_value_wei,
                 max_gas_limit = route.max_gas_limit,
                 auto_request_top_up = route.auto_request_top_up,

@@ -128,7 +128,12 @@ pub struct ChainRoute {
     /// First source block to scan when no checkpoint exists for the current scan scope. Defaults
     /// to block 1, including migration from legacy single-Outbox checkpoints.
     pub start_block: Option<u64>,
-    pub attestor_set: AttestorSet,
+    /// Destination `EOAValidator`: the source of this route's attestor allowlist and quorum, and the
+    /// EIP-712 `verifyingContract` of every message vote (see
+    /// [`write_ability::hash::MessageVoteDomain`]). The per-route watcher (`attestor_set::run`) polls
+    /// its `attestors()` / `threshold()` and hot-reloads the pool, so the relayer always enforces
+    /// exactly the set and threshold the Inbox will accept.
+    pub vote_validator: Address,
     /// Opt-in trust-minimized acknowledgment. When set, the relayer watches the destination
     /// Inbox for `MessageReceived`, fetches a native USC delivery proof from the proof-gen API,
     /// and submits it to the source-chain `AcknowledgmentValidator`. `None` disables ack for the
@@ -335,16 +340,6 @@ pub struct ClaimConfig {
     pub confirmation_depth: u64,
     /// First client-chain block to scan on first run when no persisted claim checkpoint exists.
     pub start_block: Option<u64>,
-}
-
-/// Where a route's attestor allowlist and quorum come from: the destination `EOAValidator`. The
-/// per-route watcher (`attestor_set::run`) polls its `attestors()` / `threshold()` and hot-reloads
-/// the pool, so the relayer always enforces exactly the set and threshold the Inbox will accept.
-#[derive(Debug, Clone)]
-pub struct AttestorSet {
-    /// The destination `EOAValidator`. Also the EIP-712 `verifyingContract` of every message vote
-    /// (see [`write_ability::hash::MessageVoteDomain`]).
-    pub validator: Address,
 }
 
 #[derive(Debug, Clone)]
@@ -759,14 +754,12 @@ impl ChainRouteFile {
             })?;
 
         let AttestorSetFile::EvmContract { address } = self.attestor_set;
-        let attestor_set = AttestorSet {
-            validator: parse_address(&address).with_context(|| {
-                format!(
-                    "invalid attestor_set.evm_contract.address for chain_key {}",
-                    self.chain_key
-                )
-            })?,
-        };
+        let vote_validator = parse_address(&address).with_context(|| {
+            format!(
+                "invalid attestor_set.evm_contract.address for chain_key {}",
+                self.chain_key
+            )
+        })?;
 
         let ack = self
             .ack
@@ -843,7 +836,7 @@ impl ChainRouteFile {
             relayer_contract_address,
             block_confirmation_depth: self.block_confirmation_depth,
             start_block: self.start_block,
-            attestor_set,
+            vote_validator,
             ack,
             claim,
             max_native_coin_value_wei,
@@ -924,7 +917,7 @@ routes:
         assert_eq!(cfg.routes[0].chain_key, 2);
         assert_eq!(cfg.cc3_rpc_url, "ws://cc3:9944");
         assert_eq!(
-            cfg.routes[0].attestor_set.validator,
+            cfg.routes[0].vote_validator,
             "0x0000000000000000000000000000000000000006"
                 .parse::<Address>()
                 .unwrap()

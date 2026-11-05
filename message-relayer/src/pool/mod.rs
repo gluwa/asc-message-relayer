@@ -82,10 +82,10 @@ pub struct PoolQuery {
 }
 
 /// Resolved attestor allowlist and vote domain for a route. The per-route watcher reads the
-/// [`AttestorSet`] validator's `attestors()` / `threshold()` and verified EIP-712 domain into this
+/// route's [`vote_validator`]'s `attestors()` / `threshold()` and verified EIP-712 domain into this
 /// concrete shape, so the pool only deals with EVM addresses, a threshold and a domain.
 ///
-/// [`AttestorSet`]: crate::config::AttestorSet
+/// [`vote_validator`]: crate::config::ChainRoute::vote_validator
 #[derive(Clone, Debug)]
 pub struct RouteAttestors {
     pub chain_key: u64,

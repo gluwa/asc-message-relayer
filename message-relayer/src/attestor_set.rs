@@ -35,7 +35,7 @@ pub async fn run(
     cancel: CancellationToken,
 ) -> Result<()> {
     let chain_key = route.chain_key;
-    let validator = route.attestor_set.validator;
+    let validator = route.vote_validator;
 
     info!(chain_key, %validator, "🛂 attestor-set watcher online");
 
@@ -177,7 +177,7 @@ async fn connect_and_read(
             DomainError::Transient(e) => ReadError::Transient(e),
             DomainError::Incompatible(e) => ReadError::Incompatible(e),
         })?;
-    let (attestors, threshold) = read_set(&provider, route.attestor_set.validator).await?;
+    let (attestors, threshold) = read_set(&provider, route.vote_validator).await?;
     Ok((domain, attestors, threshold))
 }
 

@@ -12,8 +12,8 @@ use alloy::primitives::Address;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use message_relayer::config::{
-    parse_wei, validate_ack_not_ready_poll_secs, AckConfig, AttestorSet, ChainRoute, ClaimConfig,
-    Config, P2pConfig, DEFAULT_ACK_NOT_READY_POLL_SECS, DEFAULT_ACK_NOT_READY_POLL_WINDOW_SECS,
+    parse_wei, validate_ack_not_ready_poll_secs, AckConfig, ChainRoute, ClaimConfig, Config,
+    P2pConfig, DEFAULT_ACK_NOT_READY_POLL_SECS, DEFAULT_ACK_NOT_READY_POLL_WINDOW_SECS,
     DEFAULT_BLOCK_CONFIRMATION_DEPTH, DEFAULT_MAX_GAS_LIMIT, DEFAULT_P2P_PORT,
 };
 use message_relayer::Server;
@@ -400,7 +400,7 @@ fn single_route_config(cli: Cli) -> Result<Config> {
         relayer_contract_address,
         block_confirmation_depth: DEFAULT_BLOCK_CONFIRMATION_DEPTH,
         start_block: None,
-        attestor_set: AttestorSet { validator },
+        vote_validator: validator,
         ack,
         claim,
         max_native_coin_value_wei,
