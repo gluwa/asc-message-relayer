@@ -1,6 +1,7 @@
 # write-ability (vendored)
 
-Shared USC write-ability protocol crate: the canonical `messageHash` implementation, the
+Shared USC write-ability protocol crate: the EIP-712 message-vote digest
+(`hash::MessageVoteDomain`) and attestor-set-update digest, the
 `MessageVote` / `ReobservationRequest` wire envelopes, gossipsub topic names, the `bytes32`
 chain-key encoding, and the `sol!` ABI bindings for the Outbox / Inbox / validator contracts.
 
@@ -9,7 +10,10 @@ chain-key encoding, and the `sol!` ABI bindings for the Outbox / Inbox / validat
 This crate is **vendored from the `creditcoin3` repository** (`common/write-ability`), where the
 **attestor** builds against it. The attestor and this relayer MUST agree byte-for-byte on:
 
-- `hash::message_hash(..)` — a divergent hash makes every attestor signature unverifiable;
+- `hash::MessageVoteDomain::digest(..)` (EIP-712 `MessageVote(bytes32 messageId,address inbox)`
+  under domain `"ASC EOAValidator"`/`"1"`/destination chainId/validator) and
+  `hash::attestor_set_update_digest(..)` — a divergent digest makes every attestor signature
+  unverifiable;
 - the SCALE-encoded `MessageVote` / `ReobservationRequest` envelopes — a divergent codec makes
   gossip mutually unintelligible;
 - the gossipsub topic strings (`{chain_key}/message-votes/v1`, `{chain_key}/reobservation-requests/v1`);
@@ -17,10 +21,10 @@ This crate is **vendored from the `creditcoin3` repository** (`common/write-abil
 
 When changing anything here, mirror the change in `creditcoin3/common/write-ability` (and vice
 versa) **in the same rollout window**, and rely on the golden-vector tests to catch drift: both
-repos pin `message_hash` to identical known-answer vectors (`src/hash.rs` tests here,
-`message-relayer/tests/golden_hash.rs`, and the attestor's `write_ability` test module in
-creditcoin3). If a vector changes on one side only, CI fails on the other side the moment the
-crates are re-synced — do not "fix" a vector mismatch by updating the vector; it means the wire
+repos (and the asc-contracts Foundry suite) pin the message-vote digest to the identical
+`vectors/message_vote_eip712.json`, asserted by `src/hash.rs` tests here and in creditcoin3. If
+a vector changes on one side only, CI fails on the other side the moment the crates are re-synced
+— do not "fix" a vector mismatch by updating the vector; it means the wire
 format broke.
 
 Version pins for `alloy`, `parity-scale-codec`, and `sha3` sit on this wire path and are kept

@@ -2,9 +2,8 @@
 //!
 //! Shared by the attestor (which decodes `MessagePublished` from the Creditcoin Outbox) and the
 //! `message-relayer` (which additionally calls `Inbox.deliverMessage` / `validateVotes`). Keeping
-//! one definition here means both crates decode the *same* event signature — since asc-contracts
-//! #54, `validateVotes` takes `messageId` itself as the signed digest, so there is no separate
-//! hash preimage left to keep in sync (see `hash.rs`'s module doc).
+//! one definition here means both crates decode the *same* event signature. The vote digest itself
+//! (EIP-712 over `messageId`, CSUB-2126) lives in `hash.rs`.
 //!
 //! Inline `alloy::sol!` declarations are used while the production contracts are finalized — when
 //! they ship, switch each block to the JSON form (`#[sol(rpc)] interface X, "contracts/x.json"`)

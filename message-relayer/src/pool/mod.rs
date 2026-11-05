@@ -2,9 +2,11 @@
 //!
 //! Receives [`IndexedMessage`]s from the outbox watcher and [`MessageVote`]s from the libp2p
 //! worker, then enforces PoC §6.2 validation rules (chain-first allowlist, ecrecover, signer
-//! allowlist, dedup) before counting. When a `messageId` (also the signed digest since
-//! asc-contracts #54) accumulates `>= threshold` distinct signers, the pool builds a
-//! [`DeliveryJob`] and dispatches it to the per-route delivery channel.
+//! allowlist, dedup) before counting. Votes are keyed by `messageId`, but each signature covers the
+//! route's EIP-712 digest of it ([`MessageVoteDomain::digest`], CSUB-2126), which binds the vote to
+//! the destination chain, `EOAValidator` and Inbox. When a `messageId` accumulates `>= threshold`
+//! distinct signers, the pool builds a [`DeliveryJob`] and dispatches it to the per-route delivery
+//! channel.
 //!
 //! The pool runs as a single tokio task. State is **not** shared with other tasks — workers
 //! talk to it strictly through mpsc channels. This keeps locking trivial and makes RAM-bound
@@ -19,6 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use write_ability::envelope::ReobservationRequest;
+use write_ability::hash::MessageVoteDomain;
 
 use crate::config::VoteCacheConfig;
 use crate::delivery::encode::encode_votes;
@@ -78,16 +81,19 @@ pub struct PoolQuery {
     pub reply: oneshot::Sender<Option<VoteBundle>>,
 }
 
-/// Pre-resolved attestor allowlist for a route. The runtime resolves [`AttestorSet`] (which may
-/// be `OnChain`) into this concrete shape during `Server::new`, so the pool only deals with
-/// EVM addresses + a fixed threshold.
+/// Resolved attestor allowlist and vote domain for a route. The per-route watcher reads the
+/// route's [`vote_validator`]'s `attestors()` / `threshold()` and verified EIP-712 domain into this
+/// concrete shape, so the pool only deals with EVM addresses, a threshold and a domain.
 ///
-/// [`AttestorSet`]: crate::config::AttestorSet
+/// [`vote_validator`]: crate::config::ChainRoute::vote_validator
 #[derive(Clone, Debug)]
 pub struct RouteAttestors {
     pub chain_key: u64,
     pub attestors: Vec<Address>,
     pub threshold: usize,
+    /// EIP-712 domain message votes are recovered under. `None` only in the initial state, before
+    /// the watcher's first successful read; the route accepts no vote until it is known.
+    pub vote_domain: Option<MessageVoteDomain>,
 }
 
 /// Inputs / outputs for the pool task.
@@ -97,8 +103,7 @@ pub struct PoolHandles {
     pub delivery_txs: HashMap<u64, mpsc::Sender<DeliveryJob>>,
     pub delivery_result_rx: mpsc::Receiver<DeliveryResult>,
     /// Hot-reloaded attestor sets from the per-route on-chain watchers. Each update replaces a
-    /// route's allowlist + threshold and re-evaluates its pending messages. Routes with a static
-    /// set never send here.
+    /// route's allowlist, threshold and vote domain and re-evaluates its pending messages.
     pub set_update_rx: mpsc::Receiver<RouteAttestors>,
     /// Reobservation requests this pool emits for messages stalled below quorum; the p2p worker
     /// gossips them so attestors re-sign.
@@ -135,11 +140,11 @@ pub async fn run(
     // receiving until it fits. Other pool inputs keep running, so delivery can free capacity.
     let mut deferred_indexed: Option<IndexedMessage> = None;
 
-    // Publish the starting allowlist sizes (static routes report their configured size; on-chain
-    // routes start empty until their watcher resolves the set).
+    // Publish the starting allowlist sizes (routes start empty until their watcher resolves the
+    // set).
     state.report_set_sizes(metrics.as_ref());
 
-    // Once every set-update sender is dropped (e.g. no on-chain routes, or all watchers exited),
+    // Once every set-update sender is dropped (e.g. all watchers exited),
     // `recv()` yields `None` forever; flip this off so the branch stops being polled.
     let mut set_updates_open = true;
     // Same guard for the query channel (sender held by the HTTP layer until shutdown).
@@ -319,6 +324,10 @@ struct State {
 }
 
 struct RouteState {
+    /// EIP-712 domain every message vote on this route is signed under. Recovery runs against
+    /// `vote_domain.digest(message_id)`; storage and aggregation stay keyed by `message_id`.
+    /// `None` until the attestor-set watcher first verifies it; every vote is rejected meanwhile.
+    vote_domain: Option<MessageVoteDomain>,
     attestors: Vec<Address>,
     threshold: usize,
     by_message: HashMap<B256, MessageSlot>,
@@ -379,6 +388,7 @@ impl State {
                     (
                         r.chain_key,
                         RouteState {
+                            vote_domain: r.vote_domain,
                             attestors: r.attestors,
                             threshold: r.threshold,
                             by_message: HashMap::new(),
@@ -529,8 +539,15 @@ impl State {
             return None;
         }
 
-        // Recover the actual signer and ensure it agrees with the claimed signer.
-        let recovered = match recover_signer(&hash, &vote.signature) {
+        // Recover the actual signer over the route's EIP-712 digest (not the raw `messageId`) and
+        // ensure it agrees with the claimed signer.
+        let Some(domain) = route.vote_domain else {
+            warn!(chain_key, %hash, %claimed_signer, "vote rejected: vote domain not resolved yet");
+            metrics.inc_vote(chain_key, VoteOutcome::Reject);
+            return None;
+        };
+        let digest = domain.digest(hash);
+        let recovered = match recover_signer(&digest, &vote.signature) {
             Ok(addr) => addr,
             Err(err) => {
                 warn!(chain_key, %hash, %err, %claimed_signer, "vote rejected: signature did not recover");
@@ -769,10 +786,12 @@ impl State {
         }
     }
 
-    /// Apply a hot-reloaded attestor set + threshold for one route. Re-evaluates that route's
-    /// not-yet-delivered messages against the **new** set/threshold: signatures from signers no
-    /// longer in the set stop counting, and a lowered threshold (or a now-sufficient set) can push
+    /// Apply a hot-reloaded attestor set + threshold + vote domain for one route. Re-evaluates that
+    /// route's not-yet-delivered messages against the **new** set/threshold: signatures from signers
+    /// no longer in the set stop counting, and a lowered threshold (or a now-sufficient set) can push
     /// an already-collected message over quorum — those are returned as [`DeliveryJob`]s to dispatch.
+    /// If a previously known domain changes, every stored signature was recovered under the old one
+    /// and would revert on delivery, so they are all dropped.
     fn apply_attestor_set(
         &mut self,
         update: RouteAttestors,
@@ -787,9 +806,14 @@ impl State {
             return Vec::new();
         };
 
-        let changed = route.attestors != update.attestors || route.threshold != update.threshold;
+        let domain_replaced =
+            route.vote_domain.is_some() && route.vote_domain != update.vote_domain;
+        let changed = route.attestors != update.attestors
+            || route.threshold != update.threshold
+            || route.vote_domain != update.vote_domain;
         route.attestors = update.attestors;
         route.threshold = update.threshold;
+        route.vote_domain = update.vote_domain;
         metrics.set_attestor_set_size(chain_key, route.attestors.len() as i64);
 
         if !changed {
@@ -803,6 +827,14 @@ impl State {
             "🔄 attestor set hot-reloaded"
         );
 
+        if domain_replaced {
+            warn!(
+                chain_key,
+                "vote domain changed; dropping votes recovered under the old one"
+            );
+            route.early_votes.clear();
+        }
+
         // Clone the (small) allowlist so we can iterate `by_message` mutably alongside it.
         let attestors = route.attestors.clone();
         let threshold = route.threshold;
@@ -814,7 +846,8 @@ impl State {
             // A set change can race a delivery already using the old bundle. Prune its stored
             // votes too, so a retry cannot keep resubmitting a removed signer's signature after
             // the update has already been consumed. The in-flight job owns its separate copy.
-            slot.signers.retain(|addr, _| attestors.contains(addr));
+            slot.signers
+                .retain(|addr, _| !domain_replaced && attestors.contains(addr));
             if slot.in_flight || slot.signers.len() < threshold {
                 continue;
             }
@@ -988,7 +1021,14 @@ impl RouteState {
             metrics.inc_vote(chain_key, VoteOutcome::Reject);
             return;
         }
-        let recovered = match recover_signer(&hash, &vote.signature) {
+        let Some(domain) = self.vote_domain else {
+            warn!(chain_key, %hash, %claimed_signer,
+                "early vote rejected: vote domain not resolved yet");
+            metrics.inc_vote(chain_key, VoteOutcome::Reject);
+            return;
+        };
+        let digest = domain.digest(hash);
+        let recovered = match recover_signer(&digest, &vote.signature) {
             Ok(addr) => addr,
             Err(err) => {
                 warn!(chain_key, %hash, %err, %claimed_signer,
@@ -1131,12 +1171,20 @@ mod tests {
     use crate::prom::NoopMetrics;
     use alloy::primitives::address;
 
+    /// EIP-712 domain every test route recovers votes under.
+    const TEST_DOMAIN: MessageVoteDomain = MessageVoteDomain {
+        chain_id: 11_155_111,
+        validator: address!("71a21ea8d28d3a0618d61d478ee20dcb64be8082"),
+        inbox: address!("5fbdb2315678afecb367f032d93f642f64180aa3"),
+    };
+
     fn route_for(chain_key: u64, attestors: Vec<Address>) -> RouteAttestors {
         let threshold = calculate_threshold(attestors.len());
         RouteAttestors {
             chain_key,
             attestors,
             threshold,
+            vote_domain: Some(TEST_DOMAIN),
         }
     }
 
@@ -1398,7 +1446,7 @@ mod tests {
         let hash = B256::from([0x07u8; 32]);
         state.note_indexed(indexed_for(2, hash), metrics.as_ref());
 
-        let canonical = canonical_sig(&signer, &hash);
+        let canonical = canonical_sig(&signer, &TEST_DOMAIN.digest(hash));
         let high_s = to_high_s(canonical);
         let mk = |sig: [u8; 65]| MessageVote {
             chain_key: 2,
@@ -1419,6 +1467,126 @@ mod tests {
         );
     }
 
+    /// CSUB-2126: a vote over the raw `messageId` (what pre-EIP-712 attestors sign) or over another
+    /// route's domain must not count — on either the indexed or the early-buffer path. It would
+    /// recover to some unrelated address here, and the destination validator would reject it too.
+    #[test]
+    fn votes_not_signed_over_this_routes_eip712_digest_are_rejected() {
+        let signer = test_signer(0x44);
+        let addr = signer.address();
+        let metrics = NoopMetrics::new();
+        let other_inbox = MessageVoteDomain {
+            inbox: address!("00000000000000000000000000000000000001b1"),
+            ..TEST_DOMAIN
+        };
+        let other_chain = MessageVoteDomain {
+            chain_id: TEST_DOMAIN.chain_id + 1,
+            ..TEST_DOMAIN
+        };
+        let other_validator = MessageVoteDomain {
+            validator: address!("00000000000000000000000000000000000000e2"),
+            ..TEST_DOMAIN
+        };
+
+        for indexed in [true, false] {
+            let mut state = State::new(vec![route_for(2, vec![addr])], VoteCacheConfig::default());
+            let hash = B256::from([0x61u8; 32]);
+            if indexed {
+                state.note_indexed(indexed_for(2, hash), metrics.as_ref());
+            }
+            let mk = |digest: B256| MessageVote {
+                chain_key: 2,
+                message_id: hash.0,
+                signer: addr.into_array(),
+                signature: canonical_sig(&signer, &digest),
+            };
+            for wrong in [
+                hash,
+                other_inbox.digest(hash),
+                other_chain.digest(hash),
+                other_validator.digest(hash),
+            ] {
+                assert!(state.note_vote(mk(wrong), metrics.as_ref()).is_none());
+            }
+            assert!(
+                state
+                    .query_bundle(&hash)
+                    .is_none_or(|b| b.signer_count == 0),
+                "indexed={indexed}: a wrong-digest vote must not be counted"
+            );
+            assert!(
+                state.by_route[&2].early_votes.is_empty(),
+                "indexed={indexed}: a wrong-digest vote must not be buffered"
+            );
+
+            // The same signer over the right digest is accepted (threshold 1).
+            let accepted = state.note_vote(mk(TEST_DOMAIN.digest(hash)), metrics.as_ref());
+            if indexed {
+                assert!(accepted.is_some(), "correct-digest vote must reach quorum");
+            } else {
+                assert!(state.by_route[&2].early_votes[&hash]
+                    .signers
+                    .contains_key(&addr));
+                let job = state.note_indexed(indexed_for(2, hash), metrics.as_ref());
+                assert!(
+                    job.is_some(),
+                    "buffered correct-digest vote must reach quorum"
+                );
+            }
+        }
+    }
+
+    /// The vote domain is resolved by the attestor-set watcher, not at startup. Until it arrives a
+    /// route rejects every vote, on both the indexed and the early-buffer path, even from an
+    /// allowlisted signer; once `apply_attestor_set` delivers set + domain, the same vote counts.
+    #[test]
+    fn votes_are_rejected_until_the_watcher_supplies_the_vote_domain() {
+        let signer = test_signer(0x45);
+        let addr = signer.address();
+        let metrics = NoopMetrics::new();
+
+        for indexed in [true, false] {
+            let no_domain = RouteAttestors {
+                vote_domain: None,
+                ..route_for(2, vec![addr])
+            };
+            let mut state = State::new(vec![no_domain], VoteCacheConfig::default());
+            let hash = B256::from([0x62u8; 32]);
+            if indexed {
+                state.note_indexed(indexed_for(2, hash), metrics.as_ref());
+            }
+
+            assert!(state
+                .note_vote(vote_for(2, hash, &signer, None), metrics.as_ref())
+                .is_none());
+            assert!(
+                state
+                    .query_bundle(&hash)
+                    .is_none_or(|b| b.signer_count == 0),
+                "indexed={indexed}: a vote must not count before the domain is known"
+            );
+            assert!(
+                state.by_route[&2].early_votes.is_empty(),
+                "indexed={indexed}: a vote must not be buffered before the domain is known"
+            );
+
+            state.apply_attestor_set(route_for(2, vec![addr]), metrics.as_ref());
+            let accepted = state.note_vote(vote_for(2, hash, &signer, None), metrics.as_ref());
+            if indexed {
+                assert!(
+                    accepted.is_some(),
+                    "vote must reach quorum once the domain is known"
+                );
+            } else {
+                let job = state.note_indexed(indexed_for(2, hash), metrics.as_ref());
+                assert!(
+                    job.is_some(),
+                    "buffered vote must reach quorum once indexed"
+                );
+            }
+        }
+    }
+
     // ---------------------------------------------------------------------------------------
     // Early-vote buffer. Attestors routinely gossip a vote before our own Outbox watcher has
     // indexed the message (they sign at import; we index at finality). Dropping those votes cost
@@ -1427,7 +1595,8 @@ mod tests {
     // from the common path.
     // ---------------------------------------------------------------------------------------
 
-    /// Build a vote as `signer` for `hash`, optionally claiming a different address.
+    /// Build a vote as `signer` for `hash` (signed over the route's EIP-712 digest, as attestors
+    /// do), optionally claiming a different address.
     fn vote_for(
         chain_key: u64,
         hash: B256,
@@ -1438,7 +1607,7 @@ mod tests {
             chain_key,
             message_id: hash.0,
             signer: claimed.unwrap_or_else(|| signer.address()).into_array(),
-            signature: canonical_sig(signer, &hash),
+            signature: canonical_sig(signer, &TEST_DOMAIN.digest(hash)),
         }
     }
 
@@ -1824,6 +1993,7 @@ mod tests {
                 chain_key: 2,
                 attestors: vec![a, b, c],
                 threshold: 3,
+                vote_domain: Some(TEST_DOMAIN),
             }],
             VoteCacheConfig::default(),
         );
@@ -1836,6 +2006,7 @@ mod tests {
                 chain_key: 2,
                 attestors: vec![a, b, c],
                 threshold: 2,
+                vote_domain: Some(TEST_DOMAIN),
             },
             NoopMetrics::new().as_ref(),
         );
@@ -1855,6 +2026,7 @@ mod tests {
                 chain_key: 2,
                 attestors: vec![a, b, c],
                 threshold: 3,
+                vote_domain: Some(TEST_DOMAIN),
             }],
             VoteCacheConfig::default(),
         );
@@ -1868,6 +2040,7 @@ mod tests {
                 chain_key: 2,
                 attestors: vec![a, c],
                 threshold: 2,
+                vote_domain: Some(TEST_DOMAIN),
             },
             NoopMetrics::new().as_ref(),
         );
@@ -1895,6 +2068,7 @@ mod tests {
                 chain_key: 2,
                 attestors: vec![a, b],
                 threshold: 2,
+                vote_domain: Some(TEST_DOMAIN),
             }],
             VoteCacheConfig::default(),
         );
@@ -1908,7 +2082,8 @@ mod tests {
                 RouteAttestors {
                     chain_key: 2,
                     attestors: vec![a, c],
-                    threshold: 2
+                    threshold: 2,
+                    vote_domain: Some(TEST_DOMAIN),
                 },
                 metrics.as_ref(),
             )
@@ -2033,6 +2208,7 @@ mod tests {
                 chain_key: 2,
                 attestors: vec![a],
                 threshold: 1,
+                vote_domain: Some(TEST_DOMAIN),
             }],
             VoteCacheConfig::default(),
         );
@@ -2041,6 +2217,7 @@ mod tests {
                 chain_key: 2,
                 attestors: vec![a],
                 threshold: 1,
+                vote_domain: Some(TEST_DOMAIN),
             },
             NoopMetrics::new().as_ref(),
         );

@@ -10,8 +10,9 @@
 //!    pushes [`IndexedMessage`]s into the pool's "chain-first allowlist".
 //!  * `p2p::run` (one shared swarm) — subscribes to `{chain_key}/message-votes/v1` topics,
 //!    decodes [`MessageVote`] envelopes, forwards to the pool.
-//!  * `pool::run` — applies PoC §6.2 validation rules and dispatches a [`DeliveryJob`] per
-//!    route once `2N/3 + 1` distinct signers have been observed.
+//!  * `pool::run` — applies PoC §6.2 validation rules (recovering each vote over the route's
+//!    EIP-712 digest, see [`vote_domain`]) and dispatches a [`DeliveryJob`] per route once
+//!    `2N/3 + 1` distinct signers have been observed.
 //!  * `delivery::run` (per route) — simulates, sends, classifies the outcome, retries.
 //!  * Plus `prom::build_router` + a hardware-stats updater.
 //!
@@ -55,11 +56,10 @@ pub mod receipt;
 pub mod revert;
 pub mod rpc;
 pub mod set_update;
+pub mod vote_domain;
 pub mod work;
 
-pub use config::{
-    AttestorSet, AttestorSource, ChainRoute, Config, DeliveryConfig, P2pConfig, VoteCacheConfig,
-};
+pub use config::{ChainRoute, Config, DeliveryConfig, P2pConfig, VoteCacheConfig};
 pub use delivery::DeliveryJob;
 pub use events::IndexedMessage;
 pub use p2p::MessageVote;
@@ -103,8 +103,7 @@ impl Server {
                 creditcoin_chain_id = route.creditcoin_chain_id,
                 inbox = %route.inbox_address,
                 destination_rpc = %redact_url_query(&route.destination_rpc_url),
-                attestor_set = ?attestor_set_summary(&route.attestor_set),
-                threshold_override = ?route.threshold_override,
+                attestor_validator = %route.vote_validator,
                 max_native_coin_value_wei = %route.max_native_coin_value_wei,
                 max_gas_limit = route.max_gas_limit,
                 auto_request_top_up = route.auto_request_top_up,
@@ -160,11 +159,11 @@ impl Server {
             .as_ref()
             .map(|path| Arc::new(work::WorkStore::for_checkpoint(path)));
 
-        // Resolve attestor sets up-front so the pool only sees concrete addresses.
-        let mut route_attestors: Vec<RouteAttestors> = Vec::with_capacity(self.config.routes.len());
-        for route in &self.config.routes {
-            route_attestors.push(resolve_attestors(route)?);
-        }
+        // Seed each route empty. The attestor-set watcher resolves the set, threshold and EIP-712
+        // message-vote domain from the destination; no destination read happens at startup, so
+        // the relayer starts (and keeps journaling) while a destination RPC is down.
+        let pool_routes: Vec<RouteAttestors> =
+            self.config.routes.iter().map(initial_attestors).collect();
 
         // Channels.
         let (indexed_tx, indexed_rx) = mpsc::channel::<IndexedMessage>(INDEXED_CHANNEL_CAP);
@@ -213,7 +212,7 @@ impl Server {
             &mut tasks,
             "vote pool",
             pool::run(
-                route_attestors,
+                pool_routes,
                 self.config.vote_cache.clone(),
                 pool::PoolHandles {
                     indexed_rx,
@@ -310,16 +309,9 @@ impl Server {
             );
         }
 
-        // On-chain attestor-set watchers (per route, only for `OnChain` sets). Each polls the
-        // destination validator's attestors()/threshold() and hot-reloads the pool on change. Static
-        // routes get no watcher (the set never changes), so we don't spawn a task that would exit
-        // immediately and trip the supervisor's "a worker exited" teardown.
-        for route in self
-            .config
-            .routes
-            .iter()
-            .filter(|r| matches!(r.attestor_set, AttestorSet::OnChain { .. }))
-        {
+        // On-chain attestor-set watchers, one per route. Each polls the destination validator's
+        // attestors()/threshold() and hot-reloads the pool on change.
+        for route in &self.config.routes {
             spawn_worker(
                 &mut tasks,
                 format!("attestor-set watcher (chain_key {})", route.chain_key),
@@ -331,13 +323,12 @@ impl Server {
                 ),
             );
         }
-        // Drop the parent set_tx so the pool's set-update branch closes once every watcher exits
-        // (and stays inert when there are no on-chain routes at all).
+        // Drop the parent set_tx so the pool's set-update branch closes once every watcher exits.
         drop(set_tx);
 
         // Attestor-set-update aggregator+submitter (P2-8): consumes SetUpdateVotes gossiped by
         // attestors and submits `submitAttestorSetUpdate` on the destination validator. Idle unless
-        // a route sources its set on-chain (`AttestorSet::OnChain { Evm }`) with a signer_key.
+        // a route has a signer_key.
         spawn_worker(
             &mut tasks,
             "attestor-set-update aggregator",
@@ -480,44 +471,16 @@ fn spawn_worker(
     });
 }
 
-/// Convert an [`AttestorSet`] into the concrete [`RouteAttestors`] the pool expects. Static sets
-/// translate directly; on-chain sets are not implemented in PoC and yield an explanatory error.
-fn resolve_attestors(route: &ChainRoute) -> Result<RouteAttestors> {
-    match &route.attestor_set {
-        AttestorSet::Static(addrs) => {
-            let attestors = addrs.clone();
-            let n = attestors.len();
-            let threshold = route
-                .threshold_override
-                .map(|t| t as usize)
-                .unwrap_or_else(|| calculate_threshold(n));
-            // The pool enforces THIS threshold locally; the destination `EOAValidator` enforces its
-            // own `threshold()`. For a static route the two are configured independently, so a
-            // mismatch is silent until delivery — too high assembles bundles the Inbox rejects, too
-            // low wastes delivery attempts. (On-chain routes avoid this by reading `threshold()`
-            // live; see `attestor_set::run`.) Surface the value so an operator can confirm parity
-            // with the deployed validator.
-            warn!(
-                chain_key = route.chain_key,
-                attestors = n,
-                threshold,
-                threshold_override = ?route.threshold_override,
-                "static attestor-set route — this threshold MUST equal the on-chain EOAValidator.threshold(); verify they match or delivery will revert"
-            );
-            Ok(RouteAttestors {
-                chain_key: route.chain_key,
-                attestors,
-                threshold,
-            })
-        }
-        // On-chain sets are resolved live by the per-route attestor-set watcher (see
-        // [`attestor_set::run`]). Start empty with an unreachable threshold so the pool accepts
-        // nothing until the first on-chain read arrives — votes meanwhile are simply re-gossiped.
-        AttestorSet::OnChain { .. } => Ok(RouteAttestors {
-            chain_key: route.chain_key,
-            attestors: Vec::new(),
-            threshold: usize::MAX,
-        }),
+/// The initial [`RouteAttestors`] for a route. The set and vote domain are resolved live by the
+/// per-route attestor-set watcher (see [`attestor_set::run`]), so start empty with an unreachable
+/// threshold and no domain: the pool accepts nothing until the first successful read arrives
+/// (votes meanwhile are simply re-gossiped).
+fn initial_attestors(route: &ChainRoute) -> RouteAttestors {
+    RouteAttestors {
+        chain_key: route.chain_key,
+        attestors: Vec::new(),
+        threshold: usize::MAX,
+        vote_domain: None,
     }
 }
 
@@ -526,16 +489,6 @@ fn redact_url_query(url: &str) -> String {
     url.split_once('?')
         .map(|(base, _)| format!("{base}?…"))
         .unwrap_or_else(|| url.to_string())
-}
-
-fn attestor_set_summary(set: &AttestorSet) -> String {
-    match set {
-        AttestorSet::Static(addresses) => format!("static({} addresses)", addresses.len()),
-        AttestorSet::OnChain { source } => match source {
-            AttestorSource::Evm { address } => format!("evm_contract({address})"),
-            AttestorSource::Cc3 { chain_key } => format!("cc3_active_set(chain_key={chain_key})"),
-        },
-    }
 }
 
 /// Resolve a Ctrl+C or SIGTERM and return.

@@ -112,7 +112,7 @@ pub enum EventLabelKind {
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
 pub enum EventOutcome {
-    /// Well-formed frame streamed to subscribers (independent of `signature_valid`).
+    /// Well-formed frame streamed to subscribers (signatures are not checked by the observer).
     Accepted,
     /// Undecodable / topic-mismatched frame, Rejected to gossipsub.
     Rejected,

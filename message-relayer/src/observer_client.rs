@@ -5,11 +5,16 @@
 //! events from the observer's `/ws` subscription, and the pool's reobservation requests go out as
 //! `publish_reobservation` frames (the observer must run with `allow_publish: true`).
 //!
-//! **Trust model:** the observer is untrusted infrastructure. Its `signature_valid` annotation is
-//! deliberately ignored — every vote is reconstructed into the wire [`MessageVote`] envelope and
-//! flows through the pool's own ecrecover + allowlist validation, exactly as gossip-delivered
-//! votes do. A lying observer can withhold votes (a liveness problem, mitigated by running your own)
-//! but cannot forge one.
+//! **Trust model:** the observer is untrusted infrastructure. It streams votes raw (it cannot
+//! rebuild the destination-bound EIP-712 digest votes sign), and any `signature_valid` field an
+//! older observer still sends is ignored — every vote is reconstructed into the wire
+//! [`MessageVote`] envelope and flows through the pool's own ecrecover + allowlist validation,
+//! exactly as gossip-delivered votes do. A lying observer can withhold votes (a liveness problem,
+//! mitigated by running your own) but cannot forge one.
+//!
+//! An observer built before CSUB-2126 replaced `signer` with the address it recovered over the raw
+//! `messageId`, which is wrong for every EIP-712 vote; the pool then rejects them all as outside
+//! the allowlist. Upgrade the observer together with the relayer.
 //!
 //! **Liveness:** heartbeats into [`Health`] fire only on *successful* activity (connect, inbound
 //! frames, pongs) — never on reconnect attempts. A dead/unreachable observer therefore trips `/health`
@@ -202,7 +207,7 @@ struct ObserverVote {
     signer: String,
     signature: String,
     // `message_hash` (equal to `message_id` since asc-contracts #54 — see the observer's event docs)
-    // and `signature_valid` are deliberately not read — the pool re-validates (module docs).
+    // and a legacy `signature_valid` are deliberately not read — the pool re-validates (module docs).
 }
 
 #[derive(Debug, Deserialize)]
@@ -293,7 +298,8 @@ fn handle_event(
 }
 
 /// Reconstruct the wire envelope from an observer event. The pool re-validates from these raw fields
-/// (ecrecover over `message_id`, signer allowlist), so nothing here trusts the observer.
+/// (ecrecover over the route's EIP-712 digest of `message_id`, signer allowlist), so nothing here
+/// trusts the observer.
 fn convert_vote(vote: ObserverVote) -> Result<MessageVote> {
     Ok(MessageVote {
         chain_key: vote.chain_key,
@@ -339,7 +345,8 @@ mod tests {
     use super::*;
 
     /// An observer `message_vote` frame (as `observer-node` serializes it) reconstructs the exact wire
-    /// envelope. Field formats pinned by the observer's own event tests.
+    /// envelope. Field formats pinned by the observer's own event tests. The frame carries the
+    /// legacy `signature_valid` field older observers send, to pin that it is tolerated and ignored.
     #[test]
     fn converts_observer_vote_event_to_wire_envelope() {
         let json = format!(

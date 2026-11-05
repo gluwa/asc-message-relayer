@@ -20,6 +20,13 @@ use message_relayer::pool::{run as run_pool, PoolHandles, RouteAttestors};
 use message_relayer::prom::NoopMetrics;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use write_ability::hash::MessageVoteDomain;
+
+const DOMAIN: MessageVoteDomain = MessageVoteDomain {
+    chain_id: 11_155_111,
+    validator: address!("71a21ea8d28d3a0618d61d478ee20dcb64be8082"),
+    inbox: address!("5fbdb2315678afecb367f032d93f642f64180aa3"),
+};
 
 #[tokio::test]
 async fn pool_drops_unknown_messages_and_emits_no_jobs() {
@@ -32,6 +39,7 @@ async fn pool_drops_unknown_messages_and_emits_no_jobs() {
         chain_key: 2,
         attestors: vec![address!("000000000000000000000000000000000000000a")],
         threshold: 1,
+        vote_domain: Some(DOMAIN),
     };
 
     let mut delivery_txs = HashMap::new();
@@ -102,6 +110,7 @@ async fn pool_drops_votes_from_unknown_signers() {
         chain_key: 2,
         attestors: vec![allowed],
         threshold: 1,
+        vote_domain: Some(DOMAIN),
     };
     let mut delivery_txs = HashMap::new();
     delivery_txs.insert(2u64, delivery_tx);

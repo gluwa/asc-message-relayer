@@ -1,16 +1,17 @@
-//! The observer's libp2p task: join the attestor mesh, observe, annotate, fan out.
+//! The observer's libp2p task: join the attestor mesh, observe, fan out.
 //!
 //! Reuses the relayer's [`RelayerBehavior`] (gossipsub Strict + `validate_messages`, kad,
 //! identify, ping, mdns toggle, connection limits) and the shared `write-ability` topic ids, so
 //! the observer is wire-identical to the relayer's observer half — one mesh, one stack.
 //!
 //! Gossipsub citizenship for a non-validator (spec §3): a decodable vote whose envelope
-//! `chain_key` matches its topic is **Accept**ed and streamed — including votes whose signature
-//! does *not* recover to the advertised signer. Signature validity is an **annotation**
-//! (`signature_valid`), not a gate: the observer has no active-set view, the mesh's real validators
-//! (attestors, relayer pool) enforce membership and reject forgeries themselves, and an observer
-//! that Rejected on local crypto judgment would P4-penalize peers for traffic the validators may
-//! accept. Only provably malformed frames (undecodable, topic/envelope mismatch) are Rejected.
+//! `chain_key` matches its topic is **Accept**ed and streamed raw. The observer does not recover
+//! signers: message votes sign an EIP-712 digest bound to the destination chain id, validator and
+//! Inbox (CSUB-2126), and the observer has no destination-chain view to rebuild it — the same
+//! reason set-update votes were always streamed raw. The mesh's real validators (attestors, relayer
+//! pool) recover, enforce membership and reject forgeries themselves, and an observer that Rejected
+//! on local crypto judgment would P4-penalize peers for traffic the validators may accept. Only
+//! provably malformed frames (undecodable, topic/envelope mismatch) are Rejected.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -367,7 +368,7 @@ fn handle_swarm_event(
     }
 }
 
-/// Decode + annotate one message-vote frame. Returns the gossipsub acceptance (module docs).
+/// Decode one message-vote frame and stream it raw. Returns the gossipsub acceptance (module docs).
 fn observe_vote(
     chain_key: u64,
     data: &[u8],
@@ -394,21 +395,12 @@ fn observe_vote(
         }
     };
 
-    // Annotate, don't gate: recovery failure streams as `signature_valid: false` (module docs).
-    let advertised = alloy::primitives::Address::from(vote.signer);
-    let (signer, signature_valid) = match recover_signer(
-        &alloy::primitives::B256::from(vote.message_id),
-        &vote.signature,
-    ) {
-        Ok(recovered) => (recovered, recovered == advertised),
-        Err(_) => (advertised, false),
-    };
-
+    // Stream raw: the signed digest is destination-bound, so the observer cannot recover the
+    // signer (module docs). Consumers recover it themselves.
     hub.publish(ObserverEvent::message_vote(
         chain_key,
         vote.message_id,
-        signer,
-        signature_valid,
+        alloy::primitives::Address::from(vote.signer),
         &vote.signature,
         source,
     ));
@@ -499,17 +491,6 @@ fn observe_set_update(
     }
 }
 
-fn recover_signer(
-    hash: &alloy::primitives::B256,
-    raw: &[u8; 65],
-) -> Result<alloy::primitives::Address> {
-    let sig: alloy::primitives::Signature = raw[..]
-        .try_into()
-        .map_err(|e| anyhow::anyhow!("malformed signature bytes: {e}"))?;
-    sig.recover_address_from_prehash(hash)
-        .map_err(|e| anyhow::anyhow!("ecrecover failed: {e}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,67 +549,18 @@ mod tests {
         assert!(note_disconnected(&mut peers, &leaving).is_empty());
     }
 
-    /// Sign a vote with a real key and run it through `observe_vote`: it must Accept, stream one
-    /// event, and annotate `signature_valid: true` with the recovered signer.
+    /// A decodable vote Accepts and streams raw: the advertised signer and the signature bytes,
+    /// untouched. The observer must not "recover" a signer — the vote signs a destination-bound
+    /// EIP-712 digest it cannot rebuild, so any address it recovered would be wrong — and even a
+    /// signature that verifies nothing streams (the mesh's validators judge, not the observer).
     #[tokio::test]
-    async fn observe_vote_streams_annotated_event() {
-        use alloy::signers::local::PrivateKeySigner;
-        use alloy::signers::SignerSync;
-
-        let signer = PrivateKeySigner::random();
-        let hash = alloy::primitives::B256::repeat_byte(0xAB);
-        let sig = signer.sign_hash_sync(&hash).unwrap();
-        let mut raw = [0u8; 65];
-        raw.copy_from_slice(&sig.as_bytes());
-
+    async fn observe_vote_streams_raw_event() {
+        let advertised = alloy::primitives::Address::repeat_byte(0x66);
         let vote = MessageVote {
             chain_key: 102,
-            message_id: hash.0,
-            signer: signer.address().into_array(),
-            signature: raw,
-        };
-
-        let hub = Hub::new();
-        let mut rx = hub.subscribe();
-        let metrics = ObserverMetrics::new();
-        let acceptance = observe_vote(
-            102,
-            &vote.encode_bytes(),
-            &libp2p::PeerId::random(),
-            &hub,
-            &metrics,
-        );
-        assert!(matches!(acceptance, MessageAcceptance::Accept));
-
-        let event = rx.recv().await.unwrap();
-        let json = serde_json::to_value(&*event).unwrap();
-        assert_eq!(json["type"], "message_vote");
-        assert_eq!(json["signature_valid"], true);
-        assert_eq!(
-            json["signer"].as_str().unwrap().to_lowercase(),
-            format!("{:?}", signer.address()).to_lowercase()
-        );
-    }
-
-    /// A forged signer field must still stream (Accept) but be annotated invalid — the observer
-    /// observes, the mesh's validators judge.
-    #[tokio::test]
-    async fn forged_signer_streams_with_signature_valid_false() {
-        use alloy::signers::local::PrivateKeySigner;
-        use alloy::signers::SignerSync;
-
-        let real = PrivateKeySigner::random();
-        let hash = alloy::primitives::B256::repeat_byte(0xCD);
-        let sig = real.sign_hash_sync(&hash).unwrap();
-        let mut raw = [0u8; 65];
-        raw.copy_from_slice(&sig.as_bytes());
-
-        let impostor = alloy::primitives::Address::repeat_byte(0x66);
-        let vote = MessageVote {
-            chain_key: 102,
-            message_id: hash.0,
-            signer: impostor.into_array(),
-            signature: raw,
+            message_id: [0xAB; 32],
+            signer: advertised.into_array(),
+            signature: [0x03; 65],
         };
 
         let hub = Hub::new();
@@ -644,7 +576,11 @@ mod tests {
         assert!(matches!(acceptance, MessageAcceptance::Accept));
 
         let json = serde_json::to_value(&*rx.recv().await.unwrap()).unwrap();
-        assert_eq!(json["signature_valid"], false);
+        assert_eq!(json["type"], "message_vote");
+        assert_eq!(json["message_id"], format!("0x{}", "ab".repeat(32)));
+        assert_eq!(json["signer"], format!("0x{}", "66".repeat(20)));
+        assert_eq!(json["signature"], format!("0x{}", "03".repeat(65)));
+        assert!(json.get("signature_valid").is_none());
     }
 
     #[test]
