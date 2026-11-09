@@ -1,17 +1,79 @@
-//! Attestor-set-update digest builder.
+//! Signing digests shared by the attestor (signer), the relayer (pre-aggregation recovery) and
+//! the destination `EOAValidator` (on-chain recovery).
 //!
-//! Prior to asc-contracts #54, this module also built the vote digest attestors signed over each
-//! `MessagePublished` (a six-field `messageHash` binding messageId/emitter/outbox/chain-keys/
-//! payload, mirrored 1:1 with creditcoin3's `common/write-ability`). #54 replaced that with a
-//! direct check inside `Inbox.deliverMessage`: `messageId == keccak256(abi.encode(outbox, emitter,
-//! sequence, keccak256(payload), sourceChainId))` (`OutboxTypes.computeMessageId`), and
-//! `validateVotes` now takes `messageId` itself as the signed digest. `messageId` is already an
-//! indexed field on `MessagePublished`, so there is nothing left to derive here — the relayer
-//! reads it straight off the event/gossiped vote when assembling `deliverMessage` calldata.
+//! * [`MessageVoteDomain::digest`] is the EIP-712 digest every message vote signs (CSUB-2126).
+//!   Before it, attestors signed the raw `messageId`, which bound a vote to the source publication
+//!   (`OutboxTypes.computeMessageId`) but not to the destination chain, validator or Inbox. The
+//!   typed digest adds that binding, and a type hash that keeps message votes apart from the other
+//!   raw 32-byte hashes the same attestor key signs (set updates, EVM-address registration).
+//!   Mirrored 1:1 from creditcoin3's `common/write-ability`.
+//! * [`attestor_set_update_digest`] is the raw set-update preimage `submitAttestorSetUpdate`
+//!   recomputes.
+//!
+//! Golden vectors for the message-vote digest live in `vectors/message_vote_eip712.json`, a
+//! byte-identical copy of the creditcoin3 file; the asc-contracts Foundry suite asserts the same
+//! vectors.
+
+use std::borrow::Cow;
 
 use alloy::primitives::{Address, B256, U256};
-use alloy::sol_types::SolValue;
+use alloy::sol_types::{Eip712Domain, SolStruct, SolValue};
 use sha3::{Digest, Keccak256};
+
+/// EIP-712 domain `name` of the destination `EOAValidator`. Must equal the `EIP712(name, version)`
+/// constructor arguments on-chain, otherwise every vote recovers to a different address.
+pub const MESSAGE_VOTE_DOMAIN_NAME: &str = "ASC EOAValidator";
+/// EIP-712 domain `version` of the destination `EOAValidator`.
+pub const MESSAGE_VOTE_DOMAIN_VERSION: &str = "1";
+
+mod typed {
+    alloy::sol! {
+        /// `MessageVote(bytes32 messageId,address inbox)`. `inbox` is the destination Inbox that
+        /// calls `validateVotes`; the validator fills it from `msg.sender`, so a vote bundle cannot
+        /// be replayed into a second Inbox that happens to accept the same Outbox.
+        struct MessageVote {
+            bytes32 messageId;
+            address inbox;
+        }
+    }
+}
+
+/// Everything a message vote is bound to besides the `messageId` itself: the destination chain,
+/// the `EOAValidator` that verifies it (EIP-712 `verifyingContract`) and the Inbox that asks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MessageVoteDomain {
+    /// Destination chain `block.chainid`.
+    pub chain_id: u64,
+    /// Destination `EOAValidator` address (EIP-712 `verifyingContract`).
+    pub validator: Address,
+    /// Destination Inbox that calls `validateVotes` (the `inbox` struct field).
+    pub inbox: Address,
+}
+
+impl MessageVoteDomain {
+    /// The EIP-712 domain, as OZ `EIP712("ASC EOAValidator", "1")` builds it on the validator.
+    #[must_use]
+    pub fn eip712_domain(&self) -> Eip712Domain {
+        Eip712Domain::new(
+            Some(Cow::Borrowed(MESSAGE_VOTE_DOMAIN_NAME)),
+            Some(Cow::Borrowed(MESSAGE_VOTE_DOMAIN_VERSION)),
+            Some(U256::from(self.chain_id)),
+            Some(self.validator),
+            None,
+        )
+    }
+
+    /// The digest an attestor signs (raw, no EIP-191 prefix) for `message_id`, and that the
+    /// validator recovers against: `keccak256(0x1901 ‖ domainSeparator ‖ hashStruct(MessageVote))`.
+    #[must_use]
+    pub fn digest(&self, message_id: B256) -> B256 {
+        typed::MessageVote {
+            messageId: message_id,
+            inbox: self.inbox,
+        }
+        .eip712_signing_hash(&self.eip712_domain())
+    }
+}
 
 /// Compute the attestor-set-update digest exactly as the `EOAValidator` recomputes it:
 /// `keccak256(abi.encode(address(this), newAttestors, chainId, nonce))`.
@@ -53,6 +115,121 @@ pub fn canonical_attestor_order(addrs: &[Address]) -> Vec<Address> {
 mod tests {
     use super::*;
     use alloy::primitives::address;
+
+    /// One entry of `vectors/message_vote_eip712.json`.
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Vector {
+        chain_id: u64,
+        validator: Address,
+        inbox: Address,
+        message_id: B256,
+        digest: B256,
+    }
+
+    fn vectors() -> Vec<Vector> {
+        serde_json::from_str(include_str!("../vectors/message_vote_eip712.json"))
+            .expect("vectors file is valid JSON")
+    }
+
+    /// The pinned vectors are the cross-repo contract: creditcoin3 (attestor) and the asc-contracts
+    /// Foundry suite assert the same file, so all three sides agree on every byte of the digest.
+    #[test]
+    fn message_vote_digest_matches_shared_vectors() {
+        let vectors = vectors();
+        assert!(!vectors.is_empty());
+        for v in vectors {
+            let domain = MessageVoteDomain {
+                chain_id: v.chain_id,
+                validator: v.validator,
+                inbox: v.inbox,
+            };
+            assert_eq!(
+                domain.digest(v.message_id),
+                v.digest,
+                "chain {}",
+                v.chain_id
+            );
+        }
+    }
+
+    /// Recompute the digest by hand from the EIP-712 spec, independent of alloy's `sol!` derive,
+    /// so a wrong type string or field order cannot hide behind the same library on both sides.
+    #[test]
+    fn message_vote_digest_matches_hand_built_eip712() {
+        use alloy::primitives::keccak256;
+
+        let domain = MessageVoteDomain {
+            chain_id: 11_155_111,
+            validator: address!("71a21ea8d28d3a0618d61d478ee20dcb64be8082"),
+            inbox: address!("00000000000000000000000000000000000001b0"),
+        };
+        let message_id = B256::repeat_byte(0x11);
+
+        let domain_typehash = keccak256(
+            "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+        );
+        let separator = keccak256(
+            (
+                domain_typehash,
+                keccak256(MESSAGE_VOTE_DOMAIN_NAME),
+                keccak256(MESSAGE_VOTE_DOMAIN_VERSION),
+                U256::from(domain.chain_id),
+                domain.validator,
+            )
+                .abi_encode(),
+        );
+        let struct_hash = keccak256(
+            (
+                keccak256("MessageVote(bytes32 messageId,address inbox)"),
+                message_id,
+                domain.inbox,
+            )
+                .abi_encode(),
+        );
+        let mut preimage = vec![0x19, 0x01];
+        preimage.extend_from_slice(separator.as_slice());
+        preimage.extend_from_slice(struct_hash.as_slice());
+
+        assert_eq!(domain.digest(message_id), keccak256(&preimage));
+    }
+
+    #[test]
+    fn message_vote_digest_binds_every_domain_field() {
+        let base = MessageVoteDomain {
+            chain_id: 42,
+            validator: address!("00000000000000000000000000000000000000e1"),
+            inbox: address!("00000000000000000000000000000000000001b0"),
+        };
+        let id = B256::repeat_byte(0x22);
+        let d = base.digest(id);
+        assert_ne!(d, id, "must not sign the raw messageId any more");
+        assert_ne!(
+            d,
+            MessageVoteDomain {
+                chain_id: 43,
+                ..base
+            }
+            .digest(id)
+        );
+        assert_ne!(
+            d,
+            MessageVoteDomain {
+                validator: address!("00000000000000000000000000000000000000e2"),
+                ..base
+            }
+            .digest(id)
+        );
+        assert_ne!(
+            d,
+            MessageVoteDomain {
+                inbox: address!("00000000000000000000000000000000000001b1"),
+                ..base
+            }
+            .digest(id)
+        );
+        assert_ne!(d, base.digest(B256::repeat_byte(0x23)));
+    }
 
     #[test]
     fn set_update_digest_deterministic_and_binds_validator_nonce_chain_order() {

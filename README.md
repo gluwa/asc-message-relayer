@@ -17,7 +17,7 @@ the message up), but cannot forge.
   └────────────┬────────────┘                             └──────────────│────────────────────┘
                │  eth_getLogs                                            │ deliverMessage(votes)
                ▼                                                         │ (EOAValidator checks
-  attestors (N) ── observe, ECDSA-sign messageId ──┐                   │  2N/3+1 signatures)
+  attestors (N) ── observe, EIP-712-sign messageId ┐                   │  2N/3+1 signatures)
                │                                     │                   │
                │        libp2p gossipsub             ▼                   │
                └──────► {chain_key}/message-votes/v1 ──► RELAYER: pool ──┘
@@ -36,11 +36,12 @@ the message up), but cannot forge.
    authorizes each emitting Outbox against historical governance state, and persists the full
    message before advancing its cursor. This establishes the chain-first allowlist: votes for a
    message ID not indexed from an authorized publication are not counted.
-3. **Vote** — attestors independently authorize the source publication and sign the raw 32-byte
-   `messageId` with their EVM secp256k1 keys, without an EIP-191 prefix. Votes travel over
-   `{chain_key}/message-votes/v1`.
-4. **Aggregate** — the pool validates each vote (decode, recover signer, check current attestor
-   membership, deduplicate). At `⌊2N/3⌋+1` distinct signers, it dispatches a `DeliveryJob`.
+3. **Vote** — attestors independently authorize the source publication and sign the EIP-712
+   digest of `messageId` (see [below](#message-id-and-signed-digest)) with their EVM secp256k1
+   keys. Votes travel over `{chain_key}/message-votes/v1`.
+4. **Aggregate** — the pool validates each vote (decode, recover the signer over the route's
+   EIP-712 digest, check current attestor membership, deduplicate). Votes are keyed by
+   `messageId`. At `⌊2N/3⌋+1` distinct signers, it dispatches a `DeliveryJob`.
 5. **Deliver and recover execution** — the delivery worker sends
    `Inbox.deliverMessage(messageId, outbox, emitter, sequence, payload, votes)` after preflighting
    the exact transaction gas limit. Optional early simulation provides an additional check.
@@ -67,11 +68,34 @@ messageId = keccak256(abi.encode(outbox, emitter, sequence, keccak256(payload), 
 ```
 
 Here `outbox` and `emitter` are addresses, `sequence` is `uint64`, and `sourceChainId` is the
-Creditcoin EVM chain ID encoded as `uint256`. Attestors sign `messageId` directly; there is no
-second message hash or signing prefix. The destination chain key scopes the route, Outbox,
-validator, and gossip topic rather than adding another field to this digest. Shared wire and
-ABI bindings live in [`write-ability`](write-ability/); both attestor and relayer must agree on
-these formats.
+Creditcoin EVM chain ID encoded as `uint256`.
+
+Attestors do not sign `messageId` itself (CSUB-2126). They sign the standard EIP-712 digest, raw
+with no EIP-191 prefix, which binds the vote to one destination chain, validator and Inbox:
+
+```text
+domain  = EIP712Domain(name "ASC EOAValidator", version "1",
+                       chainId = destination chain id,
+                       verifyingContract = destination EOAValidator)          # no salt
+struct  = MessageVote(bytes32 messageId, address inbox)                      # inbox = destination Inbox
+digest  = keccak256(0x1901 ‖ domainSeparator ‖ hashStruct(MessageVote))
+```
+
+Signatures stay 65-byte `(r, s, v)` with EIP-2 canonical checks (`v` ∈ {27, 28}, low `s`); the
+attestor-set-update digest is unchanged. Per route, the domain takes the validator from
+`attestor_set.address`, the Inbox from `inbox_address` and the chain id from the destination RPC
+(`eth_chainId`). The attestor-set watcher reads the chain id and the validator's ERC-5267
+`eip712Domain()` on every poll, alongside `attestors()` / `threshold()`, and requires name,
+version, chain id and verifying contract to match. Nothing is read from the destination at
+startup, so the relayer starts and keeps journaling while a destination RPC is down; the route
+just accepts no votes until the watcher's first fully successful poll. A pre-EIP-712 validator
+has no `eip712Domain()`, so a route pointed at one never accepts a vote: the watcher logs an
+error naming the route and `/health` reports `attestor-set:<chain_key>` as degraded, instead of
+the relayer assembling bundles that would revert.
+
+Shared wire and ABI bindings, and the digest with its golden vectors
+(`write-ability/vectors/message_vote_eip712.json`), live in [`write-ability`](write-ability/);
+attestor, relayer and `EOAValidator` must agree on these formats byte-for-byte.
 
 ## Worker inventory
 
@@ -87,7 +111,7 @@ Workers communicate over `mpsc` channels only — the pool owns all aggregation 
 | Delivery worker (per route) | `src/delivery/` | Preflight delivery/retries, reconcile confirmed execution, retain retryable work |
 | Ack submitter (per route, opt-in) | `src/ack/` | Execution/acceptance logs → proof-gen → original-Outbox acknowledgment + independent fee claim |
 | Claim submitter (per route, opt-in) | `src/claim/` | bridge `Locked` → proof-gen → `CcBridge.claim` on Creditcoin ("relayer on both sides": users only send the lock tx) |
-| Attestor-set watcher (per on-chain route) | `src/attestor_set.rs` | Poll `EOAValidator.attestors()/threshold()` every 30 s, hot-reload the pool |
+| Attestor-set watcher (per route) | `src/attestor_set.rs` | Poll `EOAValidator.attestors()/threshold()` every 30 s, hot-reload the pool |
 | HTTP + metrics | `src/prom/` | `/health`, `/metrics`, `/votes/{message_hash}` |
 
 ## Liveness & failure semantics
@@ -196,7 +220,7 @@ and repeated failures escalate in logs and metrics:
 | `p2p.identity` | — | stability only | ed25519 seed/mnemonic for a stable PeerId; ephemeral if unset |
 
 Vote validation is defense-in-depth: chain-first allowlist (must be indexed from the Outbox) →
-signature recovery → signer must be in the attestor set → per-signer dedup → threshold. A false
+signature recovery over the route's EIP-712 digest → signer must be in the attestor set → per-signer dedup → threshold. A false
 quorum requires compromising `⌊2N/3⌋+1` attestor keys; the relayer adds no trusted party.
 
 ## Configuration
@@ -218,7 +242,7 @@ message-relayer --single-route \
   --inbox-address 0x… \
   --destination-rpc-url http://localhost:8545 \
   --signer-key 0x… \
-  --attestor-set 0xA…,0xB…,0xC…
+  --validator-address 0x…   # destination EOAValidator: attestor-set source + EIP-712 verifyingContract
 ```
 
 Every flag has a `RELAYER_*` env twin (`--help` lists them); `.env` is loaded via dotenvy.
@@ -338,6 +362,7 @@ message-relayer/         the relayer crate
   src/delivery/          deliverMessage submission + outcome classification + votes calldata
   src/ack/               acknowledgment submitter (proof-gen client, pending queue, backoff)
   src/attestor_set.rs    on-chain attestor-set hot-reload watcher
+  src/vote_domain.rs     per-route EIP-712 vote domain (eth_chainId + eip712Domain() check)
   src/revert.rs          node-agnostic revert classification (selector extraction)
   src/checkpoint.rs      persisted block cursors
   src/prom/              metrics registry + HTTP router
@@ -349,8 +374,6 @@ Dockerfile               two-stage image build
 
 ## Known gaps
 
-- **`cc3_active_set` attestor source is unimplemented** — use `evm_contract` (hot-reloaded) or
-  `static`.
 - **Generic intent target** — the claim submitter currently targets the bridge PoC's
   `CcBridge.claim`; when the reviewed `IUSCBridgeInbound.bridgeFromIntent` contracts deploy, the
   swap is an ABI + config change confined to `src/claim/` (identical proof arguments).

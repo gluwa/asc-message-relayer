@@ -1,11 +1,10 @@
 //! The observer's outward-facing event schema (JSON over WebSocket) and subscription filters.
 //!
-//! Deliberately dumb, like Wormhole's Observer: events are *verified observations* (decoded envelope
-//! plus ECDSA recovery), never aggregation or quorum judgment. Consumers count signers themselves.
-//! `signature_valid` asserts only that the signature recovers to `signer` over `message_id` (also
-//! the vote's `message_hash` field, kept for wire compatibility — see that field's doc);
-//! active-set membership is the consumer's problem (checking it would give the observer a chain-RPC
-//! dependency, and the mesh's real validators enforce it anyway).
+//! Deliberately dumb, like Wormhole's Observer: events are *decoded observations*, never signature
+//! verification, aggregation or quorum judgment. Votes sign digests bound to destination-chain
+//! state (message votes: an EIP-712 digest over the destination chain id, validator and Inbox;
+//! set updates: the validator's nonce), which the observer has no connection to, so consumers
+//! recover signers, check active-set membership and count quorum themselves.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -25,19 +24,16 @@ pub enum ObserverEvent {
     /// An attestor's ECDSA vote for a published message, seen on `{chain_key}/message-votes/v1`.
     MessageVote {
         chain_key: u64,
-        /// `0x`-prefixed 32-byte hex — also the digest the signature covers (raw, no EIP-191)
-        /// since asc-contracts #54.
+        /// `0x`-prefixed 32-byte hex. The signature covers the route's EIP-712 digest of it
+        /// (`write_ability::hash::MessageVoteDomain::digest`), not this value itself.
         message_id: String,
         /// Equal to `message_id` — kept as a separate field for wire compatibility with existing
         /// consumers of this API; asc-contracts #54 removed the distinct six-field hash this used
-        /// to carry (`Inbox.validateVotes` now takes `messageId` itself as the signed digest).
+        /// to carry.
         message_hash: String,
-        /// Recovered signer when recovery succeeds; the envelope's advertised signer (with
-        /// `signature_valid: false`) when it does not.
+        /// `0x`-prefixed 20-byte hex — the envelope's advertised signer, unverified.
         signer: String,
-        /// Whether the 65-byte signature recovers to `signer` over `message_id`.
-        signature_valid: bool,
-        /// `0x`-prefixed 65-byte hex — carried so consumers can re-verify independently.
+        /// `0x`-prefixed 65-byte hex — carried so consumers can recover + verify independently.
         signature: String,
         /// The gossipsub peer we received the frame from (propagation source, not necessarily
         /// the original publisher).
@@ -55,10 +51,9 @@ pub enum ObserverEvent {
         received_at_ms: u64,
     },
     /// An attestor's ECDSA vote proposing a new destination attestor set, seen on
-    /// `{chain_key}/attestor-set-update/v1`. Streamed raw: the observer has no destination-chain
-    /// connection and cannot recompute the update digest, so (unlike `MessageVote`) it does not
-    /// annotate `signature_valid` — the relayer's set-update aggregator re-derives the digest from
-    /// chain state and recovers the signer itself.
+    /// `{chain_key}/attestor-set-update/v1`. Streamed raw, like `MessageVote`: the observer has no
+    /// destination-chain connection and cannot recompute the update digest — the relayer's
+    /// set-update aggregator re-derives it from chain state and recovers the signer itself.
     #[serde(rename = "attestor_set_update")]
     SetUpdateVote {
         chain_key: u64,
@@ -88,7 +83,6 @@ impl ObserverEvent {
         chain_key: u64,
         message_id: [u8; 32],
         signer: alloy::primitives::Address,
-        signature_valid: bool,
         signature: &[u8; 65],
         source_peer: &libp2p::PeerId,
     ) -> Self {
@@ -99,7 +93,6 @@ impl ObserverEvent {
             // distinct hash this used to carry.
             message_hash: format!("0x{}", hex::encode(message_id)),
             signer: format!("{signer:?}"),
-            signature_valid,
             signature: format!("0x{}", hex::encode(signature)),
             source_peer: source_peer.to_string(),
             received_at_ms: now_ms(),
@@ -254,7 +247,6 @@ mod tests {
             chain_key,
             [id_byte; 32],
             alloy::primitives::Address::repeat_byte(0x11),
-            true,
             &[0u8; 65],
             &libp2p::PeerId::random(),
         )
@@ -266,7 +258,7 @@ mod tests {
         assert_eq!(json["type"], "message_vote");
         assert_eq!(json["chain_key"], 102);
         assert_eq!(json["message_id"], format!("0x{}", "01".repeat(32)));
-        assert_eq!(json["signature_valid"], true);
+        assert!(json.get("signature_valid").is_none());
         assert!(json["signature"].as_str().unwrap().starts_with("0x000000"));
     }
 
