@@ -179,7 +179,7 @@ mod tests {
             inbox_address: address!("0000000000000000000000000000000000000002"),
             signer_key: None,
             outbox_address: None,
-            relayer_contract_address: None,
+            relayer_contract_addresses: Vec::new(),
             block_confirmation_depth: 0,
             start_block: None,
             vote_validator: address!("0000000000000000000000000000000000000006"),
