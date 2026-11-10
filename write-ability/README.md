@@ -21,8 +21,9 @@ This crate is **vendored from the `creditcoin3` repository** (`common/write-abil
 
 When changing anything here, mirror the change in `creditcoin3/common/write-ability` (and vice
 versa) **in the same rollout window**, and rely on the golden-vector tests to catch drift: both
-repos (and the asc-contracts Foundry suite) pin the message-vote digest to the identical
-`vectors/message_vote_eip712.json`, asserted by `src/hash.rs` tests here and in creditcoin3. If
+repos pin the digests, message IDs, delivery envelopes and SCALE gossip envelopes to identical
+files under `vectors/`. asc-contracts generates the Solidity ones (`npm run vectors`) and
+creditcoin3 the SCALE ones; `tests/vectors.rs` asserts them here and checks the copies byte for byte. If
 a vector changes on one side only, CI fails on the other side the moment the crates are re-synced
 — do not "fix" a vector mismatch by updating the vector; it means the wire
 format broke.
