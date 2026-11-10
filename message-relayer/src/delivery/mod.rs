@@ -2364,6 +2364,39 @@ async fn give_up_failed_retries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One entry of the Solidity-generated `evm_envelope.json` (`EVMPayloadCodec.encode`).
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct EnvelopeVector {
+        name: String,
+        native_coin_value: String,
+        gas_limit: String,
+        encoded: Bytes,
+    }
+
+    /// The native-value cap and the attested gas limit are read straight out of the envelope, so
+    /// the decode must agree with the contract's encoder on every vector.
+    #[test]
+    fn envelope_terms_match_solidity_vectors() {
+        let vectors: Vec<EnvelopeVector> = serde_json::from_str(include_str!(
+            "../../../write-ability/vectors/evm_envelope.json"
+        ))
+        .expect("vectors file is valid JSON");
+        assert!(!vectors.is_empty());
+        let decimal = |value: &str| U256::from_str_radix(value, 10).expect("decimal string");
+        for v in vectors {
+            assert_eq!(
+                envelope_terms(&v.encoded),
+                EnvelopeTerms {
+                    native_value: decimal(&v.native_coin_value),
+                    gas_limit: Some(decimal(&v.gas_limit)),
+                },
+                "{}",
+                v.name
+            );
+        }
+    }
     use crate::pool::{DELIVERY_RETRY_MAX, PRUNE_TICK_INTERVAL};
     use crate::prom::NoopMetrics;
     use alloy::primitives::LogData;

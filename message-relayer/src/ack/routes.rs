@@ -483,6 +483,55 @@ mod tests {
         Address::repeat_byte(n)
     }
 
+    /// One entry of the Solidity-generated `message_id.json` (`OutboxTypes.computeMessageId`).
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MessageIdVector {
+        name: String,
+        outbox: Address,
+        emitter: Address,
+        sequence: String,
+        payload_hash: B256,
+        source_chain_id: String,
+        message_id: B256,
+    }
+
+    /// Ack routing trusts a publication only when this recomputation equals the delivered ID, so
+    /// it must stay byte-identical to the Outbox's own formula.
+    #[test]
+    fn message_id_matches_solidity_vectors() {
+        let vectors: Vec<MessageIdVector> = serde_json::from_str(include_str!(
+            "../../../write-ability/vectors/message_id.json"
+        ))
+        .expect("vectors file is valid JSON");
+        let mut checked = 0;
+        for v in vectors {
+            // The relayer carries the source chain ID as a `u64`; larger values are Solidity-only.
+            let Ok(source_chain_id) = v.source_chain_id.parse::<u64>() else {
+                continue;
+            };
+            let message = OutboxMessage {
+                emitter: v.emitter,
+                sequence: v.sequence.parse().expect("sequence is a decimal u64"),
+                timestamp: 0,
+                canAck: true,
+                acknowledged: false,
+                payloadHash: v.payload_hash,
+            };
+            assert_eq!(
+                message_id(v.outbox, &message, source_chain_id),
+                v.message_id,
+                "{}",
+                v.name
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 4,
+            "only {checked} message ID vectors fit a u64 chain ID"
+        );
+    }
+
     fn record(can_ack: bool) -> OutboxMessage {
         OutboxMessage {
             emitter: address(7),

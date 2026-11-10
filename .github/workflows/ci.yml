@@ -184,7 +184,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: gluwa/asc-contracts
-          ref: d9d61a5f7da00a56577f7d2333046898b234e1c3 # #62 approval epochs and decoder v2, plus #63 checkout-only cleanup
+          ref: 55709ffbf238c2ab23fff7355ce0a93fbb65061e # shared golden vectors (CSUB-2129), on top of #67 EIP-712 message votes
           path: asc-contracts
           # asc-contracts is private; the default GITHUB_TOKEN is scoped to this repo only and
           # gets "Repository not found". Same org bot PAT creditcoin3's e2e uses cross-repo.
