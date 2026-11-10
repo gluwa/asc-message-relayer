@@ -119,7 +119,12 @@ pub struct ChainRoute {
     /// the proven delivery tx's gasLimit to match a funded tier), and the ack worker additionally
     /// submits `claimDelivery` for each delivered message. `None` falls back to gas estimation
     /// (fee not claimable).
-    pub relayer_contract_address: Option<Address>,
+    ///
+    /// One entry per source Outbox that has its own fee contract (`RelayerContract.outbox` is
+    /// immutable, so a second Outbox for the same chain key brings a second ledger). A message is
+    /// funded in exactly one of them: a ledger only records messages its own Outbox published.
+    /// The workers find that ledger per message, so fees keep settling across an Outbox rotation.
+    pub relayer_contract_addresses: Vec<Address>,
     /// Reorg guard for destination settlement and completion. Execution remains durable until
     /// `processedAt + depth <= head`; zero explicitly permits completion on an execution receipt.
     /// Source publication discovery always requires Creditcoin's finalized head and pauses on
@@ -233,7 +238,7 @@ impl ChainRoute {
         validate_max_gas_limit(self.max_gas_limit, &origin)?;
         self.failed_retry.validate(&origin)?;
         if self.auto_request_top_up {
-            if self.relayer_contract_address.is_none() {
+            if self.relayer_contract_addresses.is_empty() {
                 bail!(
                     "{origin}: auto_request_top_up requires relayer_contract_address (requestTopUp \
                      is a RelayerContract call)"
@@ -559,6 +564,10 @@ pub struct ChainRouteFile {
     /// working; the ledger the relayer talks to is the RelayerContract now.
     #[serde(default, alias = "relayer_fee_vault_address")]
     pub relayer_contract_address: Option<String>,
+    /// Every fee contract for this route, one per source Outbox. Merged with the single
+    /// `relayer_contract_address`; see [`ChainRoute::relayer_contract_addresses`].
+    #[serde(default)]
+    pub relayer_contract_addresses: Vec<String>,
     #[serde(default)]
     pub block_confirmation_depth: u64,
     #[serde(default)]
@@ -741,17 +750,22 @@ impl ChainRouteFile {
             .map(parse_address)
             .transpose()
             .with_context(|| format!("invalid outbox_address for chain_key {}", self.chain_key))?;
-        let relayer_contract_address = self
+        let mut relayer_contract_addresses = Vec::new();
+        for raw in self
             .relayer_contract_address
-            .as_deref()
-            .map(parse_address)
-            .transpose()
-            .with_context(|| {
+            .iter()
+            .chain(&self.relayer_contract_addresses)
+        {
+            let address = parse_address(raw).with_context(|| {
                 format!(
                     "invalid relayer_contract_address for chain_key {}",
                     self.chain_key
                 )
             })?;
+            if !relayer_contract_addresses.contains(&address) {
+                relayer_contract_addresses.push(address);
+            }
+        }
 
         let AttestorSetFile::EvmContract { address } = self.attestor_set;
         let vote_validator = parse_address(&address).with_context(|| {
@@ -833,7 +847,7 @@ impl ChainRouteFile {
             inbox_address,
             signer_key: self.signer_key,
             outbox_address,
-            relayer_contract_address,
+            relayer_contract_addresses,
             block_confirmation_depth: self.block_confirmation_depth,
             start_block: self.start_block,
             vote_validator,
@@ -1010,6 +1024,36 @@ routes:
         );
         assert_eq!(policy.backoff(64).as_secs(), 14_400);
         assert_eq!(policy.backoff(u32::MAX).as_secs(), 14_400);
+    }
+
+    /// A route spanning several Outboxes lists one fee contract per Outbox. The single-address
+    /// key keeps working and is merged in, first, without duplicates.
+    #[test]
+    fn relayer_contract_addresses_merge_the_single_key_and_the_list() {
+        let a = "0x000000000000000000000000000000000000000a";
+        let b = "0x000000000000000000000000000000000000000b";
+        let routes = |fields: &str| {
+            let file: ConfigFile = serde_yaml::from_str(&with_route_fields(fields)).unwrap();
+            file.into_config("ws://cc3".into(), "http://cc3-eth".into(), None)
+                .unwrap()
+                .routes[0]
+                .relayer_contract_addresses
+                .clone()
+        };
+        let (a_addr, b_addr): (Address, Address) = (a.parse().unwrap(), b.parse().unwrap());
+
+        assert!(routes("").is_empty());
+        assert_eq!(
+            routes(&format!("    relayer_contract_address: \"{a}\"\n")),
+            vec![a_addr]
+        );
+        assert_eq!(
+            routes(&format!(
+                "    relayer_contract_address: \"{a}\"\n    relayer_contract_addresses:\n      \
+                 - \"{b}\"\n      - \"{a}\"\n"
+            )),
+            vec![a_addr, b_addr]
+        );
     }
 
     fn with_route_fields(extra: &str) -> String {

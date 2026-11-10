@@ -253,8 +253,8 @@ pub async fn run(
 
     // Read-only source-chain provider, only when the relayer contract is configured: used to look
     // up each message's funded `gasLimit` so the delivery tx is pinned to it (see `funded_gas_limit`).
-    let source_provider = match route.relayer_contract_address {
-        Some(_) => Some(
+    let source_provider = match route.relayer_contract_addresses.is_empty() {
+        false => Some(
             ProviderBuilder::new()
                 .connect(&creditcoin_eth_rpc_url)
                 .await
@@ -265,29 +265,25 @@ pub async fn run(
                     )
                 })?,
         ),
-        None => None,
+        true => None,
     };
 
     // Opt-in `requestTopUp` sender (source chain, signed by the ack/claim key). Built here, once,
     // so a bad key fails the route at startup instead of on the first under-funded message.
-    let mut top_up = match (route.auto_request_top_up, route.relayer_contract_address) {
-        (true, Some(relayer_contract)) => Some(
-            TopUpRequester::connect(
-                &route,
-                relayer_contract,
-                &creditcoin_eth_rpc_url,
-                broadcast_locks.clone(),
-            )
-            .await?,
-        ),
-        _ => None,
+    let mut top_up = if route.auto_request_top_up {
+        Some(
+            TopUpRequester::connect(&route, &creditcoin_eth_rpc_url, broadcast_locks.clone())
+                .await?,
+        )
+    } else {
+        None
     };
 
     info!(
         chain_key,
         signer = %signer_address,
         inbox = %route.inbox_address,
-        relayer_contract = ?route.relayer_contract_address,
+        relayer_contracts = ?route.relayer_contract_addresses,
         max_native_coin_value_wei = %route.max_native_coin_value_wei,
         max_gas_limit = route.max_gas_limit,
         auto_request_top_up = route.auto_request_top_up,
@@ -353,11 +349,11 @@ pub async fn run(
                 // wedge the whole route (and starve the cancel branch) — the same hazard RECEIPT_TIMEOUT guards.
                 let funding = tokio::select! {
                     () = cancel.cancelled() => return Ok(()),
-                    funding = async { match (&source_provider, route.relayer_contract_address) {
-                    (Some(p), Some(relayer_contract)) if !job.reconcile_only => {
+                    funding = async { match &source_provider {
+                    Some(p) if !job.reconcile_only => {
                         match tokio::time::timeout(
                             FUNDED_GAS_READ_TIMEOUT,
-                            read_message_funding(p, relayer_contract, job.message_id),
+                            read_message_funding(p, &route.relayer_contract_addresses, job.message_id),
                         ).await {
                             Ok(Ok(f)) => f,
                             Ok(Err(err)) => {
@@ -469,15 +465,30 @@ fn idle_ticker_should_heartbeat(
 /// also falls back).
 async fn read_message_funding<P: Provider>(
     source_provider: &P,
-    relayer_contract: Address,
+    relayer_contracts: &[Address],
     message_id: B256,
 ) -> Result<MessageFunding> {
-    let ledger = IRelayerContract::new(relayer_contract, source_provider);
-    let info = ledger
-        .getMessageInfo(message_id)
-        .call()
-        .await
-        .context("RelayerContract.getMessageInfo failed")?;
+    // A ledger only records messages its own Outbox published, so at most one of the route's fee
+    // contracts knows this message (`payer` set). With none, the first ledger's empty record keeps
+    // the unfunded behaviour: estimate the gas.
+    let mut found = None;
+    for &relayer_contract in relayer_contracts {
+        let info = IRelayerContract::new(relayer_contract, source_provider)
+            .getMessageInfo(message_id)
+            .call()
+            .await
+            .context("RelayerContract.getMessageInfo failed")?;
+        let funded = info.payer != Address::ZERO;
+        if funded || found.is_none() {
+            found = Some((relayer_contract, info));
+        }
+        if funded {
+            break;
+        }
+    }
+    let Some((relayer_contract, info)) = found else {
+        return Ok(MessageFunding::unknown());
+    };
 
     // Read from the same struct rather than a second call: `deliveryDeadline` and `relaySettled`
     // arrive alongside `gasLimit` and were previously discarded, which is why an unrescuable
@@ -490,6 +501,7 @@ async fn read_message_funding<P: Provider>(
             gas: None,
             delivery_deadline,
             relay_settled,
+            relayer_contract: None,
         });
     }
     // Guard against a misconfigured contract address decoding to junk: an absurd gasLimit would
@@ -505,6 +517,7 @@ async fn read_message_funding<P: Provider>(
         gas: Some(info.gasLimit.saturating_to::<u64>()),
         delivery_deadline,
         relay_settled,
+        relayer_contract: Some(relayer_contract),
     })
 }
 
@@ -518,6 +531,8 @@ struct MessageFunding {
     delivery_deadline: Option<u64>,
     /// `MessageInfo.relaySettled`.
     relay_settled: bool,
+    /// The fee contract whose ledger funds `gas`; where a `requestTopUp` for the message goes.
+    relayer_contract: Option<Address>,
 }
 
 impl MessageFunding {
@@ -632,7 +647,6 @@ impl TopUpLedger {
 /// relayer policy: `ChainRoute::auto_request_top_up`, default off.
 struct TopUpRequester {
     provider: DynProvider,
-    relayer_contract: Address,
     signer_address: Address,
     broadcast_locks: Arc<crate::broadcast::BroadcastLocks>,
     /// Shared with the detached send tasks, which report their outcome back into it.
@@ -642,7 +656,6 @@ struct TopUpRequester {
 impl TopUpRequester {
     async fn connect(
         route: &ChainRoute,
-        relayer_contract: Address,
         creditcoin_eth_rpc_url: &str,
         broadcast_locks: Arc<crate::broadcast::BroadcastLocks>,
     ) -> Result<Self> {
@@ -671,12 +684,11 @@ impl TopUpRequester {
         info!(
             chain_key,
             signer = %signer_address,
-            %relayer_contract,
+            relayer_contracts = ?route.relayer_contract_addresses,
             "🪙 auto_request_top_up enabled — under-funded deliveries will emit requestTopUp"
         );
         Ok(Self {
             provider,
-            relayer_contract,
             signer_address,
             broadcast_locks,
             ledger: Arc::new(Mutex::new(TopUpLedger::default())),
@@ -689,7 +701,13 @@ impl TopUpRequester {
     /// delivering anything). The in-flight mark is taken *before* spawning so a second refusal of
     /// the same message while the first request is still pending does not double-send; the task
     /// reports back so a send that never completed can be retried on the next refusal.
-    fn request(&mut self, chain_key: u64, message_id: B256, additional_gas: u64) {
+    fn request(
+        &mut self,
+        chain_key: u64,
+        relayer_contract: Address,
+        message_id: B256,
+        additional_gas: u64,
+    ) {
         let attempt = match self
             .ledger
             .lock()
@@ -704,7 +722,6 @@ impl TopUpRequester {
         };
         let locks = self.broadcast_locks.clone();
         let provider = self.provider.clone();
-        let relayer_contract = self.relayer_contract;
         let signer_address = self.signer_address;
         let ledger = self.ledger.clone();
         tokio::spawn(async move {
@@ -1359,8 +1376,15 @@ async fn handle_job<P: Provider + Clone + 'static>(
                      delivering (awaiting a topUpGasLimit). Retrying with backoff."
                 );
                 // Opt-in: tell the payer/quoter on-chain how much more gas is needed, once.
-                if let Some(requester) = top_up {
-                    requester.request(route.chain_key, job.message_id, additional);
+                if let (Some(requester), Some(relayer_contract)) =
+                    (top_up, funding.relayer_contract)
+                {
+                    requester.request(
+                        route.chain_key,
+                        relayer_contract,
+                        job.message_id,
+                        additional,
+                    );
                 }
                 return Ok(DeliveryResultKind::Retryable);
             }
@@ -2364,6 +2388,63 @@ async fn give_up_failed_retries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ledger_entry(payer: Address, gas_limit: u64) -> Bytes {
+        Bytes::from(
+            IRelayerContract::MessageInfo {
+                payer,
+                destinationChain: 2,
+                gasLimit: U256::from(gas_limit),
+                relayFee: U256::from(1),
+                tip: U256::ZERO,
+                tipExpiry: U256::ZERO,
+                deliveryDeadline: U256::from(1_787_610_830u64),
+                relaySettled: false,
+                feesInNative: false,
+            }
+            .abi_encode(),
+        )
+    }
+
+    /// With one fee ledger per Outbox, the delivery gas must come from the ledger that funds the
+    /// message. Pinning an estimate instead makes the fee unclaimable (`UnfundedDeliveryGasLimit`).
+    #[tokio::test]
+    async fn funded_gas_is_read_from_the_ledger_that_holds_the_message() {
+        let (ledger_a, ledger_b) = (Address::repeat_byte(0xa), Address::repeat_byte(0xb));
+        let rpc = Asserter::new();
+        rpc.push_success(&ledger_entry(Address::ZERO, 0));
+        rpc.push_success(&ledger_entry(Address::repeat_byte(1), 432_100));
+        let provider = ProviderBuilder::new().connect_mocked_client(rpc.clone());
+
+        let funding = read_message_funding(&provider, &[ledger_a, ledger_b], B256::repeat_byte(7))
+            .await
+            .unwrap();
+
+        assert_eq!(funding.gas, Some(432_100));
+        assert_eq!(funding.relayer_contract, Some(ledger_b));
+        assert!(rpc.read_q().is_empty());
+    }
+
+    /// A message no ledger knows (published without a relay fee) still falls back to estimation.
+    #[tokio::test]
+    async fn a_message_unknown_to_every_ledger_has_no_funded_gas() {
+        let rpc = Asserter::new();
+        rpc.push_success(&ledger_entry(Address::ZERO, 0));
+        rpc.push_success(&ledger_entry(Address::ZERO, 0));
+        let provider = ProviderBuilder::new().connect_mocked_client(rpc.clone());
+
+        let funding = read_message_funding(
+            &provider,
+            &[Address::repeat_byte(0xa), Address::repeat_byte(0xb)],
+            B256::repeat_byte(7),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(funding.gas, None);
+        assert_eq!(funding.relayer_contract, None);
+        assert!(rpc.read_q().is_empty());
+    }
     use crate::pool::{DELIVERY_RETRY_MAX, PRUNE_TICK_INTERVAL};
     use crate::prom::NoopMetrics;
     use alloy::primitives::LogData;
@@ -2376,7 +2457,7 @@ mod tests {
             inbox_address: Address::repeat_byte(0x11),
             signer_key: Some(format!("{:064x}", 1)),
             outbox_address: None,
-            relayer_contract_address: None,
+            relayer_contract_addresses: Vec::new(),
             block_confirmation_depth: 0,
             start_block: None,
             vote_validator: Address::repeat_byte(0x06),
@@ -3199,7 +3280,7 @@ mod tests {
             inbox_address: Address::repeat_byte(0x11),
             signer_key: None,
             outbox_address: None,
-            relayer_contract_address: None,
+            relayer_contract_addresses: Vec::new(),
             block_confirmation_depth: 0,
             start_block: None,
             vote_validator: Address::repeat_byte(0x06),
@@ -4221,6 +4302,7 @@ mod tests {
             gas: Some(100_000),
             delivery_deadline: deadline,
             relay_settled,
+            relayer_contract: Some(Address::repeat_byte(9)),
         }
     }
 

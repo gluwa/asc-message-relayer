@@ -263,7 +263,7 @@ impl Server {
             .config
             .routes
             .iter()
-            .filter(|r| r.relayer_contract_address.is_some() && r.ack.is_none())
+            .filter(|r| !r.relayer_contract_addresses.is_empty() && r.ack.is_none())
         {
             tracing::warn!(
                 chain_key = route.chain_key,
