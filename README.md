@@ -129,6 +129,14 @@ and repeated failures escalate in logs and metrics:
   `delivery.max_retries`; unresolved work then returns to the supervised pool with capped
   backoff. Five dispatch failures escalate warnings instead of abandoning the message.
   Mutable-state reverts (pause, expired quorum, policy or validator changes) remain retryable.
+  A payload that is not an `abi.encode(address,uint256,uint256,bytes)` envelope is the exception:
+  once its pre-send simulate/estimate reverts with *empty* data (the dispatcher's `abi.decode`
+  failing) it can never be delivered, so the relayer refuses it as terminal — an `Undeliverable`
+  outcome, one WARN, `relayer_deliver_tx{status="RefusedPayload"}` — and removes its durable
+  record instead of retrying forever. A revert that carries data or a reason, or a payload that
+  does decode, stays retryable. The message remains in the source Outbox, so fixing it means
+  publishing a new one; a rescan can re-record it only while its block is inside
+  `scan_lookback_blocks`, and it is then refused again.
   `MessageAlreadyValidated` triggers confirmed Inbox-state reconciliation: it can mean executed,
   queued, or failed, so acceptance alone is not success.
 - **Execution outcomes** — `MessageQueued`/`MessageDeferred` select `retryPendingMessage`, and

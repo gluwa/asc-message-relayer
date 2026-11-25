@@ -69,6 +69,48 @@ pub fn is_revert(s: &str) -> bool {
         || lower.contains("transaction reverted")
 }
 
+/// Whether a revert error says nothing beyond "reverted": no revert data (not even a stub shorter
+/// than a selector), no selector and no reason text. This is how a Solidity `abi.decode` failure,
+/// a bare `revert()` and an out-of-gas read on every node dialect: Solidity reverts them with
+/// *empty* data. A named or decoded reason (`execution reverted: ThresholdNotMet`, `Error(string)`,
+/// a custom-error selector) is **not** bare, because that identifies a specific, possibly
+/// state-dependent condition.
+///
+/// Deliberately conservative: an error shape this does not recognise is reported as not bare, so
+/// the caller keeps its retry behaviour instead of discarding work on a guess.
+#[must_use]
+pub fn is_bare_revert(s: &str) -> bool {
+    if !is_revert(s) {
+        return false;
+    }
+    let lower = s.to_ascii_lowercase();
+    // Any revert data at all, including 1–3 bytes that `revert_data` ignores for being shorter
+    // than a selector.
+    if let Some(at) = lower.find("data") {
+        if let Some(hex_at) = lower[at..].find("0x") {
+            let tail = &lower[at + hex_at + 2..];
+            if tail.starts_with(|c: char| c.is_ascii_hexdigit()) {
+                return false;
+            }
+        }
+    }
+    // Reason text after the revert phrase. Only the end of the message or the `, data: …` field
+    // may follow it.
+    for phrase in [
+        "execution reverted",
+        "while processing transaction: revert",
+        "transaction reverted",
+    ] {
+        if let Some(at) = lower.find(phrase) {
+            let rest = lower[at + phrase.len()..].trim_start();
+            if !(rest.is_empty() || rest.starts_with(',')) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,5 +158,45 @@ mod tests {
     fn selector_match() {
         assert!(has_selector(CC_STYLE, [0x2f, 0x28, 0xbb, 0x55]));
         assert!(!has_selector(CC_STYLE, [0x33, 0x70, 0x4b, 0x28]));
+    }
+
+    /// A Solidity `abi.decode` failure reverts with empty data; every dialect must read as bare.
+    #[test]
+    fn bare_reverts_are_recognised_across_dialects() {
+        for bare in [
+            "execution reverted",
+            "server returned an error response: error code 3: execution reverted",
+            "server returned an error response: error code 3: execution reverted, data: \"0x\"",
+            "error code 3: execution reverted , data: \"0x\"",
+            "server returned an error response: error code -32603: VM Exception while processing \
+             transaction: revert",
+            "VM Exception while processing transaction: revert, data: \"0x\"",
+        ] {
+            assert!(is_bare_revert(bare), "should be bare: {bare}");
+        }
+    }
+
+    /// Anything that names a reason, carries data (of any length) or is not a revert at all must
+    /// not read as bare, so the caller keeps retrying instead of discarding work on a guess.
+    #[test]
+    fn reverts_with_a_reason_or_data_are_not_bare() {
+        for not_bare in [
+            // A decoded or named reason.
+            "execution reverted: ThresholdNotMet",
+            "execution reverted: Already validated",
+            "execution reverted: EnforcedPause()",
+            "VM Exception while processing transaction: reverted with reason string 'nope'",
+            "transaction reverted on-chain",
+            // Revert data: a full custom error, and a stub shorter than a selector.
+            CC_STYLE,
+            "error code 3: execution reverted, data: \"0x12345678\"",
+            "error code 3: execution reverted, data: \"0x12\"",
+            // Not a contract revert at all.
+            "error sending request: connection refused",
+            "error code -32000: insufficient funds for gas",
+            "",
+        ] {
+            assert!(!is_bare_revert(not_bare), "must not be bare: {not_bare}");
+        }
     }
 }

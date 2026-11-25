@@ -55,7 +55,7 @@ use crate::abi::{IInbox, IMessageDispatcher, IMessageReceiver, IRelayerContract}
 use crate::config::{ChainRoute, DeliveryConfig};
 use crate::outcome::{DeliveryOutcome, OutcomeKind, OutcomeStore};
 use crate::prom::{DeliveryStatus, Metrics};
-use crate::revert::{is_revert, revert_data, revert_selector};
+use crate::revert::{is_bare_revert, is_revert, revert_data, revert_selector};
 
 pub mod encode;
 pub mod failed_retry;
@@ -1019,14 +1019,34 @@ enum Stage {
     Proceed,
 }
 
+/// Whether `payload` decodes as the four-field EVM envelope the dispatcher reads with
+/// `abi.decode(payload, (address,uint256,uint256,bytes))`.
+fn is_envelope(payload: &[u8]) -> bool {
+    envelope_terms(payload).gas_limit.is_some()
+}
+
+/// A bare, data-less revert for a payload that is not an envelope: the Inbox validated the votes
+/// and handed the payload to its dispatcher, whose `abi.decode` reverted with empty data. No later
+/// vote, pause or configuration change can make such a publication deliverable.
+///
+/// Every part is required. A revert that carries data or a reason (`EnforcedPause`, a validator
+/// or dispatcher error, `Error(string)`, any selector) names a specific condition that may be
+/// state-dependent, and a payload that decodes fine reverted for some other reason, so both stay
+/// retryable.
+fn is_undecodable_payload_revert(err: &alloy::contract::Error, payload: &[u8]) -> bool {
+    let carries_data = err.as_revert_data().is_some_and(|data| !data.is_empty());
+    !carries_data && is_bare_revert(&err.to_string()) && !is_envelope(payload)
+}
+
 /// Log + count a revert seen before the send (simulate / estimate) and decide the
 /// job's fate. `InsufficientGasForDestination` is not terminal — the send loop bumps gas — so it
-/// proceeds; everything else that reverts is settled here.
+/// proceeds; a bare revert of a payload that is not an envelope is terminal (see
+/// [`is_undecodable_payload_revert`]); everything else that reverts returns to the pool.
 fn settle_pre_send_revert(
     route: &ChainRoute,
     job: &DeliveryJob,
     metrics: &dyn crate::prom::MetricsTrait,
-    _outcomes: &OutcomeStore,
+    outcomes: &OutcomeStore,
     stage: &str,
     revert: DeliveryRevert,
     err: &alloy::contract::Error,
@@ -1036,6 +1056,26 @@ fn settle_pre_send_revert(
     match revert {
         // Duplicate callers reconcile execution asynchronously; its selector alone proves no completion.
         DeliveryRevert::Duplicate => Stage::Done(DeliveryResultKind::Retryable),
+        // Publisher-side and permanent: refuse once instead of retrying forever. Terminal makes the
+        // pool drop the durable record, so a restart does not bring the message back (a rescan can
+        // re-record it only while its block is still inside `scan_lookback_blocks`).
+        DeliveryRevert::Other if is_undecodable_payload_revert(err, &job.payload) => {
+            let reason = format!(
+                "payload is not an abi.encode(address,uint256,uint256,bytes) envelope ({} bytes) and \
+                 the Inbox rejects it with empty revert data; it can only be fixed by publishing a \
+                 new message",
+                job.payload.len()
+            );
+            metrics.inc_deliver_tx(chain_key, DeliveryStatus::RefusedPayload);
+            warn!(chain_key, %message_id, payload_len = job.payload.len(), stage,
+                "{stage}(deliverMessage) reverted with empty data and the payload is not an \
+                 envelope; refusing (terminal — a publisher-side fix, publish a new message)");
+            outcomes.record(
+                message_id,
+                DeliveryOutcome::new(OutcomeKind::Undeliverable, chain_key).with_reason(reason),
+            );
+            Stage::Done(DeliveryResultKind::Terminal)
+        }
         DeliveryRevert::InsufficientGasForDestination => {
             warn!(chain_key, %message_id, %err,
                 "{stage}(deliverMessage) reverted InsufficientGasForDestination; proceeding to send \
@@ -1120,8 +1160,7 @@ fn describe_unknown_revert(err: &alloy::contract::Error, payload: &[u8]) -> Stri
         // selector still comes out as `custom error 0x… (N bytes)`.
         Some(data) if data.len() >= 4 => crate::dest_revert::describe_revert_data(&data),
         _ => {
-            let looks_like_envelope = envelope_terms(payload).gas_limit.is_some();
-            if looks_like_envelope {
+            if is_envelope(payload) {
                 "reverted with empty data".to_string()
             } else {
                 format!(
@@ -3623,6 +3662,186 @@ mod tests {
             Stage::Done(DeliveryResultKind::Retryable)
         ));
         assert!(outcomes.get(&job.message_id).is_none());
+    }
+
+    /// Payloads shaped like the asc-devnet probes (2026-11-25): none of them can be read by the
+    /// dispatcher's `abi.decode(payload, (address,uint256,uint256,bytes))`.
+    fn undecodable_payloads() -> Vec<Vec<u8>> {
+        let payloads = vec![
+            b"PROBE13091-CK1-ACKLESS".to_vec(),                     // 22 bytes
+            b"ASC-DEVNET-INGEST-PROBE-13091 t=1795632038".to_vec(), // 42 bytes
+            vec![b'x'; 128], // shorter than the 160-byte minimum encoding
+            (0..=255u8).cycle().take(512).collect(), // every byte value
+            vec![b'A'; 20_015], // not a multiple of 32 bytes
+        ];
+        for payload in &payloads {
+            assert!(
+                !is_envelope(payload),
+                "fixture decodes: {} bytes",
+                payload.len()
+            );
+        }
+        payloads
+    }
+
+    /// A bare (empty-data) revert of a payload the dispatcher cannot decode will revert the same
+    /// way forever, so it is refused as `Undeliverable` instead of retried at capped backoff.
+    #[test]
+    fn bare_revert_of_a_non_envelope_payload_is_terminal_undeliverable() {
+        let (route, mut job) = delivery_fixture();
+        let metrics = NoopMetrics::new();
+        for payload in undecodable_payloads() {
+            job.payload = payload;
+            for stage in ["simulate", "estimate"] {
+                let outcomes = OutcomeStore::new(8);
+                let error = structured_revert("execution reverted", &[]);
+                let class = classify_delivery_revert(&error).unwrap();
+                assert_eq!(class, DeliveryRevert::Other);
+                assert!(
+                    matches!(
+                        settle_pre_send_revert(
+                            &route,
+                            &job,
+                            metrics.as_ref(),
+                            &outcomes,
+                            stage,
+                            class,
+                            &error,
+                        ),
+                        Stage::Done(DeliveryResultKind::Terminal)
+                    ),
+                    "{stage}: {} bytes",
+                    job.payload.len()
+                );
+                let outcome = outcomes.get(&job.message_id).expect("outcome recorded");
+                assert_eq!(outcome.kind, OutcomeKind::Undeliverable);
+                let reason = outcome.reason.expect("reason recorded");
+                assert!(
+                    reason.contains(&format!("({} bytes)", job.payload.len())),
+                    "{reason}"
+                );
+            }
+        }
+    }
+
+    /// Only the bare revert of an undecodable payload is permanent. A payload that decodes, or a
+    /// revert that carries data or a reason (pause, validator errors, a selector), may depend on
+    /// mutable contract state and stays in the pool.
+    #[test]
+    fn only_the_bare_revert_of_a_non_envelope_payload_is_refused() {
+        let (route, job) = delivery_fixture();
+        let metrics = NoopMetrics::new();
+        let outcomes = OutcomeStore::new(8);
+        let settle = |job: &DeliveryJob, error: &alloy::contract::Error| {
+            let class = classify_delivery_revert(error).unwrap();
+            settle_pre_send_revert(
+                &route,
+                job,
+                metrics.as_ref(),
+                &outcomes,
+                "simulate",
+                class,
+                error,
+            )
+        };
+
+        // A valid envelope that reverts bare is not our diagnosis: some other state.
+        assert!(is_envelope(&job.payload));
+        assert!(matches!(
+            settle(&job, &structured_revert("execution reverted", &[])),
+            Stage::Done(DeliveryResultKind::Retryable)
+        ));
+
+        let mut malformed = job.clone();
+        for payload in undecodable_payloads() {
+            malformed.payload = payload;
+            for error in [
+                // A named or decoded reason, with and without revert data.
+                structured_revert("execution reverted: ThresholdNotMet", &[]),
+                structured_revert("execution reverted: EnforcedPause()", &[]),
+                structured_revert(
+                    "execution reverted",
+                    &IInbox::MessageIdMismatch {
+                        messageId: job.message_id,
+                    }
+                    .abi_encode(),
+                ),
+                // A selector, and a stub shorter than a selector.
+                structured_revert("execution reverted", &[0x12, 0x34, 0x56, 0x78]),
+                structured_revert("execution reverted", &[0x12]),
+            ] {
+                assert!(
+                    matches!(
+                        settle(&malformed, &error),
+                        Stage::Done(DeliveryResultKind::Retryable)
+                    ),
+                    "{} bytes: {error}",
+                    malformed.payload.len()
+                );
+            }
+        }
+        assert!(outcomes.get(&job.message_id).is_none());
+    }
+
+    /// End to end through the worker: both pre-send stages refuse the probe payloads without
+    /// sending anything, and leave nothing queued on the RPC.
+    #[tokio::test]
+    async fn non_envelope_payload_is_refused_at_simulate_and_estimate() {
+        for stage in ["simulate", "estimate"] {
+            for payload in undecodable_payloads() {
+                let rpc = Asserter::new();
+                let (route, mut job) = delivery_fixture();
+                job.payload = payload;
+                let config = DeliveryConfig {
+                    simulate_before_send: stage == "simulate",
+                    max_retries: 0,
+                    ..Default::default()
+                };
+                let funding = if stage == "estimate" {
+                    MessageFunding {
+                        gas: Some(200_000),
+                        ..MessageFunding::unknown()
+                    }
+                } else {
+                    MessageFunding::unknown()
+                };
+                rpc.push_failure_msg("execution reverted");
+                let provider = ProviderBuilder::new()
+                    .disable_recommended_fillers()
+                    .connect_mocked_client(rpc.clone());
+                let outcomes = Arc::new(OutcomeStore::new(8));
+                let result = handle_job(
+                    &route,
+                    &config,
+                    &provider,
+                    Address::repeat_byte(4),
+                    &crate::broadcast::BroadcastLocks::new(),
+                    &job,
+                    funding,
+                    NoopMetrics::new().as_ref(),
+                    None,
+                    &outcomes,
+                    &FailedRetries::in_memory(2),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    result,
+                    DeliveryResultKind::Terminal,
+                    "{stage}: {} bytes",
+                    job.payload.len()
+                );
+                assert_eq!(
+                    outcomes.get(&job.message_id).unwrap().kind,
+                    OutcomeKind::Undeliverable,
+                    "{stage}"
+                );
+                assert!(
+                    rpc.read_q().is_empty(),
+                    "{stage} did not use the intended RPC path"
+                );
+            }
+        }
     }
 
     /// Matches the grace period `run` actually computes: see the comment above its `error_grace_period` binding.
