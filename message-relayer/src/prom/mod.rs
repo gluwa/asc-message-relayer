@@ -847,6 +847,11 @@ pub enum DeliveryStatus {
     /// The attested envelope `gasLimit` exceeds the route's `max_gas_limit`, so no relayer can ever
     /// fit it in a destination block. Terminal (publisher-side fix).
     RefusedGasLimit,
+    /// The payload is not an `abi.encode(address,uint256,uint256,bytes)` envelope and the Inbox
+    /// reverted it with empty data (its dispatcher's `abi.decode` failed), so no vote, pause or
+    /// configuration change can ever make it deliverable. Terminal (publisher-side fix: publish a
+    /// new message with a valid envelope).
+    RefusedPayload,
     /// `deliverMessage` reverted `ValidationFailedWithNativeValue`: the votes failed validation
     /// while value was attached. Terminal for these votes.
     ValidationFailedWithNativeValue,
@@ -1111,6 +1116,7 @@ mod tests {
         m.inc_deliver_tx(8, DeliveryStatus::DestinationFailed);
         m.inc_deliver_tx(8, DeliveryStatus::RefusedNativeValue);
         m.inc_deliver_tx(8, DeliveryStatus::RefusedGasLimit);
+        m.inc_deliver_tx(8, DeliveryStatus::RefusedPayload);
         m.inc_deliver_tx(8, DeliveryStatus::ValidationFailedWithNativeValue);
         m.inc_deliver_tx(8, DeliveryStatus::InvalidDispatcher);
         let body = m.encode();
@@ -1118,6 +1124,7 @@ mod tests {
             "DestinationFailed",
             "RefusedNativeValue",
             "RefusedGasLimit",
+            "RefusedPayload",
             "ValidationFailedWithNativeValue",
             "InvalidDispatcher",
         ] {
