@@ -76,16 +76,31 @@ pub fn is_revert(s: &str) -> bool {
 /// a custom-error selector) is **not** bare, because that identifies a specific, possibly
 /// state-dependent condition.
 ///
-/// Deliberately conservative: an error shape this does not recognise is reported as not bare, so
-/// the caller keeps its retry behaviour instead of discarding work on a guess.
+/// Strict by construction: the error must contain a revert phrase, and after each one only the end
+/// of the message or exactly an *empty* `data` field (`, data: "0x"`, the form alloy prints for a
+/// JSON-RPC error with empty data) may follow, ignoring whitespace and case. Any other suffix
+/// (`, reason: …`, a selector in some wrapper field, trailing text) or any other error shape is
+/// reported as not bare, so the caller keeps its retry behaviour instead of discarding work on a
+/// guess.
 #[must_use]
 pub fn is_bare_revert(s: &str) -> bool {
+    /// The phrases a node uses to say a call reverted; [`is_revert`] also accepts a bare
+    /// `VM Exception while processing transaction`, which is not enough to call a revert bare
+    /// (`… invalid opcode`, `… out of gas`).
+    const REVERT_PHRASES: [&str; 3] = [
+        "execution reverted",
+        "while processing transaction: revert",
+        "transaction reverted",
+    ];
+    /// What may follow a revert phrase in a bare revert, with whitespace removed.
+    const EMPTY_DATA_FIELDS: [&str; 2] = [",data:\"0x\"", ",data:0x"];
+
     if !is_revert(s) {
         return false;
     }
     let lower = s.to_ascii_lowercase();
-    // Any revert data at all, including 1–3 bytes that `revert_data` ignores for being shorter
-    // than a selector.
+    // Any revert data at all before or after the phrase, including 1–3 bytes that `revert_data`
+    // ignores for being shorter than a selector.
     if let Some(at) = lower.find("data") {
         if let Some(hex_at) = lower[at..].find("0x") {
             let tail = &lower[at + hex_at + 2..];
@@ -94,21 +109,20 @@ pub fn is_bare_revert(s: &str) -> bool {
             }
         }
     }
-    // Reason text after the revert phrase. Only the end of the message or the `, data: …` field
-    // may follow it.
-    for phrase in [
-        "execution reverted",
-        "while processing transaction: revert",
-        "transaction reverted",
-    ] {
+    let mut recognised = false;
+    for phrase in REVERT_PHRASES {
         if let Some(at) = lower.find(phrase) {
-            let rest = lower[at + phrase.len()..].trim_start();
-            if !(rest.is_empty() || rest.starts_with(',')) {
+            recognised = true;
+            let rest: String = lower[at + phrase.len()..]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            if !(rest.is_empty() || EMPTY_DATA_FIELDS.contains(&rest.as_str())) {
                 return false;
             }
         }
     }
-    true
+    recognised
 }
 
 #[cfg(test)]
@@ -171,6 +185,9 @@ mod tests {
             "server returned an error response: error code -32603: VM Exception while processing \
              transaction: revert",
             "VM Exception while processing transaction: revert, data: \"0x\"",
+            // Spacing and case are irrelevant.
+            "Error code 3: Execution Reverted,data:\"0x\"",
+            "error code 3: execution reverted,   data:   \"0x\"  ",
         ] {
             assert!(is_bare_revert(bare), "should be bare: {bare}");
         }
@@ -191,6 +208,20 @@ mod tests {
             CC_STYLE,
             "error code 3: execution reverted, data: \"0x12345678\"",
             "error code 3: execution reverted, data: \"0x12\"",
+            // A comma after the phrase is not enough: only an empty `data` field may follow it.
+            // Reasons or selectors in other wrapper fields, and anything trailing, are not bare.
+            "execution reverted, reason: ThresholdNotMet",
+            "execution reverted, selector: 0x12345678",
+            "execution reverted, message: paused",
+            "error code 3: execution reverted, data: \"0x\", reason: ThresholdNotMet",
+            "error code 3: execution reverted, data: \"0x\" (retry later)",
+            "error code 3: execution reverted, data: \"0x\" execution reverted: Foo",
+            "VM Exception while processing transaction: revert, reason: nope",
+            // A VM exception that is not a revert is not a bare revert either.
+            "VM Exception while processing transaction: invalid opcode",
+            "VM Exception while processing transaction: out of gas",
+            // Two phrases, one of which carries a reason.
+            "transaction reverted: execution reverted",
             // Not a contract revert at all.
             "error sending request: connection refused",
             "error code -32000: insufficient funds for gas",

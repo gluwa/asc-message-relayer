@@ -3759,6 +3759,9 @@ mod tests {
                 // A named or decoded reason, with and without revert data.
                 structured_revert("execution reverted: ThresholdNotMet", &[]),
                 structured_revert("execution reverted: EnforcedPause()", &[]),
+                // A comma-delimited reason or selector is still a reason (PR review finding).
+                structured_revert("execution reverted, reason: ThresholdNotMet", &[]),
+                structured_revert("execution reverted, selector: 0x12345678", &[]),
                 structured_revert(
                     "execution reverted",
                     &IInbox::MessageIdMismatch {
