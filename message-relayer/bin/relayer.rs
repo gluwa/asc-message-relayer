@@ -397,7 +397,7 @@ fn single_route_config(cli: Cli) -> Result<Config> {
         inbox_address,
         signer_key: cli.signer_key,
         outbox_address,
-        relayer_contract_address,
+        relayer_contract_addresses: relayer_contract_address.into_iter().collect(),
         block_confirmation_depth: DEFAULT_BLOCK_CONFIRMATION_DEPTH,
         start_block: None,
         vote_validator: validator,

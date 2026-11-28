@@ -177,12 +177,13 @@ pub async fn run(
     // longer bundles the ack, so the two submissions are independent and both must run; see the
     // module docs. The chain key is passed to `claimDelivery` as `bytes32(uint256(chainKey))`,
     // matching the ledger's route check.
-    let mode = match route.relayer_contract_address {
-        Some(relayer_contract) => SettlementMode::AckAndClaim {
-            relayer_contract,
+    let mode = if route.relayer_contract_addresses.is_empty() {
+        SettlementMode::Ack
+    } else {
+        SettlementMode::AckAndClaim {
+            relayer_contracts: route.relayer_contract_addresses.clone(),
             chain_key: B256::from(U256::from(chain_key)),
-        },
-        None => SettlementMode::Ack,
+        }
     };
 
     // Register with the health watchdog BEFORE any fallible or blocking setup: `Health::status`
@@ -269,12 +270,12 @@ pub async fn run(
             "🧾 acknowledgment submitter online (ack mode)"
         ),
         SettlementMode::AckAndClaim {
-            relayer_contract, ..
+            relayer_contracts, ..
         } => info!(
             chain_key,
             inbox = %route.inbox_address,
             validator_hint = %ack.validator_address,
-            relayer_contract = %relayer_contract,
+            ?relayer_contracts,
             submitter = %submitter_address,
             proof_gen_url = %ack.proof_gen_url,
             "💰 settlement submitter online (ack + relay-fee claim; independent since usc-contracts #23)"
@@ -721,7 +722,7 @@ async fn process_pending<P: Provider>(
 }
 
 /// What this worker submits once a delivery proof is ready — chosen per route in [`run`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum SettlementMode {
     /// No RelayerContract on the route: prove delivery to the `AcknowledgmentValidator` only
     /// (`submitAcknowledgment`, one call per tx — the validator acks every `MessageExecuted` log
@@ -733,8 +734,11 @@ enum SettlementMode {
     /// the proven relayer). Since usc-contracts #23 the claim does NOT acknowledge, so skipping
     /// either call would leave messages unacknowledged or fees unclaimed. `chain_key` is passed to
     /// `claimDelivery` as `bytes32(uint256(chainKey))`.
+    ///
+    /// `relayer_contracts` holds one fee ledger per source Outbox. Each message is claimed from
+    /// the one ledger that funds it, so fees keep settling when a route spans several Outboxes.
     AckAndClaim {
-        relayer_contract: Address,
+        relayer_contracts: Vec<Address>,
         chain_key: B256,
     },
 }
@@ -807,25 +811,34 @@ async fn classify_submit(
     }
 }
 
-/// MessageIds in `ids` whose relay fee is still claimable: funded through the RelayerContract
-/// ledger (`payer != 0`) and not yet settled. Empty means nothing to claim for this tx. Traffic
-/// funded outside the relayer (e.g. bridge messages) reports `payer == 0` and is skipped.
+/// MessageIds in `ids` whose relay fee is still claimable, each paired with the RelayerContract
+/// whose ledger funds it (`payer != 0`) and has not settled it. Empty means nothing to claim for
+/// this tx. Traffic funded outside the relayer (e.g. bridge messages) reports `payer == 0` in
+/// every ledger and is skipped.
+///
+/// A ledger only records messages its own Outbox published and the messageId binds the Outbox,
+/// so at most one of `relayer_contracts` knows a given id.
 async fn relay_claimable_ids<P: Provider>(
     provider: &P,
-    relayer_contract: Address,
+    relayer_contracts: &[Address],
     ids: &[B256],
-) -> Result<Vec<B256>> {
-    let ledger = crate::abi::IRelayerContract::new(relayer_contract, provider);
+) -> Result<Vec<(Address, B256)>> {
     let mut claimable = Vec::new();
     for id in ids {
-        let info = ledger
-            .getMessageInfo(*id)
-            .block(BlockNumberOrTag::Finalized.into())
-            .call()
-            .await
-            .context("IRelayerContract.getMessageInfo call failed")?;
-        if info.payer != Address::ZERO && !info.relaySettled {
-            claimable.push(*id);
+        for &relayer_contract in relayer_contracts {
+            let info = crate::abi::IRelayerContract::new(relayer_contract, provider)
+                .getMessageInfo(*id)
+                .block(BlockNumberOrTag::Finalized.into())
+                .call()
+                .await
+                .context("IRelayerContract.getMessageInfo call failed")?;
+            if info.payer == Address::ZERO {
+                continue;
+            }
+            if !info.relaySettled {
+                claimable.push((relayer_contract, *id));
+            }
+            break;
         }
     }
     Ok(claimable)
@@ -882,15 +895,24 @@ async fn acknowledge_tx<P: Provider>(
     let needs_ack = !ack_routes.authorities.is_empty() || ack_routes.failure.is_some();
     let mut failure = ack_routes.failure;
 
-    let claim_ids: Vec<B256> = match mode {
+    let claim_ids: Vec<(Address, B256)> = match mode {
         SettlementMode::Ack => Vec::new(),
         SettlementMode::AckAndClaim {
-            relayer_contract, ..
-        } => match relay_claimable_ids(source_provider, *relayer_contract, &message_ids).await {
+            relayer_contracts, ..
+        } => match relay_claimable_ids(source_provider, relayer_contracts, &message_ids).await {
             Ok(ids) => ids,
             Err(err) => {
+                // Without the ledger read the funding contract is unknown, so try each: the
+                // ledgers that do not hold a message reject its claim before anything is mined.
                 warn!(chain_key, %tx_hash, %err, "relay-claimable pre-check failed; attempting all ids");
-                message_ids.clone()
+                message_ids
+                    .iter()
+                    .flat_map(|id| {
+                        relayer_contracts
+                            .iter()
+                            .map(move |contract| (*contract, *id))
+                    })
+                    .collect()
             }
         },
     };
@@ -1048,13 +1070,9 @@ async fn acknowledge_tx<P: Provider>(
     // One claimDelivery per messageId (the ledger settles a single message per call, unlike the
     // validator which acks every log in one tx). A tx usually carries one delivery, so the proof
     // structs are rebuilt per id rather than cloned.
-    if let SettlementMode::AckAndClaim {
-        relayer_contract,
-        chain_key: ck,
-    } = mode
-    {
-        let ledger = crate::abi::IRelayerContract::new(*relayer_contract, source_provider);
-        for id in &claim_ids {
+    if let SettlementMode::AckAndClaim { chain_key: ck, .. } = mode {
+        for (relayer_contract, id) in &claim_ids {
+            let ledger = crate::abi::IRelayerContract::new(*relayer_contract, source_provider);
             let (inclusion, continuity) = proof.to_inclusion_and_continuity()?;
             let pending_tx = match broadcast_locks
                 .broadcast(
@@ -1133,10 +1151,11 @@ async fn acknowledge_tx<P: Provider>(
         }
     }
     if let SettlementMode::AckAndClaim {
-        relayer_contract, ..
+        relayer_contracts, ..
     } = mode
     {
-        match relay_claimable_ids(source_provider, *relayer_contract, &claim_ids).await {
+        let claimed: Vec<B256> = claim_ids.iter().map(|(_, id)| *id).collect();
+        match relay_claimable_ids(source_provider, relayer_contracts, &claimed).await {
             Ok(remaining) if !remaining.is_empty() => {
                 failure.get_or_insert_with(|| {
                     anyhow!("relay fees remain unsettled in the configured ledger")
@@ -1223,6 +1242,61 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::sol_types::SolValue;
     use alloy::transports::mock::Asserter;
+
+    fn ledger_entry(payer: Address, gas_limit: u64, settled: bool) -> Bytes {
+        Bytes::from(
+            crate::abi::IRelayerContract::MessageInfo {
+                payer,
+                destinationChain: 2,
+                gasLimit: U256::from(gas_limit),
+                relayFee: U256::from(1),
+                tip: U256::ZERO,
+                tipExpiry: U256::ZERO,
+                deliveryDeadline: U256::ZERO,
+                relaySettled: settled,
+                feesInNative: false,
+            }
+            .abi_encode(),
+        )
+    }
+
+    /// A route that spans two Outboxes has two fee ledgers. Each message must be claimed from the
+    /// ledger that funds it: the other one has no record of it (`payer == 0`).
+    #[tokio::test]
+    async fn claims_route_to_the_ledger_that_funds_each_message() {
+        let (ledger_a, ledger_b) = (Address::repeat_byte(0xa), Address::repeat_byte(0xb));
+        let payer = Address::repeat_byte(1);
+        let (in_a, in_b, settled_in_b, unfunded) = (
+            B256::repeat_byte(1),
+            B256::repeat_byte(2),
+            B256::repeat_byte(3),
+            B256::repeat_byte(4),
+        );
+        let rpc = Asserter::new();
+        // in_a: found in the first ledger, so the second is never asked.
+        rpc.push_success(&ledger_entry(payer, 100_000, false));
+        // in_b: unknown to A, funded in B.
+        rpc.push_success(&ledger_entry(Address::ZERO, 0, false));
+        rpc.push_success(&ledger_entry(payer, 100_000, false));
+        // settled_in_b: unknown to A, already claimed in B.
+        rpc.push_success(&ledger_entry(Address::ZERO, 0, false));
+        rpc.push_success(&ledger_entry(payer, 100_000, true));
+        // unfunded: unknown to both.
+        rpc.push_success(&ledger_entry(Address::ZERO, 0, false));
+        rpc.push_success(&ledger_entry(Address::ZERO, 0, false));
+        let provider = ProviderBuilder::new().connect_mocked_client(rpc.clone());
+
+        let claimable = relay_claimable_ids(
+            &provider,
+            &[ledger_a, ledger_b],
+            &[in_a, in_b, settled_in_b, unfunded],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(claimable, vec![(ledger_a, in_a), (ledger_b, in_b)]);
+        assert!(rpc.read_q().is_empty(), "every queued ledger read was used");
+    }
 
     #[tokio::test]
     async fn full_pending_queue_keeps_cursor_and_unfinished_work() {
@@ -1605,7 +1679,7 @@ mod tests {
         assert!(resolved.failure.is_none());
         assert!(resolved.authorities.is_empty());
         assert!(
-            relay_claimable_ids(&provider, Address::repeat_byte(2), &[id])
+            relay_claimable_ids(&provider, &[Address::repeat_byte(2)], &[id])
                 .await
                 .unwrap()
                 .is_empty()
@@ -1789,7 +1863,7 @@ mod tests {
         let result = acknowledge_tx(
             2,
             &SettlementMode::AckAndClaim {
-                relayer_contract: Address::repeat_byte(2),
+                relayer_contracts: vec![Address::repeat_byte(2)],
                 chain_key: B256::from(U256::from(2)),
             },
             42,

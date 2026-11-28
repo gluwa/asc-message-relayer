@@ -95,6 +95,12 @@ routes:
     # routes without the fee flow. The pre-#23 key `relayer_fee_vault_address` is accepted as an
     # alias for existing configs.
     # relayer_contract_address: "0x2222222222222222222222222222222222222222"
+    # A route whose chain key has more than one source Outbox (during a defaultOutbox rotation,
+    # for example) has one RelayerContract per Outbox. List them all; each message is funded and
+    # claimed in the one that belongs to its Outbox. Merged with relayer_contract_address.
+    # relayer_contract_addresses:
+    #   - "0x2222222222222222222222222222222222222222"
+    #   - "0x3333333333333333333333333333333333333333"
 
     # --- asc-contracts #36 envelope policy (all optional) ---------------------------------------
     # Every EVM message payload is now an envelope abi.encode(destination, nativeCoinValue,
